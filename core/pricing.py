@@ -1,15 +1,7 @@
 """
 pricing.py
 ==========
-Black-Scholes option pricing and probability helpers for ETH options.
-
-Functions
----------
-ncdf(x)                         Standard normal CDF
-bs_put(S, K, T, r, v)          Black-Scholes put price
-bs_call(S, K, T, r, v)         Black-Scholes call price
-prob_otm_put(S, K, T, r, v)    Probability put expires OTM (worthless)
-prob_otm_call(S, K, T, r, v)   Probability call expires OTM (worthless)
+Black-Scholes option pricing and probability helpers for BTC/ETH options.
 
 All prices are in USD. Volatility (v) and risk-free rate (r) are decimals,
 e.g. 80% IV → v=0.80, 5% rate → r=0.05. Time (T) is in years.
@@ -18,11 +10,16 @@ e.g. 80% IV → v=0.80, 5% rate → r=0.05. Time (T) is in years.
 import math
 
 
-# ── Normal CDF ────────────────────────────────────────────────────────────────
+# ── Normal distribution helpers ───────────────────────────────────────────────
 
 def ncdf(x: float) -> float:
     """Standard normal cumulative distribution function."""
     return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+def npdf(x: float) -> float:
+    """Standard normal probability density function."""
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
 # ── d1 / d2 helpers ───────────────────────────────────────────────────────────
  
@@ -111,7 +108,7 @@ def gamma(S: float, K: float, T: float, r: float, v: float) -> float:
     if T <= 0 or v <= 0:
         return 0.0
     d1 = _d1(S, K, T, r, v)
-    return ncdf(d1) / (S * v * math.sqrt(T))
+    return npdf(d1) / (S * v * math.sqrt(T))
 
 
 def vega(S: float, K: float, T: float, r: float, v: float) -> float:
@@ -119,7 +116,7 @@ def vega(S: float, K: float, T: float, r: float, v: float) -> float:
     if T <= 0 or v <= 0:
         return 0.0
     d1 = _d1(S, K, T, r, v)
-    return S * ncdf(d1) * math.sqrt(T) / 100.0
+    return S * npdf(d1) * math.sqrt(T) / 100.0
 
 
 def theta_call(S: float, K: float, T: float, r: float, v: float) -> float:
@@ -128,7 +125,7 @@ def theta_call(S: float, K: float, T: float, r: float, v: float) -> float:
         return 0.0
     d1 = _d1(S, K, T, r, v)
     d2 = _d2(S, K, T, r, v)
-    term1 = -S * ncdf(d1) * v / (2 * math.sqrt(T))
+    term1 = -S * npdf(d1) * v / (2 * math.sqrt(T))
     term2 = r * K * math.exp(-r * T) * ncdf(d2)
     return (term1 - term2) / 365.0
 
@@ -139,7 +136,7 @@ def theta_put(S: float, K: float, T: float, r: float, v: float) -> float:
         return 0.0
     d1 = _d1(S, K, T, r, v)
     d2 = _d2(S, K, T, r, v)
-    term1 = -S * ncdf(d1) * v / (2 * math.sqrt(T))
+    term1 = -S * npdf(d1) * v / (2 * math.sqrt(T))
     term2 = r * K * math.exp(-r * T) * ncdf(-d2)
     return (term1 + term2) / 365.0
 

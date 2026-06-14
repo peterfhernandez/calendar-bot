@@ -19,12 +19,17 @@ See [BOT_PLAN.md](BOT_PLAN.md) for full design details and [README.md](README.md
 
 ## Phase 1 — Port Core Logic
 
-- [ ] Port `market/pricing.py` → `core/pricing.py` (Black-Scholes, breakevens, prob-of-profit)
-- [ ] Port `trading/fee_calculator.py` → `core/fees.py`
-- [ ] Port `strategies/calendar.py` → `core/calendar_engine.py` (spread valuation, stop/TP check, P&L at expiry)
-- [ ] Port `database/calendar_db.py` → `db/state.py`
-- [ ] Write unit tests for ported pricing functions (`tests/test_pricing.py`)
-- [ ] Write unit tests for calendar engine (`tests/test_calendar_engine.py`)
+Files have already been copied over from optionsStrat. Files need to be adapted...
+
+- [x] Port `market/pricing.py` → `core/pricing.py` (Black-Scholes, breakevens, prob-of-profit)
+- [x] Port `trading/fee_calculator.py` → `core/fees.py`
+- [x] Port `strategies/calendar.py` → `core/calendar_engine.py` (spread valuation, stop/TP check, P&L at expiry)
+- [x] Port `database/calendar_db.py` → `db/state.py`
+- [x] Write unit tests for ported pricing functions (`tests/test_pricing.py`)
+- [x] Write unit tests for calendar engine (`tests/test_calendar_engine.py`)
+- [x] Write unit tests for fees functions (`tests/test_fees.py`)
+- [x] Write unit tests for state engine (`tests/test_state.py`)
+- [x] Remove any unused code/functions from the ported files. Update all the comments and docstrings
 
 ---
 
@@ -56,6 +61,7 @@ See [BOT_PLAN.md](BOT_PLAN.md) for full design details and [README.md](README.md
   - [ ] Enforce `MAX_POSITIONS` concurrent limit
   - [ ] Enforce correlation limits (skip if same asset + similar strike already open)
 - [ ] Write unit tests for scanner and sizer (`tests/test_scanner.py`)
+- [ ] Remove any unused functions from the scanner.py module
 
 ---
 
@@ -82,6 +88,7 @@ See [BOT_PLAN.md](BOT_PLAN.md) for full design details and [README.md](README.md
   - [ ] Reconcile order state against Deribit REST API on startup
   - [ ] Detect stuck orders and cancel after timeout
 - [ ] Write executor unit tests with mocked Deribit client (`tests/test_executor.py`)
+- [ ] Remove unused code from copied files
 
 ---
 
