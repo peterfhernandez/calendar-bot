@@ -1,7 +1,7 @@
 # Calendar Spread Bot — TODO
 
 Progress tracker for building the `calendar-bot` project.
-See [BOT_PLAN.md](BOT_PLAN.md) for full design details and [BOT_README.md](BOT_README.md) for an overview.
+See [BOT_PLAN.md](BOT_PLAN.md) for full design details and [README.md](README.md) for an overview.
 
 ---
 
@@ -11,9 +11,9 @@ See [BOT_PLAN.md](BOT_PLAN.md) for full design details and [BOT_README.md](BOT_R
 - [x] Set up Python virtual environment (3.11+)
 - [x] Create folder scaffold: `core/`, `data/`, `strategy/`, `execution/`, `monitor/`, `db/`, `backtest/`, `alerts/`, `tests/`
 - [x] Add `requirements.txt` with: `websockets`, `aiohttp`, `apscheduler`, `scipy`, `numpy`, `pytest`
-- [ ] Add `.gitignore` (venv, `*.db`, `.env`, `__pycache__`)
-- [ ] Create `config.py` with all tuneable parameters (assets, horizons, sizing, stop/TP, scheduler intervals)
-- [ ] Create `bot.py` entry point stub
+- [x] Add `.gitignore` (venv, `*.db`, `.env`, `__pycache__`)
+- [x] Create `config.py` with all tuneable parameters (assets, horizons, sizing, stop/TP, scheduler intervals)
+- [x] Create `bot.py` entry point stub
 
 ---
 

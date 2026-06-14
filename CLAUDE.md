@@ -16,3 +16,7 @@ This repo is a python project for aun automated bot that trades calendar options
 ### Update README.md if needed
 
 Make sure the Readme.md file is up to date as well.
+
+### Update progress in BOT_TODO.md
+
+Each time you complete a task from BOT_TODO, make sure to update progress.
