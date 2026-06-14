@@ -35,17 +35,18 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 2 — Live Data Feed
 
-- [ ] Implement `data/deribit_feed.py`
-  - [ ] Deribit WebSocket connection with authentication
-  - [ ] Subscribe to ticker channels for target instruments
-  - [ ] Fetch option chain (all strikes/expiries for an asset)
-  - [ ] Extract spot price, mark IV, bid/ask per instrument
-  - [ ] Reconnect logic with exponential backoff
-- [ ] Implement `data/chain_cache.py`
-  - [ ] In-memory cache with configurable TTL (default 30s)
-  - [ ] Thread-safe read/write
-  - [ ] Stale-data detection and warning
-- [ ] Write integration tests against Deribit paper API (`tests/test_feed.py`)
+- [x] Implement `data/deribit_feed.py`
+  - [x] Deribit WebSocket connection with authentication
+  - [x] Subscribe to ticker channels for target instruments
+  - [x] Fetch option chain (all strikes/expiries for an asset)
+  - [x] Extract spot price, mark IV, bid/ask per instrument
+  - [x] Reconnect logic with exponential backoff
+- [x] Implement `data/chain_cache.py`
+  - [x] In-memory cache with configurable TTL (default 30s)
+  - [x] Thread-safe read/write
+  - [x] Stale-data detection and warning
+- [x] Write integration tests against Deribit paper API (`tests/test_feed.py`)
+- [x] Add `data/debug_viewer.py` — live terminal dashboard for the feed
 
 ---
 
@@ -61,7 +62,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
   - [ ] Enforce `MAX_POSITIONS` concurrent limit
   - [ ] Enforce correlation limits (skip if same asset + similar strike already open)
 - [ ] Write unit tests for scanner and sizer (`tests/test_scanner.py`)
-- [ ] Remove any unused functions from the scanner.py module
+- [ ] Remove any unused functions from the scanner.py module. Update comments and docstrings.
 
 ---
 
@@ -88,7 +89,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
   - [ ] Reconcile order state against Deribit REST API on startup
   - [ ] Detect stuck orders and cancel after timeout
 - [ ] Write executor unit tests with mocked Deribit client (`tests/test_executor.py`)
-- [ ] Remove unused code from copied files
+- [ ] Remove unused code from copied files. Update comments and docstrings.
 
 ---
 

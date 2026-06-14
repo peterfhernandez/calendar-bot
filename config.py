@@ -1,3 +1,19 @@
+import os as _os
+
+# Load .env file if present (never commit .env to git)
+def _load_env(path: str = ".env") -> None:
+    try:
+        with open(path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _, _v = _line.partition("=")
+                    _os.environ.setdefault(_k.strip(), _v.strip())
+    except FileNotFoundError:
+        pass
+
+_load_env()
+
 # Assets to trade
 ASSETS = ["BTC", "ETH"]
 
@@ -24,8 +40,10 @@ SCAN_INTERVAL_SEC    = 300  # 5 minutes
 MONITOR_INTERVAL_SEC = 60   # 1 minute
 
 # Broker
-DERIBIT_PAPER    = True   # set False for live trading
-DAILY_LOSS_LIMIT = 500    # USD — halt bot if breached
+DERIBIT_PAPER         = True   # set False for live trading
+DAILY_LOSS_LIMIT      = 500    # USD — halt bot if breached
+DERIBIT_CLIENT_ID     = _os.environ.get("DERIBIT_CLIENT_ID",     "")
+DERIBIT_CLIENT_SECRET = _os.environ.get("DERIBIT_CLIENT_SECRET", "")
 
 # Alerts
 ALERT_EMAIL    = ""  # SMTP recipient; leave empty to disable
