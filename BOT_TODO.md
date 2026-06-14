@@ -52,17 +52,18 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 3 — Scanner and Ranker
 
-- [ ] Implement `strategy/scanner.py`
-  - [ ] Enumerate all valid near/far expiry pairs per asset
-  - [ ] Filter by min OI, min IV contango, min prob of profit
-  - [ ] Score each candidate: EV = P(profit) × avg_win − P(loss) × net_debit
-  - [ ] Return ranked list of `CalendarCandidate` objects
-- [ ] Implement `strategy/sizer.py`
-  - [ ] Calculate position size from portfolio value and `MAX_LOSS_PCT`
-  - [ ] Enforce `MAX_POSITIONS` concurrent limit
-  - [ ] Enforce correlation limits (skip if same asset + similar strike already open)
-- [ ] Write unit tests for scanner and sizer (`tests/test_scanner.py`)
-- [ ] Remove any unused functions from the scanner.py module. Update comments and docstrings.
+- [x] Implement `strategy/scanner.py`
+  - [x] Enumerate all valid near/far expiry pairs per asset
+  - [x] Filter by min OI, min IV contango, min prob of profit
+  - [x] Score each candidate: EV = P(profit) × avg_win − P(loss) × net_debit
+  - [x] Return ranked list of `CalendarCandidate` objects
+- [x] Implement `strategy/sizer.py`
+  - [x] Calculate position size from portfolio value and `MAX_LOSS_PCT`
+  - [x] Enforce `MAX_POSITIONS` concurrent limit
+  - [x] Enforce correlation limits (skip if same asset + similar strike already open)
+- [x] Write unit tests for scanner and sizer (`tests/test_scanner.py`)
+- [x] Remove any unused functions from the scanner.py module. Update comments and docstrings.
+- [x] Add `scratch_scan.py` — test the scanner: manual debug script in repo's root
 
 ---
 
@@ -150,6 +151,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Notes
 
+- `scratch_scan.py` in repo root — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python scratch_scan.py`. Not committed to git (add to `.gitignore` if needed).
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
 - Do not switch to live trading until Phase 9 is fully complete
