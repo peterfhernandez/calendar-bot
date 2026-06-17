@@ -9,7 +9,7 @@ An automated trading bot that systematically scans, enters, monitors, and closes
 ## What We Already Have (Reusable from optionsStrat)
 
 | Module | Source | What it provides |
-|---|---|---|
+| --- | --- | --- |
 | Pricing math | `market/pricing.py` | Black-Scholes, breakevens, prob-of-profit |
 | Calendar logic | `strategies/calendar.py` | Spread valuation, stop/TP evaluation, P&L at expiry |
 | Fee model | `trading/fee_calculator.py` | Per-leg fee estimates |
@@ -27,6 +27,7 @@ Roughly 60–70% of the non-trivial logic is already there.
 ### 1. Scanner / Opportunity Ranker *(medium effort)*
 
 Scores calendar setups across assets and strikes. Key signals:
+
 - IV term structure (front-month IV vs back-month IV) — prefer high contango
 - Days-to-expiry matching (7d/30d, 14d/45d, etc.)
 - Probability of profit derived from breakeven finding
@@ -35,6 +36,7 @@ Scores calendar setups across assets and strikes. Key signals:
 ### 2. Market Data Feed *(medium effort)*
 
 Replaces the current interactive spot/IV input with a live polling loop:
+
 - Fetches real-time spot, bid/ask, and IV per instrument from Deribit WebSocket API
 - Caches option chains with configurable refresh cadence (e.g. 30s during active hours)
 - Detects regime shifts (IV spike, liquidity gaps) to pause trading
@@ -42,6 +44,7 @@ Replaces the current interactive spot/IV input with a live polling loop:
 ### 3. Risk / Position Sizing Engine *(medium effort)*
 
 Replaces the static `BUDGET_USD / spot` quantity with:
+
 - Per-trade max loss as % of portfolio
 - Maximum concurrent positions (especially if multi-asset)
 - Correlation limits (e.g. avoid BTC + ETH calendars at the same strike simultaneously)
@@ -50,7 +53,7 @@ Replaces the static `BUDGET_USD / spot` quantity with:
 
 Replaces interactive menus with a rule-based engine:
 
-```
+```text
 SCAN → RANK → VALIDATE → ENTER → MONITOR → { ROLL | CLOSE }
 ```
 
@@ -59,6 +62,7 @@ Stop/TP conditions already exist in `check_calendar_status` — need to be calle
 ### 5. Execution Hardening *(medium–hard)*
 
 The current executor places market orders naively. For unattended trading:
+
 - Submit both legs as a **combo/spread order** to eliminate leg risk
 - Retry and fill-detection logic
 - Slippage bounds — reject if fill price > X% from mid
@@ -80,7 +84,7 @@ Replay historical option chain snapshots through the scanner + decision engine b
 
 ### Repository Layout
 
-```
+```text
 calendar-bot/
 ├── core/
 │   ├── __init__.py
@@ -152,7 +156,7 @@ cp ../optionsStrat/database/calendar_db.py db/state.py
 ### Key Dependencies
 
 | Package | Purpose |
-|---|---|
+| --- | --- |
 | `websockets` / `aiohttp` | Deribit WebSocket feed |
 | `apscheduler` | Scan/monitor scheduling |
 | `scipy` | Black-Scholes and numerical solvers |
@@ -166,7 +170,7 @@ cp ../optionsStrat/database/calendar_db.py db/state.py
 ## Biggest Risks
 
 | Risk | Mitigation |
-|---|---|
+| --- | --- |
 | Leg risk on entry (one leg fills, other doesn't) | Use Deribit combo orders |
 | IV collapse after entry | Check IV term structure before entering; set max IV drop stop |
 | Liquidity gaps on crypto calendars | Enforce minimum OI/volume thresholds per strike |
@@ -179,7 +183,7 @@ cp ../optionsStrat/database/calendar_db.py db/state.py
 
 ## Decision Engine State Machine
 
-```
+```text
 ┌─────────┐
 │  IDLE   │◄──────────────────────────────────────────────┐
 └────┬────┘                                               │
@@ -263,7 +267,7 @@ DAILY_LOSS_LIMIT  = 500      # USD — halt bot if exceeded
 ## Estimated Effort
 
 | Layer | Effort |
-|---|---|
+| --- | --- |
 | Port + clean core modules | 1–2 days |
 | Live WebSocket data feed | 3–5 days |
 | Scanner / ranker | 2–3 days |

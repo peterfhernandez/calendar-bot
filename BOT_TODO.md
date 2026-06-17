@@ -70,13 +70,13 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 4 — Decision State Machine
 
-- [ ] Implement `strategy/decision.py`
-  - [ ] States: IDLE → SCAN → RANK → ENTER → MONITOR → {ROLL | CLOSE} → IDLE
-  - [ ] Entry gate: run scanner, validate through sizer, approve or skip
-  - [ ] Monitor gate: check stop/TP on each tick; trigger close or alert
-  - [ ] Roll logic: if near leg approaches expiry and setup still valid, roll to new near leg
-  - [ ] Hard daily loss limit: halt all trading if exceeded
-- [ ] Write state machine unit tests (`tests/test_decision.py`)
+- [x] Implement `strategy/decision.py`
+  - [x] States: IDLE → SCAN → RANK → ENTER → MONITOR → {ROLL | CLOSE} → IDLE
+  - [x] Entry gate: run scanner, validate through sizer, approve or skip
+  - [x] Monitor gate: check stop/TP on each tick; trigger close or alert
+  - [x] Roll logic: if near leg approaches expiry and setup still valid, roll to new near leg
+  - [x] Hard daily loss limit: halt all trading if exceeded
+- [x] Write state machine unit tests (`tests/test_decision.py`)
 
 ---
 
@@ -153,6 +153,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 ## Notes
 
 - `strategy/scratch_scan.py` — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python -m strategy.scratch_scan` from the repo root.
+- `strategy/scratch_decision.py` — end-to-end dry-run of the decision engine; connects to the paper feed, runs `scan_tick()` then `monitor_tick()`, and prints a full status report. Uses a separate `db/scratch_decision.db` so it doesn't touch the real database. Run with `python -m strategy.scratch_decision` from the repo root.
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
 - Do not switch to live trading until Phase 9 is fully complete
