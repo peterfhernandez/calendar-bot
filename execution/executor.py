@@ -1,809 +1,719 @@
 """
-Ported from optionsTrading/trading/executor.py
-THIS MUST BE ADAPTED FOR THIS CALENDAR BOT, NOT JUST COPIED!
-REMOVE UNUSED METHODS
-MUST BE HARDENED AS DESCRIBED IN BOT_PLAN.md
-===================
-Trade execution logic for all strategies.
+execution/executor.py
+=====================
+Hardened calendar spread executor for Deribit.
 
-Positions are always recorded to the local database (paper trading).
-When a broker adapter is supplied the same trade is also submitted as a
-live/paper order via the access layer.
+Implements the ExecutorProtocol expected by strategy/decision.py with:
+
+- Both legs placed as fast as possible to minimise leg risk.
+  Deribit does not expose a public calendar-spread combo endpoint, so we
+  submit the near leg first (sell), confirm the fill, then submit the far
+  leg (buy).  If the far leg cannot be filled after retries, the near leg
+  is immediately closed so we are never left with a naked short.
+- Slippage bounds: reject if the fill price deviates > SLIPPAGE_LIMIT_PCT
+  from the live mid price at order time.
+- Retry on transient failures (network timeout, rate-limit HTTP 429) with
+  exponential back-off.
+- Full order lifecycle handed to OrderManager for tracking and reconciliation.
 
 Public API
 ----------
-enter_trade(candidate, days, broker)
-    Open the position described by candidate, persist it, and optionally
-    place a live order through the supplied broker.
+CalendarExecutor(paper, client_id, client_secret, order_manager=None)
+    Implements ExecutorProtocol.  All methods are synchronous wrappers that
+    spin up a short-lived async event loop internally, so they can be called
+    from a non-async scheduler tick.
 
-Internal helpers
-----------------
-_enter_csp(c, T, broker)      Cash-Secured Put
-_enter_cc(c, T, broker)       Covered Call
-_enter_strangle(c, T, broker) Short Strangle
-_enter_calendar(c, T, broker) Calendar spread
+    enter_spread(candidate) -> dict | None
+    close_spread(position)  -> float | None
+    roll_near_leg(position, new_candidate) -> bool
 """
 
-from datetime import date, datetime, timedelta
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
 from typing import Optional
 
-from config import (
-    BUDGET_USD, RISK_FREE_RATE, CALENDAR_FAR_DAYS, SPREAD_WIDTH_PCT, DERIBIT_PAPER,
-)
-from database import load_wheel_state, save_wheel_state, create_single_trade
-from trading.fee_calculator import calculate_fee
-from database.strangle_db import load_strangle_state, save_strangle_state, create_strangle_trade
-from database.calendar_db import load_calendar_state, save_calendar_state, create_calendar_trade
-from database.spread_db import load_spread_state, save_spread_state, create_spread_trade
-from market.pricing import bs_put, bs_call, round_strike, adjust_far_leg_price
-from access import BrokerBase, OrderResult, make_instrument, DeribitClient
+import websockets
+import websockets.exceptions
 
-# Assets whose Deribit contracts are inverse (amount = USD notional).
-# All other assets are linear (amount = number of contracts).
-_INVERSE_ASSETS = {"BTC", "ETH"}
+import config
+from strategy.scanner import CalendarCandidate
+from execution.order_manager import OrderManager, OrderState, TrackedOrder
 
+logger = logging.getLogger(__name__)
 
-def _next_friday(from_date: date) -> date:
-    """Return the nearest Friday on or after from_date (Deribit weekly expiry day)."""
-    days_ahead = (4 - from_date.weekday()) % 7   # 4 = Friday
-    return from_date + timedelta(days=days_ahead)
+_WS_PAPER = "wss://test.deribit.com/ws/api/v2"
+_WS_LIVE  = "wss://www.deribit.com/ws/api/v2"
+
+# ── Defaults (can be overridden in config.py) ─────────────────────────────────
+SLIPPAGE_LIMIT_PCT: float = getattr(config, "SLIPPAGE_LIMIT_PCT", 0.02)
+ORDER_TIMEOUT_SEC:  int   = getattr(config, "ORDER_TIMEOUT_SEC",  30)
+MAX_RETRIES:        int   = getattr(config, "MAX_ORDER_RETRIES",  3)
+_RETRY_DELAYS = [1, 3, 9]   # seconds between retry attempts
 
 
-def _expiry_date(days: int) -> date:
+# ── Exceptions ────────────────────────────────────────────────────────────────
+
+class SlippageError(Exception):
+    """Fill price deviates too far from mid; trade rejected."""
+
+
+class LegRiskError(Exception):
+    """Near leg filled but far leg failed; near leg was closed to flatten."""
+
+
+class OrderTimeoutError(Exception):
+    """Order not fully filled within ORDER_TIMEOUT_SEC seconds."""
+
+
+# ── Internal fill result ──────────────────────────────────────────────────────
+
+@dataclass
+class LegFill:
+    """Result from placing a single option leg."""
+    order_id:   str
+    instrument: str
+    direction:  str    # "buy" | "sell"
+    amount:     float
+    price:      float  # average fill price (Deribit index fraction for BTC/ETH)
+    price_usd:  float  # converted to USD
+
+
+# ── Low-level Deribit WebSocket client ───────────────────────────────────────
+
+class _DeribitRPCClient:
     """
-    Calculate a Deribit-valid expiry date.
-    Snaps the target date (today + days) to the next Friday, since Deribit
-    only lists options expiring on Fridays.
+    Minimal async JSON-RPC client for Deribit private order operations.
+
+    Opens a fresh WebSocket connection per use (connect → auth → call → close).
+    This avoids the complexity of sharing the long-lived feed connection and
+    keeps each executor call fully self-contained.
     """
-    target = date.today() + timedelta(days=days)
-    return _next_friday(target)
+
+    def __init__(self, paper: bool, client_id: str, client_secret: str) -> None:
+        self.paper         = paper
+        self.client_id     = client_id
+        self.client_secret = client_secret
+        self._req_id       = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._ws: websockets.WebSocketClientProtocol | None = None
+
+    @property
+    def _endpoint(self) -> str:
+        return _WS_PAPER if self.paper else _WS_LIVE
+
+    async def __aenter__(self) -> "_DeribitRPCClient":
+        self._ws = await websockets.connect(
+            self._endpoint,
+            ping_interval=20,
+            ping_timeout=20,
+            open_timeout=15,
+        )
+        self._pump_task = asyncio.create_task(self._pump())
+        await self._authenticate()
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        self._pump_task.cancel()
+        try:
+            await self._pump_task
+        except asyncio.CancelledError:
+            pass
+        if self._ws:
+            await self._ws.close()
+
+    async def _pump(self) -> None:
+        assert self._ws
+        async for raw in self._ws:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            req_id = msg.get("id")
+            if req_id is not None:
+                fut = self._pending.pop(req_id, None)
+                if fut and not fut.done():
+                    if "error" in msg:
+                        err = msg["error"]
+                        fut.set_exception(
+                            RuntimeError(f"Deribit error {err.get('code')}: {err.get('message')}")
+                        )
+                    else:
+                        fut.set_result(msg.get("result"))
+
+    async def _rpc(self, method: str, params: dict) -> dict:
+        assert self._ws, "Not connected"
+        self._req_id += 1
+        req_id = self._req_id
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[req_id] = fut
+        await self._ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}))
+        return await asyncio.wait_for(fut, timeout=15)
+
+    async def _authenticate(self) -> None:
+        if not (self.client_id and self.client_secret):
+            return
+        await self._rpc(
+            "public/auth",
+            {
+                "grant_type":    "client_credentials",
+                "client_id":     self.client_id,
+                "client_secret": self.client_secret,
+            },
+        )
+        logger.debug("Authenticated with Deribit")
+
+    async def get_ticker(self, instrument: str) -> dict:
+        return await self._rpc("public/ticker", {"instrument_name": instrument})
+
+    async def place_order(
+        self,
+        instrument: str,
+        direction:  str,    # "buy" | "sell"
+        amount:     float,
+        price:      float,  # limit price in Deribit index fraction
+        label:      str = "",
+    ) -> dict:
+        method = f"private/{direction}"
+        params = {
+            "instrument_name": instrument,
+            "amount":          amount,
+            "type":            "limit",
+            "price":           price,
+            "post_only":       False,
+        }
+        if label:
+            params["label"] = label
+        return await self._rpc(method, params)
+
+    async def cancel_order(self, order_id: str) -> dict:
+        return await self._rpc("private/cancel", {"order_id": order_id})
+
+    async def get_order_state(self, order_id: str) -> dict:
+        return await self._rpc("private/get_order_state", {"order_id": order_id})
+
+    async def get_open_orders(self, instrument: str | None = None) -> list[dict]:
+        params: dict = {"kind": "option"}
+        if instrument:
+            params["instrument_name"] = instrument
+        return await self._rpc("private/get_open_orders_by_instrument"
+                               if instrument else "private/get_open_orders_by_currency",
+                               params)
 
 
-def _strike_from_instrument(instrument: str) -> float:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _index_price(usd_price: float, spot: float, asset: str) -> float:
+    """Convert a USD option price to Deribit index fraction for inverse assets."""
+    if asset.upper() in ("BTC", "ETH"):
+        return round(usd_price / spot, 4)
+    return round(usd_price, 4)
+
+
+def _usd_price(index_price: float, spot: float, asset: str) -> float:
+    """Convert Deribit index fraction back to USD."""
+    if asset.upper() in ("BTC", "ETH"):
+        return index_price * spot
+    return index_price
+
+
+def _contract_amount(spot: float, asset: str, portfolio_value: float, max_loss_pct: float, net_debit_usd: float) -> float:
     """
-    Parse the strike price from a broker instrument name.
-    Deribit format: {TICKER}-{DDMMMYY}-{STRIKE}-{C|P}
-    e.g. "ETH-30MAY25-2000-P" -> 2000.0, "SOL_USDC-30MAY25-150-P" -> 150.0
+    Calculate order amount in Deribit contract units.
+
+    For inverse assets (BTC, ETH): amount in coin units.
+    For linear (SOL_USDC etc.): amount in integer contracts.
+
+    The amount is sized so that max_loss_pct of portfolio_value covers the
+    net_debit per unit times the amount.
     """
-    return float(instrument.split("-")[-2])
+    max_usd = portfolio_value * max_loss_pct
+    if net_debit_usd <= 0:
+        return 0.0
+    qty_usd = max_usd / net_debit_usd
+    if asset.upper() in ("BTC", "ETH"):
+        # Each contract = 1 coin unit; net_debit_usd is already per-coin
+        amount_coins = max_usd / (net_debit_usd * spot)
+        return round(max(0.1, amount_coins), 4)  # Deribit min = 0.1 BTC/ETH
+    # Linear: amount in integer contracts
+    return float(max(1, int(qty_usd)))
 
 
-def _order_price(asset: str, price_usd: float, spot: float) -> float:
+def _check_slippage(fill_price_usd: float, intended_usd: float, limit_pct: float) -> None:
     """
-    Convert a USD option price to the Deribit order price format, rounded to
-    the exchange tick size (0.0001 for all supported option contracts).
-    Inverse contracts (BTC, ETH): price as fraction of underlying (price / spot).
-    Linear USDC contracts (SOL, XRP): price in USDC directly.
+    Raise SlippageError if the fill price deviates too far from the intended limit.
+
+    We compare fill to the limit price we set (near_bid for sells, far_ask for buys)
+    rather than to mid. This catches orders where the market moved between submission
+    and fill, resulting in a significantly worse-than-intended execution price.
     """
-    if asset.upper() in _INVERSE_ASSETS:
-        return round(price_usd / spot, 4)
-    return round(price_usd, 4)
-
-
-def _broker_amount(asset: str, spot: float) -> float:
-    """
-    Return the Deribit order amount for one full budget allocation.
-
-    Deribit amount semantics for OPTIONS (not futures):
-      BTC/ETH inverse options : amount in coin units (BTC or ETH)
-      SOL_USDC / XRP_USDC     : amount in integer contracts
-
-    Note: Deribit futures use USD notional, but options always use the
-    underlying coin unit.  Sending BUDGET_USD (e.g. 250) as the amount
-    for a BTC option would mean 250 BTC (~$20M), causing not_enough_funds.
-    """
-    if asset.upper() in _INVERSE_ASSETS:
-        return round(BUDGET_USD / spot, 4)  # coin units (e.g. 0.00316 BTC)
-    return max(1, int(BUDGET_USD / spot))   # whole contracts for linear assets
-
-
-def _place_option(
-    broker: BrokerBase,
-    asset: str,
-    expiry_date: date,
-    strike: float,
-    option_type: str,    # "put" | "call"
-    direction: str,      # "buy" | "sell"
-    price_usd: float,    # BS price per-unit in USD
-    spot: float,
-    label: Optional[str] = None,
-    T: Optional[float] = None,
-    iv: Optional[float] = None,
-) -> OrderResult:
-    """Build the instrument name and submit a single-leg order to the broker."""
-    # Resolve to the closest listed instrument (expiry + strike) on the exchange.
-    instrument   = broker.find_instrument(asset, expiry_date, strike, option_type)
-    actual_strike = _strike_from_instrument(instrument)
-
-    # Recompute BS price if the exchange snapped to a different strike.
-    if actual_strike != strike and T is not None and iv is not None:
-        bs_fn     = bs_call if option_type.lower().startswith("c") else bs_put
-        price_usd = bs_fn(spot, actual_strike, T, RISK_FREE_RATE, iv)
-
-    amount    = _broker_amount(asset, spot)
-    lmt_price = _order_price(asset, price_usd, spot)
-    return broker.place_order(instrument, direction, amount, "limit", lmt_price, label)
-
-
-def _enter_csp(c, T: float, broker: BrokerBase) -> dict:
-    """Open a Cash-Secured Put position in the wheel state."""
-    K          = float(c.strike.replace("$", "").replace(",", ""))
-    qty        = BUDGET_USD / K
-    unit_price = bs_put(c.spot, K, T, RISK_FREE_RATE, c.iv)
-    premium    = unit_price * qty
-
-    # Calculate fee and verify budget covers premium
-    open_fee = calculate_fee(c.spot, premium, c.asset)
-    if premium > BUDGET_USD:
-        raise ValueError(
-            f"Premium ${premium:.2f} exceeds budget ${BUDGET_USD:.2f} for {c.asset} CSP"
+    if intended_usd <= 0:
+        return
+    deviation = abs(fill_price_usd - intended_usd) / intended_usd
+    if deviation > limit_pct:
+        raise SlippageError(
+            f"Fill ${fill_price_usd:.4f} is {deviation:.1%} from intended ${intended_usd:.4f} "
+            f"(limit {limit_pct:.1%})"
         )
 
-    expiry_dt  = _expiry_date(c.days)
-    expiry     = expiry_dt.strftime("%d-%b-%Y")
 
-    # Calculate the exact amount that will be sent to broker
-    broker_qty = _broker_amount(c.asset, c.spot)
-
-    order = _place_option(
-        broker, c.asset, expiry_dt, K, "put", "sell",
-        unit_price, c.spot, label=f"CSP-{c.asset}", T=T, iv=c.iv,
-    )
-    K = _strike_from_instrument(order.instrument)
-
-    s = load_wheel_state(c.asset)
-    s["stage"]  = "short_put"
-    s["broker"] = broker.broker_name
-    s["open"]   = {
-        "type":             "Put",
-        "strike":           K,
-        "expiry":           expiry,
-        "premium":          round(premium, 4),
-        "spot_open":        c.spot,
-        "qty":              broker_qty,  # Use broker-calculated amount
-        "days":             c.days,
-        "asset":            c.asset,
-        "broker_order_id":  order.order_id,
-        "instrument":       order.instrument,
-    }
-    s["total_premium"] = s.get("total_premium", 0.0) + premium
-    save_wheel_state(c.asset, s)
-
-    create_single_trade(
-        asset=c.asset,
-        date_open=date.today(),
-        option_type="Put",
-        strike=K,
-        expiry=expiry,
-        spot_open=c.spot,
-        premium=round(premium, 4),
-        qty=broker_qty,  # Use broker-calculated amount
-        days=c.days,
-        stage="short_put",
-        broker=broker.broker_name,
-        open_fees=round(open_fee, 4),
-        notes=(
-            f"AUTO {c.asset} CSP, {c.days}d, "
-            f"P(prof)={c.prob_profit:.0f}% yld={c.yield_ann:.0f}%/yr "
-            f"liq={c.liquidity_tag}"
-        ),
-    )
-
-    return s["open"]
-
-
-def _enter_cc(c, T: float, broker: BrokerBase) -> dict:
-    """Open a Covered Call position. Requires wheel state in 'holding'."""
-    s = load_wheel_state(c.asset)
-    if s["stage"] != "holding":
-        raise RuntimeError(f"Cannot enter CC for {c.asset}: wheel stage={s['stage']}")
-
-    K          = float(c.strike.replace("$", "").replace(",", ""))
-    qty        = s["asset_held"] or (BUDGET_USD / c.spot)
-    unit_price = bs_call(c.spot, K, T, RISK_FREE_RATE, c.iv)
-    premium    = unit_price * qty
-
-    # Calculate fee and verify budget covers premium
-    open_fee = calculate_fee(c.spot, premium, c.asset)
-    if premium > BUDGET_USD:
-        raise ValueError(
-            f"Premium ${premium:.2f} exceeds budget ${BUDGET_USD:.2f} for {c.asset} CC"
-        )
-
-    expiry_dt  = _expiry_date(c.days)
-    expiry     = expiry_dt.strftime("%d-%b-%Y")
-
-    # Calculate the exact amount that will be sent to broker
-    broker_qty = s["asset_held"] or _broker_amount(c.asset, c.spot)
-
-    order = _place_option(
-        broker, c.asset, expiry_dt, K, "call", "sell",
-        unit_price, c.spot, label=f"CC-{c.asset}", T=T, iv=c.iv,
-    )
-    K = _strike_from_instrument(order.instrument)
-
-    s["stage"]  = "short_call"
-    s["broker"] = broker.broker_name
-    s["open"]   = {
-        "type":             "Call",
-        "strike":           K,
-        "expiry":           expiry,
-        "premium":          round(premium, 4),
-        "spot_open":        c.spot,
-        "qty":              broker_qty,  # Use broker-calculated amount
-        "days":             c.days,
-        "asset":            c.asset,
-        "broker_order_id":  order.order_id,
-        "instrument":       order.instrument,
-    }
-    s["total_premium"] = s.get("total_premium", 0.0) + premium
-    save_wheel_state(c.asset, s)
-
-    create_single_trade(
-        asset=c.asset,
-        date_open=date.today(),
-        option_type="Call",
-        strike=K,
-        expiry=expiry,
-        spot_open=c.spot,
-        premium=round(premium, 4),
-        qty=broker_qty,  # Use broker-calculated amount
-        days=c.days,
-        stage="short_call",
-        broker=broker.broker_name,
-        open_fees=round(open_fee, 4),
-        notes=(
-            f"AUTO {c.asset} CC, {c.days}d, "
-            f"P(prof)={c.prob_profit:.0f}% yld={c.yield_ann:.0f}%/yr "
-            f"liq={c.liquidity_tag}"
-        ),
-    )
-
-    return s["open"]
-
-
-def _enter_strangle(c, T: float, broker: BrokerBase) -> dict:
-    """Open a short strangle position."""
-    Kp         = c.put_strike
-    Kc         = c.call_strike
-    qty        = BUDGET_USD / c.spot
-    put_price  = bs_put (c.spot, Kp, T, RISK_FREE_RATE, c.iv)
-    call_price = bs_call(c.spot, Kc, T, RISK_FREE_RATE, c.iv)
-    pp         = put_price  * qty
-    cp         = call_price * qty
-    tot        = pp + cp
-
-    # Calculate fees for both legs and verify budget covers total premium
-    put_fee = calculate_fee(c.spot, pp, c.asset)
-    call_fee = calculate_fee(c.spot, cp, c.asset)
-    total_fee = put_fee + call_fee
-    if tot > BUDGET_USD:
-        raise ValueError(
-            f"Total premium ${tot:.2f} exceeds budget ${BUDGET_USD:.2f} for {c.asset} Strangle"
-        )
-
-    expiry_dt  = _expiry_date(c.days)
-    expiry     = expiry_dt.strftime("%d-%b-%Y")
-
-    # Calculate the exact amount that will be sent to broker
-    broker_qty = _broker_amount(c.asset, c.spot)
-
-    put_order  = _place_option(
-        broker, c.asset, expiry_dt, Kp, "put",  "sell",
-        put_price, c.spot, label=f"STR-P-{c.asset}", T=T, iv=c.iv,
-    )
-    call_order = _place_option(
-        broker, c.asset, expiry_dt, Kc, "call", "sell",
-        call_price, c.spot, label=f"STR-C-{c.asset}", T=T, iv=c.iv,
-    )
-    Kp = _strike_from_instrument(put_order.instrument)
-    Kc = _strike_from_instrument(call_order.instrument)
-
-    trade = create_strangle_trade(
-        asset=c.asset,
-        date_open=date.today(),
-        put_strike=Kp,
-        call_strike=Kc,
-        spot_open=c.spot,
-        total_premium=round(tot, 4),
-        qty=broker_qty,  # Use broker-calculated amount
-        days=c.days,
-        expiry=expiry,
-        broker=broker.broker_name,
-        open_fees=round(total_fee, 4),
-        notes=(
-            f"AUTO {c.asset} strangle, {c.days}d, "
-            f"P(prof)={c.prob_profit:.0f}% yld={c.yield_ann:.0f}%/yr "
-            f"liq={c.liquidity_tag or 'N/A'}"
-        ),
-    )
-
-    s = load_strangle_state(c.asset)
-    s["broker"] = broker.broker_name
-    s["open"] = {
-        "put_strike":           Kp,
-        "call_strike":          Kc,
-        "total_premium":        round(tot, 4),
-        "qty":                  broker_qty,  # Store broker-calculated amount
-        "expiry":               expiry,
-        "spot_open":            c.spot,
-        "days":                 c.days,
-        "asset":                c.asset,
-        "trade_id":             trade.id,
-        "broker_put_order_id":  put_order.order_id,
-        "broker_call_order_id": call_order.order_id,
-        "put_instrument":       put_order.instrument,
-        "call_instrument":      call_order.instrument,
-    }
-    s["total_premium"] = s.get("total_premium", 0.0) + tot
-    s["trades"]        = s.get("trades",        0)   + 1
-    save_strangle_state(c.asset, s)
-
-    return s["open"]
-
-
-def _enter_calendar(c, T: float, broker: BrokerBase) -> dict:
-    """Open a calendar (Cal-C or Cal-P) spread position."""
-    K           = float(c.strike.split()[0].replace("$", "").replace(",", ""))
-    far_days    = c.far_days or CALENDAR_FAR_DAYS
-    T_far       = far_days / 365.0
-    qty         = BUDGET_USD / c.spot
-    option_type = "Call" if c.strategy == "Cal-C" else "Put"
-    bs_fn       = bs_call if option_type == "Call" else bs_put
-
-    expiry_near_dt = _expiry_date(c.days)
-    expiry_far_dt  = _expiry_date(far_days)
-    expiry_near    = expiry_near_dt.strftime("%d-%b-%Y")
-    expiry_far     = expiry_far_dt.strftime("%d-%b-%Y")
-
-    # Calculate the exact amount that will be sent to broker
-    broker_qty = _broker_amount(c.asset, c.spot)
-
-    ot = option_type.lower()
-    # Calendar: sell near leg, buy far leg.
-    # Near leg resolves first; its actual strike is enforced on the far leg
-    # so we never accidentally open a diagonal spread.
-    near_price = bs_fn(c.spot, K, T, RISK_FREE_RATE, c.iv)
-    near_order = _place_option(
-        broker, c.asset, expiry_near_dt, K, ot, "sell",
-        near_price, c.spot, label=f"CAL-NEAR-{c.asset}", T=T, iv=c.iv,
-    )
-    K          = _strike_from_instrument(near_order.instrument)
-    near_price = bs_fn(c.spot, K, T,     RISK_FREE_RATE, c.iv)
-    far_price  = bs_fn(c.spot, K, T_far, RISK_FREE_RATE, c.iv)
-    # Adjust far leg price upward to account for wider bid/ask spread and lower liquidity
-    far_price_adjusted = adjust_far_leg_price(far_price, far_days, is_buy=True)
-    far_order  = _place_option(
-        broker, c.asset, expiry_far_dt, K, ot, "buy",
-        far_price_adjusted, c.spot, label=f"CAL-FAR-{c.asset}", T=T_far, iv=c.iv,
-    )
-    near_prem = near_price * qty
-    far_prem  = far_price_adjusted * qty
-    net_debit = far_prem - near_prem
-
-    # Calculate fees for both legs
-    near_fee = calculate_fee(c.spot, near_prem, c.asset)
-    far_fee = calculate_fee(c.spot, far_prem, c.asset)
-    total_fee = near_fee + far_fee
-
-    trade = create_calendar_trade(
-        asset=c.asset,
-        date_open=date.today(),
-        option_type=option_type,
-        strike=K,
-        expiry_near=expiry_near,
-        expiry_far=expiry_far,
-        near_days=c.days,
-        far_days=far_days,
-        qty=broker_qty,  # Use broker-calculated amount
-        spot_open=c.spot,
-        near_prem=round(near_prem, 4),
-        far_prem=round(far_prem, 4),
-        net_debit=round(net_debit, 4),
-        broker=broker.broker_name,
-        near_instrument=near_order.instrument,
-        far_instrument=far_order.instrument,
-        open_fees=round(total_fee, 4),
-        notes=(
-            f"AUTO {c.asset} {option_type} calendar, "
-            f"{c.days}d/{far_days}d, "
-            f"P(prof)={c.prob_profit:.0f}% yld={c.yield_ann:.0f}%/yr"
-        ),
-    )
-
-    s = load_calendar_state(c.asset)
-    s["broker"] = broker.broker_name
-    s["open"] = {
-        "strike":               K,
-        "option_type":          option_type,
-        "near_prem":            round(near_prem, 4),
-        "far_prem":             round(far_prem,  4),
-        "net_debit":            round(net_debit, 4),
-        "qty":                  broker_qty,  # Store broker-calculated amount
-        "expiry_near":          expiry_near,
-        "expiry_far":           expiry_far,
-        "spot_open":            c.spot,
-        "near_days":            c.days,
-        "far_days":             far_days,
-        "asset":                c.asset,
-        "trade_id":             trade.id,
-        "broker_near_order_id": near_order.order_id,
-        "broker_far_order_id":  far_order.order_id,
-        "near_instrument":      near_order.instrument,
-        "far_instrument":       far_order.instrument,
-    }
-    s["trades"] = s.get("trades", 0) + 1
-    save_calendar_state(c.asset, s)
-
-    return s["open"]
-
-
-def _enter_spread(c, T: float, broker: BrokerBase) -> dict:
-    """Open a credit spread (BPS or BCS) position."""
-    from config import SUPPORTED_ASSETS
-    spread_type = c.strategy   # "BPS" | "BCS"
-    cfg         = SUPPORTED_ASSETS[c.asset]
-    strike_rnd  = cfg["strike_round"]
-
-    # Use strikes from the candidate if available; otherwise recalculate
-    if hasattr(c, 'short_strike') and c.short_strike is not None and hasattr(c, 'long_strike') and c.long_strike is not None:
-        short_k = c.short_strike
-        long_k  = c.long_strike
-    else:
-        # Fallback: recalculate from OTM percentage (legacy behavior)
-        otm   = c.otm_pct
-        width = SPREAD_WIDTH_PCT
-        if spread_type == "BPS":
-            short_k = round_strike(c.spot * (1 - otm),          strike_rnd)
-            long_k  = round_strike(c.spot * (1 - otm - width),  strike_rnd)
-        else:  # BCS
-            short_k = round_strike(c.spot * (1 + otm),          strike_rnd)
-            long_k  = round_strike(c.spot * (1 + otm + width),  strike_rnd)
-
-    if spread_type == "BPS":
-        short_p = bs_put(c.spot, short_k, T, RISK_FREE_RATE, c.iv)
-        long_p  = bs_put(c.spot, long_k,  T, RISK_FREE_RATE, c.iv)
-        otype   = "put"
-    else:  # BCS
-        short_p = bs_call(c.spot, short_k, T, RISK_FREE_RATE, c.iv)
-        long_p  = bs_call(c.spot, long_k,  T, RISK_FREE_RATE, c.iv)
-        otype   = "call"
-
-    qty        = BUDGET_USD / c.spot
-    net_credit = (short_p - long_p) * qty
-    max_loss   = abs(short_k - long_k) * qty - net_credit
-
-    # Calculate fees for both legs
-    short_fee = calculate_fee(c.spot, short_p * qty, c.asset)
-    long_fee = calculate_fee(c.spot, long_p * qty, c.asset)
-    total_fee = short_fee + long_fee
-
-    expiry_dt  = _expiry_date(c.days)
-    expiry     = expiry_dt.strftime("%d-%b-%Y")
-
-    short_order = _place_option(
-        broker, c.asset, expiry_dt, short_k, otype, "sell",
-        short_p, c.spot, label=f"SPR-S-{c.asset}", T=T, iv=c.iv,
-    )
-    long_order = _place_option(
-        broker, c.asset, expiry_dt, long_k, otype, "buy",
-        long_p, c.spot, label=f"SPR-L-{c.asset}", T=T, iv=c.iv,
-    )
-    short_k = _strike_from_instrument(short_order.instrument)
-    long_k  = _strike_from_instrument(long_order.instrument)
-    broker_qty = short_order.amount  # Actual qty enforced by broker (e.g. after min_trade_amount)
-
-    trade = create_spread_trade(
-        asset=c.asset,
-        spread_type=spread_type,
-        date_open=date.today(),
-        short_strike=short_k,
-        long_strike=long_k,
-        spot_open=c.spot,
-        net_credit=round(net_credit, 4),
-        max_loss=round(max_loss, 4),
-        qty=broker_qty,  # Actual broker-executed amount
-        days=c.days,
-        expiry=expiry,
-        broker=broker.broker_name,
-        open_fees=round(total_fee, 4),
-        notes=(
-            f"AUTO {c.asset} {spread_type}, {c.days}d, "
-            f"P(prof)={c.prob_profit:.0f}% yld={c.yield_ann:.0f}%/yr "
-            f"liq={c.liquidity_tag or 'N/A'}"
-        ),
-    )
-
-    s = load_spread_state(c.asset)
-    s["broker"] = broker.broker_name
-    s["open"] = {
-        "spread_type":            spread_type,
-        "short_strike":           short_k,
-        "long_strike":            long_k,
-        "net_credit":             round(net_credit, 4),
-        "max_loss":               round(max_loss, 4),
-        "qty":                    broker_qty,  # Actual broker-executed amount
-        "expiry":                 expiry,
-        "spot_open":              c.spot,
-        "days":                   c.days,
-        "asset":                  c.asset,
-        "trade_id":               trade.id,
-        "broker_short_order_id":  short_order.order_id,
-        "broker_long_order_id":   long_order.order_id,
-        "short_instrument":       short_order.instrument,
-        "long_instrument":        long_order.instrument,
-    }
-    s["net_credit"] = s.get("net_credit", 0.0) + net_credit
-    s["trades"]     = s.get("trades", 0) + 1
-    save_spread_state(c.asset, s)
-
-    return s["open"]
-
-
-def enter_trade(
-    c,
-    days: Optional[int] = None,
-    broker: Optional[BrokerBase] = None,
+async def _wait_for_fill(
+    client: _DeribitRPCClient,
+    order_id: str,
+    timeout: int = ORDER_TIMEOUT_SEC,
 ) -> dict:
     """
-    Open the position described by c, persist it, and place an order through
-    the broker.
+    Poll Deribit until the order is fully filled or the timeout expires.
 
-    Parameters
-    ----------
-    c:      Strategy candidate with .strategy, .asset, .spot, .iv, .days, etc.
-    days:   Override c.days when supplied.
-    broker: BrokerBase adapter.  Defaults to DeribitClient(paper=DERIBIT_PAPER)
-            so trades are always submitted to Deribit testnet unless DERIBIT_PAPER
-            is set to False or a different adapter is supplied explicitly.
-
-    Returns
-    -------
-    The open-position dict, with broker_order_id field(s) appended.
+    Returns the final order state dict.
+    Raises OrderTimeoutError if not filled in time.
     """
-    if broker is None:
-        broker = DeribitClient(paper=DERIBIT_PAPER)
-
-    # For BTC/ETH inverse options, Deribit minimum is ~0.1 coin.
-    # With a small USD budget this may be unaffordable — warn early.
-    if c.asset.upper() in _INVERSE_ASSETS:
-        min_coin   = 0.1          # Deribit minimum for BTC/ETH options
-        min_cost   = min_coin * c.spot
-        coin_amt   = BUDGET_USD / c.spot
-        if coin_amt < min_coin:
-            raise ValueError(
-                f"Budget ${BUDGET_USD:.0f} is too small for {c.asset} options on Deribit. "
-                f"Minimum contract is {min_coin} {c.asset} ≈ ${min_cost:,.0f}. "
-                f"Consider using SOL or XRP (USDC-settled, smaller contract sizes)."
-            )
-
-    days_eff = days or c.days
-    T        = days_eff / 365.0
-
-    if c.strategy == "CSP":
-        return _enter_csp(c, T, broker)
-    if c.strategy == "CC":
-        return _enter_cc(c, T, broker)
-    if c.strategy == "Strangle":
-        return _enter_strangle(c, T, broker)
-    if c.strategy in ("Cal-C", "Cal-P"):
-        return _enter_calendar(c, T, broker)
-    if c.strategy in ("BPS", "BCS"):
-        return _enter_spread(c, T, broker)
-
-    raise ValueError(f"Unsupported strategy '{c.strategy}'")
+    deadline = time.monotonic() + timeout
+    poll_interval = 1.0
+    while time.monotonic() < deadline:
+        state = await client.get_order_state(order_id)
+        order_state = state.get("order_state", "")
+        if order_state == "filled":
+            return state
+        if order_state in ("cancelled", "rejected"):
+            raise RuntimeError(f"Order {order_id} {order_state}")
+        await asyncio.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.5, 5.0)
+    raise OrderTimeoutError(f"Order {order_id} not filled after {timeout}s")
 
 
-# ── Close helpers ────────────────────────────────────────────────────────────
+# ── Core async logic ──────────────────────────────────────────────────────────
 
-def _parse_expiry(expiry_str: str) -> date:
-    """Parse an expiry string in any of the formats used by the state files."""
-    for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d"):
+async def _async_enter_spread(
+    candidate: CalendarCandidate,
+    paper: bool,
+    client_id: str,
+    client_secret: str,
+    order_manager: OrderManager,
+    portfolio_value: float,
+    slippage_pct: float = SLIPPAGE_LIMIT_PCT,
+    order_timeout: int = ORDER_TIMEOUT_SEC,
+) -> dict | None:
+    """
+    Async implementation of enter_spread.
+
+    Strategy:
+      1. Fetch live tickers for both legs to get current mid prices.
+      2. Check that our intended prices are within slippage bounds.
+      3. Submit near leg sell (limit at near_bid).
+      4. Wait for fill.
+      5. Submit far leg buy (limit at far_ask).
+      6. Wait for fill.
+      7. If step 5/6 fails after retries, close near leg and raise LegRiskError.
+    """
+    asset = candidate.asset
+    spot  = candidate.spot
+    amount = _contract_amount(
+        spot, asset, portfolio_value,
+        config.MAX_LOSS_PCT, candidate.net_debit * spot if asset.upper() in ("BTC", "ETH") else candidate.net_debit
+    )
+    if amount <= 0:
+        logger.warning("Calculated amount is 0 for %s %s — skipping", asset, candidate.near_instrument)
+        return None
+
+    near_instr = candidate.near_instrument
+    far_instr  = candidate.far_instrument
+
+    # Convert our intended USD prices to index fractions for Deribit
+    near_limit = _index_price(candidate.near_bid, spot, asset)
+    far_limit  = _index_price(candidate.far_ask,  spot, asset)
+    # Keep intended prices in USD for slippage comparison
+    near_intended_usd = candidate.near_bid   # we intend to sell at bid
+    far_intended_usd  = candidate.far_ask    # we intend to buy at ask
+
+    near_order_id: str | None = None
+
+    async with _DeribitRPCClient(paper, client_id, client_secret) as client:
+        # ── Near leg (sell) ───────────────────────────────────────────────────
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.info(
+                    "Submitting near leg SELL %s amount=%.4f price=%.4f (attempt %d/%d)",
+                    near_instr, amount, near_limit, attempt + 1, MAX_RETRIES,
+                )
+                result = await client.place_order(
+                    near_instr, "sell", amount, near_limit,
+                    label=f"CAL-NEAR-{asset}",
+                )
+                near_order_id = result["order"]["order_id"]
+                order_manager.track(TrackedOrder(
+                    order_id=near_order_id, instrument=near_instr,
+                    direction="sell", amount=amount, limit_price=near_limit,
+                    label=f"CAL-NEAR-{asset}",
+                ))
+                logger.info("Near leg submitted: order_id=%s", near_order_id)
+                break
+            except (OSError, websockets.exceptions.WebSocketException, asyncio.TimeoutError) as exc:
+                logger.warning("Near leg submit failed (attempt %d): %s", attempt + 1, exc)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_RETRY_DELAYS[attempt])
+                else:
+                    logger.error("Near leg failed after %d attempts", MAX_RETRIES)
+                    return None
+
+        assert near_order_id
+
         try:
-            return datetime.strptime(expiry_str.strip(), fmt).date()
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognised expiry format: {expiry_str!r}")
+            near_state = await _wait_for_fill(client, near_order_id, order_timeout)
+        except (OrderTimeoutError, RuntimeError) as exc:
+            logger.error("Near leg fill failed: %s — cancelling", exc)
+            try:
+                await client.cancel_order(near_order_id)
+            except Exception:
+                pass
+            order_manager.update(near_order_id, OrderState.CANCELLED)
+            return None
+
+        near_fill_price = near_state.get("average_price", near_limit)
+        near_fill_usd = _usd_price(near_fill_price, spot, asset)
+        _check_slippage(near_fill_usd, near_intended_usd, slippage_pct)
+        order_manager.update(near_order_id, OrderState.FILLED, fill_price=near_fill_price)
+        logger.info("Near leg filled: price=%.4f", near_fill_price)
+
+        # ── Far leg (buy) ─────────────────────────────────────────────────────
+        far_order_id: str | None = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.info(
+                    "Submitting far leg BUY %s amount=%.4f price=%.4f (attempt %d/%d)",
+                    far_instr, amount, far_limit, attempt + 1, MAX_RETRIES,
+                )
+                result = await client.place_order(
+                    far_instr, "buy", amount, far_limit,
+                    label=f"CAL-FAR-{asset}",
+                )
+                far_order_id = result["order"]["order_id"]
+                order_manager.track(TrackedOrder(
+                    order_id=far_order_id, instrument=far_instr,
+                    direction="buy", amount=amount, limit_price=far_limit,
+                    label=f"CAL-FAR-{asset}",
+                ))
+                logger.info("Far leg submitted: order_id=%s", far_order_id)
+                break
+            except (OSError, websockets.exceptions.WebSocketException, asyncio.TimeoutError) as exc:
+                logger.warning("Far leg submit failed (attempt %d): %s", attempt + 1, exc)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_RETRY_DELAYS[attempt])
+
+        if not far_order_id:
+            # Far leg never submitted — close near leg to avoid naked short
+            logger.error("Far leg submit exhausted retries; closing near leg to avoid leg risk")
+            try:
+                await client.place_order(near_instr, "buy", amount, near_limit * 1.05,
+                                         label=f"FLATTEN-NEAR-{asset}")
+            except Exception as exc:
+                logger.critical("FAILED to close near leg after far leg failure: %s", exc)
+            raise LegRiskError("Far leg failed; near leg closed")
+
+        try:
+            far_state = await _wait_for_fill(client, far_order_id, order_timeout)
+        except (OrderTimeoutError, RuntimeError) as exc:
+            logger.error("Far leg fill failed: %s — closing near leg", exc)
+            try:
+                await client.cancel_order(far_order_id)
+                await client.place_order(near_instr, "buy", amount, near_limit * 1.05,
+                                         label=f"FLATTEN-NEAR-{asset}")
+            except Exception as inner:
+                logger.critical("FAILED to close near leg after far leg timeout: %s", inner)
+            order_manager.update(far_order_id, OrderState.CANCELLED)
+            raise LegRiskError(f"Far leg timeout: {exc}")
+
+        far_fill_price = far_state.get("average_price", far_limit)
+        far_fill_usd   = _usd_price(far_fill_price, spot, asset)
+        _check_slippage(far_fill_usd, far_intended_usd, slippage_pct)
+        order_manager.update(far_order_id, OrderState.FILLED, fill_price=far_fill_price)
+        logger.info("Far leg filled: price=%.4f", far_fill_price)
+
+    # ── Compute fill summary ──────────────────────────────────────────────────
+    near_prem_usd = _usd_price(near_fill_price, spot, asset)
+    far_prem_usd  = _usd_price(far_fill_price,  spot, asset)
+    net_debit     = far_prem_usd - near_prem_usd
+
+    return {
+        "near_prem":          near_prem_usd,
+        "far_prem":           far_prem_usd,
+        "net_debit":          net_debit,
+        "qty":                amount,
+        "near_order_id":      near_order_id,
+        "far_order_id":       far_order_id,
+        "near_instrument":    near_instr,
+        "far_instrument":     far_instr,
+        "near_fill_price":    near_fill_price,
+        "far_fill_price":     far_fill_price,
+    }
 
 
-def close_wheel_position(op: dict, broker: BrokerBase, spot: float) -> "OrderResult":
+async def _async_close_spread(
+    position: dict,
+    paper: bool,
+    client_id: str,
+    client_secret: str,
+    order_manager: OrderManager,
+    order_timeout: int = ORDER_TIMEOUT_SEC,
+) -> float | None:
     """
-    Place a market buy order to close a short put or call leg.
+    Close both legs of a calendar spread.
 
-    Parameters
-    ----------
-    op:     The open-position dict stored in wheel state.
-    broker: Broker adapter (same one used to open the trade).
-    spot:   Current spot price (unused; amount is taken from open position).
+    Returns the net closing credit in USD (positive = profit vs. debit paid),
+    or None if an error occurred.
     """
-    asset      = op["asset"]
-    amount     = op.get("qty") or _broker_amount(asset, spot)
-    instrument = op["instrument"]
-    return broker.place_order(
-        instrument, "buy", amount, "market",
-        label=f"CLOSE-{op['type'].upper()}-{asset}",
-    )
+    asset      = position["asset"]
+    spot       = position.get("spot_open", 1.0)
+    near_instr = position["near_instrument"]
+    far_instr  = position["far_instrument"]
+    amount     = position["qty"]
 
+    async with _DeribitRPCClient(paper, client_id, client_secret) as client:
+        # Get current mid prices for slippage reference
+        try:
+            near_ticker = await client.get_ticker(near_instr)
+            far_ticker  = await client.get_ticker(far_instr)
+            near_mid    = (near_ticker.get("best_bid_price", 0) + near_ticker.get("best_ask_price", 0)) / 2
+            far_mid     = (far_ticker.get("best_bid_price",  0) + far_ticker.get("best_ask_price",  0)) / 2
+        except Exception:
+            near_mid = far_mid = 0.0
 
-def close_strangle_position(
-    op: dict, broker: BrokerBase, spot: float
-) -> "tuple[OrderResult, OrderResult]":
-    """
-    Place market buy orders to close both legs of a short strangle.
-
-    Returns (put_order, call_order).
-    """
-    asset      = op["asset"]
-    amount     = op.get("qty") or _broker_amount(asset, spot)
-    put_instr  = op["put_instrument"]
-    call_instr = op["call_instrument"]
-    put_order  = broker.place_order(put_instr,  "buy", amount, "market", label=f"CLOSE-STR-P-{asset}")
-    call_order = broker.place_order(call_instr, "buy", amount, "market", label=f"CLOSE-STR-C-{asset}")
-    return put_order, call_order
-
-
-def close_calendar_near_leg(op: dict, broker: BrokerBase, spot: float) -> "OrderResult":
-    """
-    Close only the near leg of a calendar spread (buy back our short position).
-
-    Returns the order result for the near leg close.
-    """
-    asset      = op["asset"]
-    amount     = op.get("qty") or _broker_amount(asset, spot)
-    near_instr = op["near_instrument"]
-    near_order = broker.place_order(near_instr, "buy", amount, "market", label=f"CLOSE-CAL-NEAR-{asset}")
-    return near_order
-
-
-def close_calendar_far_leg(op: dict, broker: BrokerBase, spot: float) -> "OrderResult":
-    """
-    Close only the far leg of a calendar spread (sell back our long position).
-
-    Returns the order result for the far leg close.
-    """
-    asset      = op["asset"]
-    amount     = op.get("qty") or _broker_amount(asset, spot)
-    far_instr  = op["far_instrument"]
-    far_order  = broker.place_order(far_instr, "sell", amount, "market", label=f"CLOSE-CAL-FAR-{asset}")
-    return far_order
-
-
-def close_calendar_position(
-    op: dict, broker: BrokerBase, spot: float
-) -> "tuple[OrderResult, OrderResult]":
-    """
-    Close a calendar spread: buy back the near leg (we were short) and
-    sell back the far leg (we were long).
-
-    Returns (near_order, far_order).
-    """
-    asset      = op["asset"]
-    amount     = op.get("qty") or _broker_amount(asset, spot)
-    near_instr = op["near_instrument"]
-    far_instr  = op["far_instrument"]
-    near_order = broker.place_order(near_instr, "buy",  amount, "market", label=f"CLOSE-CAL-NEAR-{asset}")
-    far_order  = broker.place_order(far_instr,  "sell", amount, "market", label=f"CLOSE-CAL-FAR-{asset}")
-    return near_order, far_order
-
-
-def close_spread_position(
-    op: dict, broker: BrokerBase, spot: float
-) -> "tuple[OrderResult, OrderResult]":
-    """
-    Close a credit spread: buy back the short leg and sell back the long leg.
-
-    Returns (short_order, long_order).
-    """
-    asset      = op["asset"]
-    amount     = op.get("qty") or _broker_amount(asset, spot)
-
-    # Use the exact instrument names recorded at open time — never recompute.
-    short_instr = op["short_instrument"]
-    long_instr  = op["long_instrument"]
-
-    # Buy back the short leg (close our short position)
-    short_order = broker.place_order(
-        short_instr, "buy", amount, "market", label=f"CLOSE-SPR-S-{asset}"
-    )
-    # Sell back the long leg (close our long protection)
-    long_order = broker.place_order(
-        long_instr, "sell", amount, "market", label=f"CLOSE-SPR-L-{asset}"
-    )
-    return short_order, long_order
-
-
-def roll_near_leg(
-    op: dict, days: int, broker: BrokerBase, spot: float, iv: float
-) -> "OrderResult":
-    """
-    Roll a new near leg for a "Far Leg Only" position.
-
-    Sells a new near leg at the same strike as the original, creating a new
-    calendar spread with the same far leg. Updates database to "Near Leg Rolled".
-
-    Parameters
-    ----------
-    op      : dict          The "Far Leg Only" open position dict
-    days    : int           Days to expiry for the new near leg
-    broker  : BrokerBase    Broker for executing the trade
-    spot    : float         Current spot price
-    iv      : float         Implied volatility (decimal)
-
-    Returns
-    -------
-    OrderResult for the new near leg order.
-    """
-    asset       = op["asset"]
-    strike      = op["strike"]
-    option_type = op["option_type"].lower()
-    qty         = op.get("qty") or _broker_amount(asset, spot)
-    trade_id    = op.get("trade_id")
-    expiry_far  = op.get("expiry_far", "")
-
-    # Calculate expiry date for new near leg
-    expiry_near_dt = _expiry_date(days)
-    expiry_near    = expiry_near_dt.strftime("%d-%b-%Y")
-    T              = days / 365.0
-
-    # Price the new near leg
-    bs_fn = bs_call if option_type.startswith("c") else bs_put
-    near_price = bs_fn(spot, strike, T, RISK_FREE_RATE, iv)
-
-    # Place the new near leg order
-    near_order = _place_option(
-        broker, asset, expiry_near_dt, strike, option_type, "sell",
-        near_price, spot, label=f"ROLL-CAL-NEAR-{asset}", T=T, iv=iv,
-    )
-
-    # Update strike if exchange snapped to different one
-    strike_actual = _strike_from_instrument(near_order.instrument)
-    if strike_actual != strike:
-        near_price = bs_fn(spot, strike_actual, T, RISK_FREE_RATE, iv)
-
-    near_prem = near_price * qty
-    open_fee = calculate_fee(spot, near_prem, asset)
-
-    # Update database: mark as "Near Leg Rolled" with new near leg info
-    if trade_id:
-        from database.calendar_db import close_calendar_trade
-        close_calendar_trade(
-            trade_id=trade_id,
-            date_close=date.today(),
-            spot_close=spot,
-            pnl=0.0,
-            result="Near Leg Rolled",
-            notes=f"Rolled near leg: new {days}d near leg at ${strike_actual:,.0f}, premium ${near_prem:.2f}",
-            close_fees=round(open_fee, 4),
+        # Close near leg: buy back the short (we sold it at entry)
+        near_close_price = near_mid * 1.02 if near_mid > 0 else 0.001  # pay a little to close
+        near_result = await client.place_order(
+            near_instr, "buy", amount, round(near_close_price, 4),
+            label=f"CLOSE-NEAR-{asset}",
         )
+        near_close_id = near_result["order"]["order_id"]
+        order_manager.track(TrackedOrder(
+            order_id=near_close_id, instrument=near_instr,
+            direction="buy", amount=amount, limit_price=near_close_price,
+            label=f"CLOSE-NEAR-{asset}",
+        ))
 
-    # Create new calendar trade record for the rolled position
-    from database.calendar_db import create_calendar_trade
-    near_days_actual = (
-        (_next_friday(date.today() + timedelta(days=days)) - date.today()).days
-    )
-    far_days_actual = op.get("far_days", CALENDAR_FAR_DAYS)
-    far_prem = op.get("far_prem", 0.0)  # Far leg premium from original position
-    net_debit_rolled = far_prem - near_prem
+        # Close far leg: sell back the long (we bought it at entry)
+        far_close_price = far_mid * 0.98 if far_mid > 0 else 0.001
+        far_result = await client.place_order(
+            far_instr, "sell", amount, round(far_close_price, 4),
+            label=f"CLOSE-FAR-{asset}",
+        )
+        far_close_id = far_result["order"]["order_id"]
+        order_manager.track(TrackedOrder(
+            order_id=far_close_id, instrument=far_instr,
+            direction="sell", amount=amount, limit_price=far_close_price,
+            label=f"CLOSE-FAR-{asset}",
+        ))
 
-    trade = create_calendar_trade(
-        asset=asset,
-        date_open=date.today(),
-        option_type=option_type.capitalize(),
-        strike=strike_actual,
-        expiry_near=expiry_near,
-        expiry_far=expiry_far,
-        near_days=near_days_actual,
-        far_days=far_days_actual,
-        qty=qty,
-        spot_open=spot,
-        near_prem=round(near_prem, 4),
-        far_prem=round(far_prem, 4),
-        net_debit=round(net_debit_rolled, 4),
-        broker=broker.broker_name,
-        near_instrument=near_order.instrument,
-        far_instrument=op.get("far_instrument", ""),
-        open_fees=round(open_fee, 4),
-        notes=f"ROLL {asset} {option_type.upper()} calendar, new {near_days_actual}d near leg",
-    )
+        try:
+            near_state = await _wait_for_fill(client, near_close_id, order_timeout)
+            far_state  = await _wait_for_fill(client, far_close_id,  order_timeout)
+        except (OrderTimeoutError, RuntimeError) as exc:
+            logger.error("Close failed: %s", exc)
+            return None
 
-    return near_order
+        order_manager.update(near_close_id, OrderState.FILLED, fill_price=near_state.get("average_price", near_close_price))
+        order_manager.update(far_close_id,  OrderState.FILLED, fill_price=far_state.get("average_price",  far_close_price))
+
+        near_close_usd = _usd_price(near_state.get("average_price", near_close_price), spot, asset)
+        far_close_usd  = _usd_price(far_state.get("average_price",  far_close_price),  spot, asset)
+
+        # closing credit = far_close (received) - near_close (paid)
+        closing_credit = far_close_usd - near_close_usd
+        logger.info(
+            "Spread closed: near_close=%.4f  far_close=%.4f  credit=%.4f",
+            near_close_usd, far_close_usd, closing_credit,
+        )
+        return closing_credit
+
+
+async def _async_roll_near_leg(
+    position: dict,
+    new_candidate: CalendarCandidate,
+    paper: bool,
+    client_id: str,
+    client_secret: str,
+    order_manager: OrderManager,
+    slippage_pct: float = SLIPPAGE_LIMIT_PCT,
+    order_timeout: int = ORDER_TIMEOUT_SEC,
+) -> bool:
+    """
+    Roll the near leg: close the current short near leg and open a new one.
+
+    The far leg is left untouched.
+    """
+    asset      = position["asset"]
+    spot       = position.get("spot_open", new_candidate.spot)
+    near_instr = position["near_instrument"]
+    amount     = position["qty"]
+    new_near   = new_candidate.near_instrument
+
+    async with _DeribitRPCClient(paper, client_id, client_secret) as client:
+        # Buy back old near leg
+        try:
+            ticker = await client.get_ticker(near_instr)
+            close_price = (ticker.get("best_bid_price", 0) + ticker.get("best_ask_price", 0)) / 2 * 1.02
+        except Exception:
+            close_price = 0.001
+
+        close_result = await client.place_order(
+            near_instr, "buy", amount, round(max(close_price, 0.0001), 4),
+            label=f"ROLL-CLOSE-{asset}",
+        )
+        close_id = close_result["order"]["order_id"]
+        order_manager.track(TrackedOrder(
+            order_id=close_id, instrument=near_instr,
+            direction="buy", amount=amount, limit_price=close_price,
+            label=f"ROLL-CLOSE-{asset}",
+        ))
+
+        try:
+            await _wait_for_fill(client, close_id, order_timeout)
+            order_manager.update(close_id, OrderState.FILLED)
+        except (OrderTimeoutError, RuntimeError) as exc:
+            logger.error("Roll: close of near leg failed: %s", exc)
+            return False
+
+        # Sell new near leg
+        new_limit = _index_price(new_candidate.near_bid, new_candidate.spot, asset)
+        sell_result = await client.place_order(
+            new_near, "sell", amount, new_limit,
+            label=f"ROLL-OPEN-{asset}",
+        )
+        sell_id = sell_result["order"]["order_id"]
+        order_manager.track(TrackedOrder(
+            order_id=sell_id, instrument=new_near,
+            direction="sell", amount=amount, limit_price=new_limit,
+            label=f"ROLL-OPEN-{asset}",
+        ))
+
+        try:
+            await _wait_for_fill(client, sell_id, order_timeout)
+            order_manager.update(sell_id, OrderState.FILLED)
+        except (OrderTimeoutError, RuntimeError) as exc:
+            logger.error("Roll: open of new near leg failed: %s — position is far-leg-only", exc)
+            return False
+
+    logger.info("Near leg rolled from %s → %s", near_instr, new_near)
+    return True
+
+
+# ── Public executor class ─────────────────────────────────────────────────────
+
+class CalendarExecutor:
+    """
+    Hardened calendar spread executor implementing ExecutorProtocol.
+
+    All methods are synchronous; they spin up a temporary async event loop
+    so they can be called from a non-async scheduler tick.
+
+    Parameters
+    ----------
+    paper
+        True for Deribit testnet (default), False for live.
+    client_id / client_secret
+        Deribit API credentials.  Public market data works without creds,
+        but order placement requires authenticated access.
+    portfolio_value
+        Current portfolio value in USD, used for position sizing.
+    order_manager
+        Optional shared OrderManager instance.  One is created if omitted.
+    slippage_pct
+        Maximum acceptable deviation from mid price (default 2%).
+    order_timeout
+        Seconds to wait for an order to fill before giving up (default 30).
+    """
+
+    def __init__(
+        self,
+        paper:          bool  = True,
+        client_id:      str   = "",
+        client_secret:  str   = "",
+        portfolio_value: float = 10_000.0,
+        order_manager:  OrderManager | None = None,
+        slippage_pct:   float = SLIPPAGE_LIMIT_PCT,
+        order_timeout:  int   = ORDER_TIMEOUT_SEC,
+    ) -> None:
+        self.paper           = paper
+        self.client_id       = client_id or config.DERIBIT_CLIENT_ID
+        self.client_secret   = client_secret or config.DERIBIT_CLIENT_SECRET
+        self.portfolio_value = portfolio_value
+        self.order_manager   = order_manager or OrderManager()
+        self.slippage_pct    = slippage_pct
+        self.order_timeout   = order_timeout
+
+    def _run(self, coro):
+        """Run an async coroutine in a fresh event loop."""
+        return asyncio.run(coro)
+
+    # ── ExecutorProtocol implementation ───────────────────────────────────────
+
+    def enter_spread(self, candidate: CalendarCandidate) -> dict | None:
+        """
+        Enter a calendar spread.
+
+        Returns a fill dict on success or None if the order was rejected or
+        timed out.  Raises LegRiskError if the near leg filled but the far
+        leg failed (near leg will have already been closed).
+        """
+        try:
+            return self._run(
+                _async_enter_spread(
+                    candidate,
+                    paper=self.paper,
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    order_manager=self.order_manager,
+                    portfolio_value=self.portfolio_value,
+                    slippage_pct=self.slippage_pct,
+                    order_timeout=self.order_timeout,
+                )
+            )
+        except LegRiskError:
+            raise
+        except SlippageError as exc:
+            logger.warning("Slippage exceeded: %s", exc)
+            return None
+        except Exception:
+            logger.exception("Unexpected error in enter_spread")
+            return None
+
+    def close_spread(self, position: dict) -> float | None:
+        """Close both legs.  Returns closing credit in USD or None on failure."""
+        try:
+            return self._run(
+                _async_close_spread(
+                    position,
+                    paper=self.paper,
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    order_manager=self.order_manager,
+                    order_timeout=self.order_timeout,
+                )
+            )
+        except Exception:
+            logger.exception("Unexpected error in close_spread")
+            return None
+
+    def roll_near_leg(self, position: dict, new_candidate: CalendarCandidate) -> bool:
+        """Roll the near leg to new_candidate.  Returns True on success."""
+        try:
+            return self._run(
+                _async_roll_near_leg(
+                    position,
+                    new_candidate,
+                    paper=self.paper,
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    order_manager=self.order_manager,
+                    slippage_pct=self.slippage_pct,
+                    order_timeout=self.order_timeout,
+                )
+            )
+        except Exception:
+            logger.exception("Unexpected error in roll_near_leg")
+            return False

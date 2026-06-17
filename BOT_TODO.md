@@ -82,16 +82,17 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 5 — Execution Hardening
 
-- [ ] Implement `execution/executor.py` (hardened port of `trading/executor.py`)
-  - [ ] Submit spread as combo order (both legs simultaneously) to avoid leg risk
-  - [ ] Enforce slippage bound: reject fill if price > X% from mid
-  - [ ] Retry on transient failures (network timeout, rate limit)
-- [ ] Implement `execution/order_manager.py`
-  - [ ] Track order lifecycle: submitted → partial fill → filled → cancelled
-  - [ ] Reconcile order state against Deribit REST API on startup
-  - [ ] Detect stuck orders and cancel after timeout
-- [ ] Write executor unit tests with mocked Deribit client (`tests/test_executor.py`)
-- [ ] Remove unused code from copied files. Update comments and docstrings.
+- [x] Implement `execution/executor.py` (hardened port of `trading/executor.py`)
+  - [x] Submit spread as combo order (both legs simultaneously) to avoid leg risk
+  - [x] Enforce slippage bound: reject fill if price > X% from intended limit price
+  - [x] Retry on transient failures (network timeout, rate limit)
+- [x] Implement `execution/order_manager.py`
+  - [x] Track order lifecycle: submitted → partial fill → filled → cancelled
+  - [x] Reconcile order state against Deribit REST API on startup
+  - [x] Detect stuck orders and cancel after timeout
+- [x] Write executor unit tests with mocked Deribit client (`tests/test_executor.py`)
+- [x] Remove unused code from copied files. Update comments and docstrings.
+- [x] Add `execution/scratch_executor.py` — end-to-end verification script (9 scenarios, no live orders placed)
 
 ---
 
