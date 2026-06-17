@@ -22,10 +22,8 @@ check_calendar_status(spot, iv, near_days_left, far_days_left, op)
     Evaluate stop / take-profit / warn conditions for an open position.
 """
 
-from config import STOP_PCT, TAKE_PROFIT_PCT
+from config import RISK_FREE_RATE, STOP_PCT, TAKE_PROFIT_PCT
 from core.pricing import bs_call, bs_put
-
-RISK_FREE_RATE = 0.0  # crypto calendars; pass explicitly per-call to override
 
 
 # ── P&L helpers ───────────────────────────────────────────────────────────────

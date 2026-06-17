@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import config
+from config import RISK_FREE_RATE
 from core.calendar_engine import find_breakevens, pnl_at_near_expiry
 from data.chain_cache import ChainCache
 from data.deribit_feed import TickerSnapshot
@@ -33,8 +34,6 @@ _INSTRUMENT_RE = re.compile(
     r"^(?P<asset>[A-Z]+)-(?P<expiry>\d{1,2}[A-Z]{3}\d{2})-(?P<strike>\d+)-(?P<type>[CP])$"
 )
 _EXPIRY_FMT = "%d%b%y"   # e.g. "27JUN25"
-
-RISK_FREE_RATE = 0.0      # standard for crypto; matches calendar_engine.py
 
 
 # ── Data structures ───────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ def _load_env(path: str = ".env") -> None:
 _load_env()
 
 # Assets to trade
-ASSETS = ["BTC", "ETH"]
+ASSETS = ["BTC", "ETH", "SOL"]
 
 # Calendar horizons (days to expiry)
 NEAR_DAYS_OPTIONS = [7, 14]
@@ -30,6 +30,12 @@ MIN_OI_FAR      = 100    # minimum open interest on far-leg strike
 # Position sizing
 MAX_LOSS_PCT  = 0.02  # max 2% of portfolio per trade
 MAX_POSITIONS = 3     # max concurrent open calendar spreads
+
+# Risk-free rate used in Black-Scholes pricing.
+# Deribit crypto options have no financing cost baked in, so 0.0 is the
+# standard and correct value.  Override only if pricing against collateral
+# that earns a yield (e.g. stablecoin margin earning interest).
+RISK_FREE_RATE = 0.0   # decimal (0.0 = 0%)
 
 # Stop / take-profit
 STOP_PCT        = 0.50  # close if spread value < 50% of debit paid

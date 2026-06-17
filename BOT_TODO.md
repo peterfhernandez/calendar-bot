@@ -64,6 +64,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - [x] Write unit tests for scanner and sizer (`tests/test_scanner.py`)
 - [x] Remove any unused functions from the scanner.py module. Update comments and docstrings.
 - [x] Add `scratch_scan.py` — test the scanner: manual debug script in repo's root
+- [x] Move `scratch_scan.py` to the strategy folder
 
 ---
 
@@ -151,7 +152,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Notes
 
-- `scratch_scan.py` in repo root — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python scratch_scan.py`. Not committed to git (add to `.gitignore` if needed).
+- `strategy/scratch_scan.py` — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python -m strategy.scratch_scan` from the repo root.
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
 - Do not switch to live trading until Phase 9 is fully complete
