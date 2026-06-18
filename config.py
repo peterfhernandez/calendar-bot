@@ -52,6 +52,8 @@ DERIBIT_CLIENT_ID     = _os.environ.get("DERIBIT_CLIENT_ID",     "")
 DERIBIT_CLIENT_SECRET = _os.environ.get("DERIBIT_CLIENT_SECRET", "")
 
 # Alerts
-ALERT_EMAIL    = ""  # SMTP recipient; leave empty to disable
-TELEGRAM_TOKEN = ""  # bot token; leave empty to disable
-TELEGRAM_CHAT  = ""  # chat ID; leave empty to disable
+# SMTP credentials are read from env vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
+# (defaults: smtp.gmail.com:587).  Set ALERT_EMAIL to enable email alerts.
+ALERT_EMAIL    = _os.environ.get("ALERT_EMAIL",    "")  # SMTP recipient
+TELEGRAM_TOKEN = _os.environ.get("TELEGRAM_TOKEN", "")  # bot token
+TELEGRAM_CHAT  = _os.environ.get("TELEGRAM_CHAT",  "")  # chat ID

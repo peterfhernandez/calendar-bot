@@ -1,0 +1,215 @@
+"""
+alerts/notifier.py
+==================
+Alert dispatcher for the calendar spread bot.
+
+Supports two channels:
+  - Email  via smtplib (SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS env vars)
+  - Telegram via the Bot API (TELEGRAM_TOKEN / TELEGRAM_CHAT config values)
+
+Both channels are optional: if credentials are absent the channel is silently
+skipped.  Each channel is configured through config.py and the .env file.
+
+Deduplication
+-------------
+Each alert has a *key* (event_type + subject).  A cooldown window
+(default 300 s) prevents the same alert from being re-sent within that window.
+
+Public API
+----------
+Notifier(cooldown_sec=300)
+    send(event_type, subject, body)  — dispatches to all configured channels
+    send_stop_loss(instrument, pnl)
+    send_take_profit(instrument, pnl)
+    send_daily_limit(current_loss)
+    send_error(context, detail)
+
+All methods are thread-safe.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import smtplib
+import ssl
+import threading
+import time
+from email.mime.text import MIMEText
+from typing import Any
+
+import aiohttp
+
+import config
+
+logger = logging.getLogger(__name__)
+
+# ── SMTP settings (read from .env / environment) ──────────────────────────────
+
+import os as _os
+
+_SMTP_HOST = _os.environ.get("SMTP_HOST", "smtp.gmail.com")
+_SMTP_PORT = int(_os.environ.get("SMTP_PORT", "587"))
+_SMTP_USER = _os.environ.get("SMTP_USER", "")
+_SMTP_PASS = _os.environ.get("SMTP_PASS", "")
+_SMTP_FROM = _os.environ.get("SMTP_FROM", _SMTP_USER)
+
+
+class Notifier:
+    """
+    Dispatches alerts to email and/or Telegram with per-key cooldown deduplication.
+
+    Parameters
+    ----------
+    cooldown_sec : int
+        Minimum seconds between two alerts with the same (event_type, subject) key.
+    """
+
+    def __init__(self, cooldown_sec: int = 300) -> None:
+        self._cooldown = cooldown_sec
+        self._sent_at: dict[str, float] = {}   # key → last-sent timestamp
+        self._lock = threading.Lock()
+
+    # ── Public helpers ────────────────────────────────────────────────────────
+
+    def send_stop_loss(self, instrument: str, pnl: float) -> None:
+        """Alert when a position hits the stop-loss threshold."""
+        self.send(
+            event_type="stop_loss",
+            subject=f"Stop-loss triggered: {instrument}",
+            body=(
+                f"Position {instrument} hit the stop-loss threshold.\n"
+                f"Realised P&L: ${pnl:+.2f}"
+            ),
+        )
+
+    def send_take_profit(self, instrument: str, pnl: float) -> None:
+        """Alert when a position hits the take-profit threshold."""
+        self.send(
+            event_type="take_profit",
+            subject=f"Take-profit triggered: {instrument}",
+            body=(
+                f"Position {instrument} hit the take-profit threshold.\n"
+                f"Realised P&L: ${pnl:+.2f}"
+            ),
+        )
+
+    def send_daily_limit(self, current_loss: float) -> None:
+        """Alert when the daily loss limit is breached."""
+        self.send(
+            event_type="daily_limit",
+            subject="Daily loss limit breached — bot halted",
+            body=(
+                f"Cumulative daily loss ${current_loss:.2f} exceeded the "
+                f"configured limit of ${config.DAILY_LOSS_LIMIT:.2f}.\n"
+                "All trading has been halted for the remainder of the day."
+            ),
+        )
+
+    def send_error(self, context: str, detail: str) -> None:
+        """Alert on unexpected runtime errors."""
+        self.send(
+            event_type="error",
+            subject=f"Bot error: {context}",
+            body=f"An error occurred in {context}:\n\n{detail}",
+        )
+
+    # ── Core dispatch ─────────────────────────────────────────────────────────
+
+    def send(self, event_type: str, subject: str, body: str) -> None:
+        """
+        Dispatch an alert to all configured channels.
+
+        Deduplication: if the same (event_type, subject) key was sent within
+        `cooldown_sec` seconds, the call is a no-op and a DEBUG log is written.
+
+        Parameters
+        ----------
+        event_type : str
+            Machine-readable category, e.g. "stop_loss", "error".
+        subject : str
+            Human-readable subject line.
+        body : str
+            Full alert body text (plain text).
+        """
+        key = f"{event_type}:{subject}"
+        now = time.monotonic()
+
+        with self._lock:
+            last = self._sent_at.get(key, 0.0)
+            if now - last < self._cooldown:
+                remaining = int(self._cooldown - (now - last))
+                logger.debug(
+                    "Alert suppressed (cooldown %ds remaining): %s", remaining, subject
+                )
+                return
+            self._sent_at[key] = now
+
+        logger.info("Sending alert [%s]: %s", event_type, subject)
+
+        self._dispatch_email(subject, body)
+        self._dispatch_telegram(subject, body)
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+
+    def _dispatch_email(self, subject: str, body: str) -> None:
+        recipient = getattr(config, "ALERT_EMAIL", "")
+        if not recipient:
+            return
+        if not _SMTP_USER or not _SMTP_PASS:
+            logger.warning(
+                "Email alert skipped: SMTP_USER / SMTP_PASS not configured"
+            )
+            return
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = f"[CalendarBot] {subject}"
+        msg["From"]    = _SMTP_FROM or _SMTP_USER
+        msg["To"]      = recipient
+
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=context)
+                smtp.login(_SMTP_USER, _SMTP_PASS)
+                smtp.sendmail(msg["From"], [recipient], msg.as_string())
+            logger.info("Email sent to %s", recipient)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to send email alert: %s", exc)
+
+    # ── Telegram ──────────────────────────────────────────────────────────────
+
+    def _dispatch_telegram(self, subject: str, body: str) -> None:
+        token = getattr(config, "TELEGRAM_TOKEN", "")
+        chat  = getattr(config, "TELEGRAM_CHAT",  "")
+        if not token or not chat:
+            return
+
+        text = f"*[CalendarBot]* {subject}\n\n{body}"
+
+        # Fire-and-forget: schedule on any running event loop, or run a new one
+        # in a background thread if none is available.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._post_telegram(token, chat, text))
+        except RuntimeError:
+            threading.Thread(
+                target=lambda: asyncio.run(self._post_telegram(token, chat, text)),
+                daemon=True,
+            ).start()
+
+    @staticmethod
+    async def _post_telegram(token: str, chat: str, text: str) -> None:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat, "text": text, "parse_mode": "Markdown"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logger.error("Telegram API error %d: %s", resp.status, body)
+                    else:
+                        logger.info("Telegram message sent to chat %s", chat)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to send Telegram alert: %s", exc)

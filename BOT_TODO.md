@@ -109,11 +109,11 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 7 — Alerts
 
-- [ ] Implement `alerts/notifier.py`
-  - [ ] Email alert (smtplib) for stop-loss, take-profit, daily loss limit, errors
-  - [ ] Optional Telegram alert (python-telegram-bot)
-  - [ ] Alert deduplication (don't spam same alert)
-- [ ] Configure alert recipients in `config.py`
+- [x] Implement `alerts/notifier.py`
+  - [x] Email alert (smtplib) for stop-loss, take-profit, daily loss limit, errors
+  - [x] Optional Telegram alert (python-telegram-bot)
+  - [x] Alert deduplication (don't spam same alert)
+- [x] Configure alert recipients in `config.py`
 
 ---
 
@@ -159,4 +159,5 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - `strategy/scratch_decision.py` — end-to-end dry-run of the decision engine; connects to the paper feed, runs `scan_tick()` then `monitor_tick()`, and prints a full status report. Uses a separate `db/scratch_decision.db` so it doesn't touch the real database. Run with `python -m strategy.scratch_decision` from the repo root.
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
+- `alerts/scratch_notifier.py` — end-to-end verification script for the Notifier; runs 8 sections covering dispatch, deduplication, cooldown expiry, all helper methods, skip-when-unconfigured, and payload correctness (19 checks, no live network calls). Run with `python -m alerts.scratch_notifier` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
