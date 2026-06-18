@@ -98,11 +98,12 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 6 — Scheduler and Monitor Loop
 
-- [ ] Implement `monitor/loop.py`
-  - [ ] APScheduler jobs: scan every 5 min, monitor every 1 min
-  - [ ] Graceful shutdown on SIGINT/SIGTERM
-  - [ ] Log all events to rotating file + console
-- [ ] Wire `bot.py` to start the scheduler and data feed
+- [x] Implement `monitor/loop.py`
+  - [x] APScheduler jobs: scan every 5 min, monitor every 1 min
+  - [x] Graceful shutdown on SIGINT/SIGTERM
+  - [x] Log all events to rotating file + console
+- [x] Wire `bot.py` to start the scheduler and data feed
+- [x] Add `monitor/scratch_loop.py` — test the loop
 
 ---
 
@@ -153,6 +154,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Notes
 
+- `monitor/scratch_loop.py` — end-to-end verification script for the BotLoop; runs with fake cache/executor for 12 s then prints a summary. Run with `python -m monitor.scratch_loop` from the repo root.
 - `strategy/scratch_scan.py` — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python -m strategy.scratch_scan` from the repo root.
 - `strategy/scratch_decision.py` — end-to-end dry-run of the decision engine; connects to the paper feed, runs `scan_tick()` then `monitor_tick()`, and prints a full status report. Uses a separate `db/scratch_decision.db` so it doesn't touch the real database. Run with `python -m strategy.scratch_decision` from the repo root.
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project

@@ -1,60 +1,95 @@
-"""Entry point for the calendar spread bot."""
+"""
+bot.py
+======
+Entry point for the calendar spread bot.
 
+Starts the Deribit WebSocket feed and the BotLoop scheduler together.
+The feed and the loop run as concurrent asyncio tasks; the loop blocks
+until SIGINT/SIGTERM, then both are shut down cleanly.
+
+Usage
+-----
+    python bot.py              # paper trading (DERIBIT_PAPER = True in config)
+    python bot.py --live       # live trading  (sets DERIBIT_PAPER = False)
+    python bot.py --portfolio 50000
+"""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
 import logging
-import signal
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
+from data.chain_cache import ChainCache
+from data.deribit_feed import DeribitFeed
+from monitor.loop import BotLoop, configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log"),
-    ],
-)
-log = logging.getLogger("bot")
+logger = logging.getLogger("bot")
 
 
-async def scan_job():
-    """Placeholder: run scanner and decision engine."""
-    log.info("scan_job fired — scanner not yet implemented")
+async def _run(portfolio_value: float, paper: bool) -> None:
+    configure_logging()
 
+    cache = ChainCache()
 
-async def monitor_job():
-    """Placeholder: check open positions for stop/TP."""
-    log.info("monitor_job fired — monitor not yet implemented")
-
-
-async def main():
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(scan_job, "interval", seconds=config.SCAN_INTERVAL_SEC, id="scan")
-    scheduler.add_job(monitor_job, "interval", seconds=config.MONITOR_INTERVAL_SEC, id="monitor")
-    scheduler.start()
-
-    log.info(
-        "Calendar bot started (paper=%s). Scan every %ds, monitor every %ds.",
-        config.DERIBIT_PAPER,
-        config.SCAN_INTERVAL_SEC,
-        config.MONITOR_INTERVAL_SEC,
+    feed = DeribitFeed(
+        assets=config.ASSETS,
+        paper=paper,
+        client_id=config.DERIBIT_CLIENT_ID,
+        client_secret=config.DERIBIT_CLIENT_SECRET,
+        on_ticker=cache.update,
     )
 
-    stop_event = asyncio.Event()
+    loop = BotLoop(
+        cache=cache,
+        portfolio_value=portfolio_value,
+    )
 
-    def _shutdown(sig, frame):
-        log.info("Shutdown signal received (%s), stopping…", sig)
-        stop_event.set()
+    logger.info(
+        "Starting calendar bot  paper=%s  assets=%s  portfolio=%.2f",
+        paper,
+        config.ASSETS,
+        portfolio_value,
+    )
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    # Run the feed and the scheduler loop concurrently
+    feed_task = asyncio.create_task(feed.start(), name="feed")
+    loop_task = asyncio.create_task(loop.run(),  name="loop")
 
-    await stop_event.wait()
-    scheduler.shutdown(wait=False)
-    log.info("Bot stopped.")
+    # Wait for the loop to finish (triggered by stop() or a signal).
+    # Cancel the feed afterwards so we don't leave a dangling WS connection.
+    try:
+        await loop_task
+    finally:
+        await feed.stop()
+        feed_task.cancel()
+        try:
+            await feed_task
+        except asyncio.CancelledError:
+            pass
+
+    logger.info("Bot exited cleanly.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Calendar Spread Bot")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Use live Deribit endpoint (default: paper trading)",
+    )
+    parser.add_argument(
+        "--portfolio",
+        type=float,
+        default=10_000.0,
+        help="Portfolio value in USD used for position sizing (default: 10000)",
+    )
+    args = parser.parse_args()
+
+    paper = not args.live
+    asyncio.run(_run(portfolio_value=args.portfolio, paper=paper))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
