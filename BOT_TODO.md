@@ -127,6 +127,9 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
   - [ ] Record all trades, P&L, and decision points
   - [ ] Output summary: win rate, avg P&L, max drawdown, Sharpe
 - [ ] Run backtest across at least 2 distinct vol regimes before going live
+  - [ ] Identify 4 distinct vol regimes
+  - [ ] Setup a script to run the backtest on these 4 regimes
+  - [ ] make sure that output summaries are clearly displayed for all regimes. Display: regime name, win rate, avg p&l, max drawdown, sharpe
 
 ---
 
@@ -154,10 +157,10 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Notes
 
-- `monitor/scratch_loop.py` — end-to-end verification script for the BotLoop; runs with fake cache/executor for 12 s then prints a summary. Run with `python -m monitor.scratch_loop` from the repo root.
-- `strategy/scratch_scan.py` — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python -m strategy.scratch_scan` from the repo root.
-- `strategy/scratch_decision.py` — end-to-end dry-run of the decision engine; connects to the paper feed, runs `scan_tick()` then `monitor_tick()`, and prints a full status report. Uses a separate `db/scratch_decision.db` so it doesn't touch the real database. Run with `python -m strategy.scratch_decision` from the repo root.
+- `scratch/scratch_loop.py` — end-to-end verification script for the BotLoop; runs with fake cache/executor for 12 s then prints a summary. Run with `python -m scratch.scratch_loop` from the repo root.
+- `scratch/scratch_scan.py` — manual debug script; connects to Deribit paper feed, waits 15s for chain data, then runs the scanner and prints ranked candidates. Run with `python -m scratch.scratch_scan` from the repo root.
+- `scratch/scratch_decision.py` — end-to-end dry-run of the decision engine; connects to the paper feed, runs `scan_tick()` then `monitor_tick()`, and prints a full status report. Uses a separate `db/scratch_decision.db` so it doesn't touch the real database. Run with `python -m scratch.scratch_decision` from the repo root.
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
-- `alerts/scratch_notifier.py` — end-to-end verification script for the Notifier; runs 8 sections covering dispatch, deduplication, cooldown expiry, all helper methods, skip-when-unconfigured, and payload correctness (19 checks, no live network calls). Run with `python -m alerts.scratch_notifier` from the repo root.
+- `scratch/scratch_notifier.py` — end-to-end verification script for the Notifier; runs 8 sections covering dispatch, deduplication, cooldown expiry, all helper methods, skip-when-unconfigured, and payload correctness (19 checks, no live network calls). Run with `python -m scratch.scratch_notifier` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete

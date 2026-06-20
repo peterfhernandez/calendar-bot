@@ -13,6 +13,14 @@ This repo is a python project for aun automated bot that trades calendar options
 - If necessary update existing test code to support any updates made to existing modules
 - Fix code for any broken tests that arise from newly created code
 
+### Create debug files
+
+- for any new code created, create scripts with a name of `scratch_*.py` within the scratch folder
+- scrath files demonstrate the new functionality, proving to the human that the code works as intended
+- scratch files provide debug capability
+- scratch files are not unit tests and they establish real connections and perform real actions when paper trading
+- scratch files do not perform real trades. They do not run when `DERIBIT_PAPER = False`
+
 ### Update README.md if needed
 
 Make sure the Readme.md file is up to date as well.
