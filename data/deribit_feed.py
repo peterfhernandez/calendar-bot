@@ -259,7 +259,9 @@ class DeribitFeed:
                 instrument = channel.split(".")[1]
                 snapshot = self._parse_ticker(instrument, data)
                 if snapshot and self.on_ticker:
-                    await self.on_ticker(snapshot)
+                    result = self.on_ticker(snapshot)
+                    if asyncio.iscoroutine(result):
+                        await result
 
     def _parse_ticker(self, instrument: str, data: dict) -> TickerSnapshot | None:
         try:
