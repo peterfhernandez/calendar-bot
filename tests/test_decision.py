@@ -827,3 +827,114 @@ class TestClosePositionPnl:
 
         expected_pnl = 0.025 - 0.02 * 1.0  # = 0.005
         assert engine._today_pnl == pytest.approx(expected_pnl)
+
+
+# ── Fix 6: Market mid-price spread value preferred over B-S ───────────────────
+
+class TestMarketSpreadValue:
+    """
+    _monitor_position must use live market bid/ask mid-prices to compute the
+    current spread value rather than Black-Scholes with a single uniform IV.
+    B-S can diverge massively from market prices for options away from ATM or
+    with strong IV skew (e.g. deep-ITM BTC calls at 61000 with BTC at 63600
+    showed B-S sv=~$2266 vs actual market spread of ~$222).
+    """
+
+    def _open_pos(self, near_instr: str, far_instr: str,
+                  net_debit: float = 222.59, qty: float = 0.8) -> dict:
+        near_label = _future_label(13)
+        far_label  = _future_label(41)
+        return {
+            "trade_id":        10,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          61_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             qty,
+            "net_debit":       net_debit,
+            "spot_open":       63_597.0,
+            "near_days":       13,
+            "far_days":        41,
+            "near_instrument": near_instr,
+            "far_instrument":  far_instr,
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def _cache_with_legs(self, near_instr: str, far_instr: str,
+                         near_bid: float, near_ask: float,
+                         far_bid: float,  far_ask: float) -> MagicMock:
+        """Cache that returns specific bid/ask for both leg instruments."""
+        near_snap = _make_snap(near_instr, bid=near_bid, ask=near_ask)
+        far_snap  = _make_snap(far_instr,  bid=far_bid,  ask=far_ask)
+        cache = MagicMock()
+        cache.get_spot.return_value = 63_597.0
+        cache.get_chain.return_value = [near_snap, far_snap]
+        return cache
+
+    def test_market_sv_used_when_leg_prices_available(self):
+        """
+        When both legs are in the cache with bid/ask, the monitor must compute
+        sv = (far_mid - near_mid) * qty from market prices, not B-S.
+        """
+        near_instr = "BTC-13DAY-61000-C"
+        far_instr  = "BTC-41DAY-61000-C"
+        # Market: near_mid=4866, far_mid=5089 → spread_mid=223, total_sv=223*0.8=178.4
+        # B-S would give sv≈2266 (1272% of debit) — would spuriously TP
+        cache = self._cache_with_legs(
+            near_instr, far_instr,
+            near_bid=4865.0, near_ask=4867.0,
+            far_bid=5088.0,  far_ask=5090.0,
+        )
+        pos = self._open_pos(near_instr, far_instr, net_debit=222.59, qty=0.8)
+
+        engine, _ = _make_engine(cache=cache)
+        engine._get_iv = MagicMock(return_value=0.80)
+
+        market_sv = engine._get_market_spread_value(pos)
+        # near_mid=4866, far_mid=5089, spread_mid=223, total=223*0.8=178.4
+        expected_sv = ((5088 + 5090) / 2 - (4865 + 4867) / 2) * 0.8
+        assert market_sv == pytest.approx(expected_sv)
+
+    def test_market_sv_prevents_spurious_tp(self):
+        """
+        With market prices, pct = sv/total_debit ≈ 100% (no TP).
+        With B-S only it would be ~1272% (immediate TP).
+        """
+        near_instr = "BTC-13DAY-61000-C"
+        far_instr  = "BTC-41DAY-61000-C"
+        # market spread value ≈ net_debit (position roughly at breakeven)
+        cache = self._cache_with_legs(
+            near_instr, far_instr,
+            near_bid=4865.0, near_ask=4867.0,
+            far_bid=5088.0,  far_ask=5090.0,
+        )
+        executor = MagicMock()
+        pos = self._open_pos(near_instr, far_instr, net_debit=222.59, qty=0.8)
+
+        engine, _ = _make_engine(cache=cache, executor=executor)
+        engine._get_iv = MagicMock(return_value=0.80)
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]):
+            status = engine.monitor_tick()
+
+        # Must NOT have closed (pct≈100%, well inside 150% TP threshold)
+        executor.close_spread.assert_not_called()
+        assert "All positions OK" in status.message or "OK" in status.message
+
+    def test_falls_back_to_bs_when_leg_prices_missing(self):
+        """When leg instruments are not in the cache, market_sv is None and B-S is used."""
+        near_instr = "BTC-13DAY-61000-C"
+        far_instr  = "BTC-41DAY-61000-C"
+        # Cache has no matching instruments
+        cache = MagicMock()
+        cache.get_spot.return_value = 63_597.0
+        cache.get_chain.return_value = []
+
+        pos = self._open_pos(near_instr, far_instr, net_debit=222.59, qty=0.8)
+        engine, _ = _make_engine(cache=cache)
+
+        market_sv = engine._get_market_spread_value(pos)
+        assert market_sv is None

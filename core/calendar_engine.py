@@ -126,6 +126,7 @@ def check_calendar_status(
     near_days_left: int,
     far_days_left: int,
     op: dict,
+    market_sv: float | None = None,
 ) -> tuple[str, float, float, str]:
     """
     Evaluate the current status of an open calendar spread position.
@@ -138,6 +139,12 @@ def check_calendar_status(
     far_days_left  : int    Days remaining until far-leg expiry
     op             : dict   Open position dict with keys:
                             net_debit, qty, strike, option_type
+    market_sv      : float | None
+                    If provided, use this as the current spread value instead of
+                    computing it via Black-Scholes.  Pass the market mid-price
+                    spread (far_mid - near_mid) * qty when live bid/ask data is
+                    available — B-S with a single uniform IV can be wildly wrong
+                    for options far from ATM or with strong IV skew.
 
     Returns
     -------
@@ -154,7 +161,10 @@ def check_calendar_status(
     strike      = op["strike"]
     option_type = op["option_type"]
 
-    sv  = spread_value(spot, strike, T_near, T_far, RISK_FREE_RATE, iv, qty, option_type)
+    if market_sv is not None:
+        sv = market_sv
+    else:
+        sv = spread_value(spot, strike, T_near, T_far, RISK_FREE_RATE, iv, qty, option_type)
     total_debit = net_debit * qty
     pct = sv / total_debit if total_debit > 0 else 0.0
     pnl = sv - total_debit

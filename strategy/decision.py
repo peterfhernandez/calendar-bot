@@ -439,8 +439,14 @@ class DecisionEngine:
             logger.warning("No IV for trade %d — skipping status check", trade_id)
             return "__NO_IV__", 0.0
 
-        status, sv, pct, msg = check_calendar_status(spot, iv, near_days_left, far_days_left, pos)
-        logger.info("trade_id=%d  %s", trade_id, msg)
+        market_sv = self._get_market_spread_value(pos)
+        if market_sv is None:
+            logger.debug("trade_id=%d  no market prices for legs — falling back to B-S", trade_id)
+        status, sv, pct, msg = check_calendar_status(
+            spot, iv, near_days_left, far_days_left, pos, market_sv=market_sv
+        )
+        logger.info("trade_id=%d  %s%s", trade_id, msg,
+                    "" if market_sv is not None else "  [B-S fallback]")
 
         if status == "stop":
             return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv), 0.0
@@ -583,6 +589,38 @@ class DecisionEngine:
             if snap.instrument == far_instrument:
                 return snap.mark_iv if snap.mark_iv > 0 else None
         return None
+
+    def _get_market_spread_value(self, pos: dict) -> float | None:
+        """
+        Compute current spread value from live market mid-prices in the cache.
+
+        Returns (far_mid - near_mid) * qty, or None if either leg is missing.
+        This is far more reliable than Black-Scholes with a uniform IV, which
+        can diverge badly from market prices for options away from ATM or when
+        there is significant IV skew across the term structure.
+        """
+        near_instrument = pos.get("near_instrument")
+        far_instrument  = pos.get("far_instrument")
+        if not near_instrument or not far_instrument:
+            return None
+
+        chain = self._cache.get_chain(pos["asset"])
+        near_mid = far_mid = None
+        for snap in chain:
+            if snap.instrument == near_instrument:
+                if snap.bid > 0 and snap.ask > 0:
+                    near_mid = (snap.bid + snap.ask) / 2
+                elif snap.mark_price > 0:
+                    near_mid = snap.mark_price
+            elif snap.instrument == far_instrument:
+                if snap.bid > 0 and snap.ask > 0:
+                    far_mid = (snap.bid + snap.ask) / 2
+                elif snap.mark_price > 0:
+                    far_mid = snap.mark_price
+
+        if near_mid is None or far_mid is None:
+            return None
+        return (far_mid - near_mid) * pos.get("qty", 1.0)
 
     def _status(
         self,
