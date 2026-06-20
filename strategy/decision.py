@@ -194,7 +194,8 @@ class DecisionEngine:
             else config.DAILY_LOSS_LIMIT
         )
         self._state           = BotState.IDLE
-        self._today_pnl: float = 0.0  # accumulates in-session; reset at midnight
+        self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
+        self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -252,6 +253,13 @@ class DecisionEngine:
         entered = 0
 
         for candidate in candidates:
+            if candidate.ev_score < config.MIN_EV:
+                logger.debug(
+                    "RANK skip: negative EV (%.4f) for %s %s strike=%.0f",
+                    candidate.ev_score, candidate.asset, candidate.option_type, candidate.strike,
+                )
+                continue
+
             size = size_candidate(candidate, self._portfolio_value, open_positions)
             if size.qty <= 0:
                 logger.debug("RANK skip: %s", size.reason)
@@ -308,16 +316,31 @@ class DecisionEngine:
 
         self._state = BotState.MONITOR
         actions: list[str] = []
+        skipped_no_iv = 0
+        unrealized_pnl = 0.0
 
         for pos in list(open_positions):
-            action = self._monitor_position(pos)
-            if action:
+            action, unr = self._monitor_position(pos)
+            if action == "__NO_IV__":
+                skipped_no_iv += 1
+            elif action:
                 actions.append(action)
+            else:
+                unrealized_pnl += unr
+
+        self._unrealized_pnl = unrealized_pnl
 
         # Refresh after actions
         open_positions = self._load_all_open_positions()
         self._state = BotState.IDLE if not open_positions else BotState.MONITOR
-        summary = "; ".join(actions) if actions else "All positions OK."
+
+        if skipped_no_iv and not actions:
+            summary = f"{skipped_no_iv} position(s) skipped — no IV data"
+        elif skipped_no_iv:
+            summary = "; ".join(actions) + f"; {skipped_no_iv} skipped (no IV)"
+        else:
+            summary = "; ".join(actions) if actions else "All positions OK."
+
         return self._status(f"Monitor: {summary}", open_positions)
 
     # ── Entry logic ───────────────────────────────────────────────────────────
@@ -367,11 +390,15 @@ class DecisionEngine:
 
     # ── Monitor logic ─────────────────────────────────────────────────────────
 
-    def _monitor_position(self, pos: dict) -> str | None:
+    def _monitor_position(self, pos: dict) -> tuple[str | None, float]:
         """
         Check a single open position. Closes, rolls, or logs OK.
 
-        Returns a short action string or None if no action was taken.
+        Returns (action, unrealized_pnl) where:
+          - action is a short description string, None if OK (no action taken),
+            or "__NO_IV__" if the check was skipped due to missing IV data.
+          - unrealized_pnl is the mark-to-market P&L contribution for this
+            position (non-zero only when action is None, i.e. position held).
         """
         asset       = pos["asset"]
         strike      = pos["strike"]
@@ -381,39 +408,41 @@ class DecisionEngine:
         spot = self._cache.get_spot(asset)
         if spot is None or spot <= 0:
             logger.warning("No spot for %s — skipping monitor of trade %d", asset, trade_id)
-            return None
+            return "__NO_IV__", 0.0
 
         # Determine remaining days from today
         near_days_left, far_days_left = _days_left(pos)
         if near_days_left <= 0:
             # Near leg has expired — close the full position
             logger.info("trade_id=%d near leg expired, closing", trade_id)
-            return self._close_position(pos, spot, "Near leg expired")
+            return self._close_position(pos, spot, "Near leg expired"), 0.0
 
         # Get current IV from cache (use the far instrument as representative)
         iv = self._get_iv(pos)
         if iv is None or iv <= 0:
             logger.warning("No IV for trade %d — skipping status check", trade_id)
-            return None
+            return "__NO_IV__", 0.0
 
         status, sv, pct, msg = check_calendar_status(spot, iv, near_days_left, far_days_left, pos)
         logger.info("trade_id=%d  %s", trade_id, msg)
 
         if status == "stop":
-            return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)")
+            return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)"), 0.0
 
         if status == "tp":
-            return self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)")
+            return self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)"), 0.0
 
         # Roll trigger: near leg approaching expiry and no exit signal yet
         if near_days_left <= _ROLL_TRIGGER_DAYS:
             rolled = self._try_roll(pos, spot)
             if rolled:
-                return f"trade_id={trade_id} rolled near leg"
+                return f"trade_id={trade_id} rolled near leg", 0.0
             # If roll fails, close cleanly
-            return self._close_position(pos, spot, "Roll failed — closing")
+            return self._close_position(pos, spot, "Roll failed — closing"), 0.0
 
-        return None
+        # Position held — compute unrealized P&L vs entry debit
+        unrealized = (sv - pos.get("net_debit", 0.0)) * pos.get("qty", 1.0)
+        return None, unrealized
 
     def _close_position(self, pos: dict, spot: float, reason: str) -> str:
         """Close a position and record it in the database."""
@@ -523,7 +552,7 @@ class DecisionEngine:
         return EngineStatus(
             state=self._state,
             open_positions=len(open_positions) if open_positions is not None else 0,
-            daily_pnl=self._today_pnl,
+            daily_pnl=self._today_pnl + self._unrealized_pnl,
             message=message,
         )
 

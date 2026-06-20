@@ -164,4 +164,13 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
 - `scratch/scratch_notifier.py` — end-to-end verification script for the Notifier; runs 8 sections covering dispatch, deduplication, cooldown expiry, all helper methods, skip-when-unconfigured, and payload correctness (19 checks, no live network calls). Run with `python -m scratch.scratch_notifier` from the repo root.
 - `scratch/scratch_backtest.py` — end-to-end verification for the backtesting harness; generates synthetic BTC data for 4 vol regimes (High Vol Contango, Low Vol Weak Contango, IV Spike/Collapse, Stable Sideways), runs BacktestEngine on each, and prints a formatted summary table. Also exercises loader CSV/JSON round-trips and BacktestChainCache. Run with `python -m scratch.scratch_backtest` from the repo root.
+- `scratch/scratch_three_fixes.py` — demonstrates three bug fixes: (1) negative-EV trade rejection, (2) correct stale-IV monitor message, (3) daily_pnl reflecting unrealized MTM. Run with `python -m scratch.scratch_three_fixes` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
+
+---
+
+## Bug Fixes
+
+- [x] **Negative-EV entry filter** — added `MIN_EV = 0.0` to `config.py`; `strategy/decision.py` now rejects any candidate with `ev_score < MIN_EV` before calling the sizer or executor. Tests: `TestNegativeEvFilter` in `tests/test_decision.py`.
+- [x] **Misleading monitor OK message on stale IV** — `_monitor_position` returns `("__NO_IV__", 0.0)` when IV is unavailable; `monitor_tick` counts these and emits `"N position(s) skipped — no IV data"` instead of the incorrect `"All positions OK."`. Tests: `TestMonitorSkippedNoIv`.
+- [x] **daily_pnl stuck at 0.00** — `_monitor_position` now returns the per-position unrealized MTM P&L `(sv - net_debit) * qty` when the position is held; `monitor_tick` accumulates these into `_unrealized_pnl`; `_status()` returns `_today_pnl + _unrealized_pnl`. Tests: `TestDailyPnlUnrealized`.

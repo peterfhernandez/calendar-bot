@@ -69,7 +69,7 @@ class CalendarCandidate:
     pop:       float  # probability of profit at near-leg expiry
     be_lo:     float  # lower breakeven price
     be_hi:     float  # upper breakeven price
-    ev_score:  float  # expected value score (higher is better)
+    ev_score:  float  # expected value as a fraction of net_debit (e.g. 0.25 = EV is 25% of debit paid)
 
     # Fields set after sizing
     qty: float = 0.0
@@ -241,6 +241,7 @@ def _eval_candidate(
         return None
 
     ev = _ev_score(spot, strike, near_dte, far_dte, near_iv, net_debit, opt_type, pop)
+    ev_ratio = ev / net_debit if net_debit > 0 else 0.0
 
     return CalendarCandidate(
         asset=asset,
@@ -264,7 +265,7 @@ def _eval_candidate(
         pop=pop,
         be_lo=be_lo,
         be_hi=be_hi,
-        ev_score=ev,
+        ev_score=ev_ratio,
     )
 
 

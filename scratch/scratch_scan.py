@@ -29,7 +29,7 @@ async def main():
     print(f"{'='*72}")
     for c in candidates[:10]:
         result   = size_candidate(c, portfolio_value=10_000, open_positions=[])
-        ev_pct   = (c.ev_score / c.net_debit * 100) if c.net_debit > 0 else 0.0
+        ev_pct   = c.ev_score * 100
         min_unit = MIN_CONTRACT.get(c.asset, DEFAULT_MIN)
         min_cost = c.net_debit * min_unit
         print(

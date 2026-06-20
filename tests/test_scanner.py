@@ -256,7 +256,7 @@ def _dummy_candidate(**kwargs) -> CalendarCandidate:
         net_debit=140.0,
         near_oi=600.0, far_oi=600.0,
         pop=0.50, be_lo=92_000.0, be_hi=108_000.0,
-        ev_score=50.0,
+        ev_score=0.36,   # EV = 36% of net_debit
     )
     defaults.update(kwargs)
     return CalendarCandidate(**defaults)

@@ -266,7 +266,7 @@ class TestBacktestExecutor:
             near_iv=0.80, far_iv=0.70, iv_contango=0.10,
             near_ask=200.0, near_bid=180.0, far_ask=600.0, far_bid=570.0,
             net_debit=420.0, near_oi=500, far_oi=500,
-            pop=0.55, be_lo=25000.0, be_hi=35000.0, ev_score=50.0, qty=1.0,
+            pop=0.55, be_lo=25000.0, be_hi=35000.0, ev_score=0.12, qty=1.0,
         )
 
     def test_enter_spread_returns_fill(self):

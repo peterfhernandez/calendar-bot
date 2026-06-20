@@ -95,7 +95,7 @@ def _make_candidate(near_days: int = 10, far_days: int = 35) -> CalendarCandidat
         pop=0.55,
         be_lo=80_000.0,
         be_hi=100_000.0,
-        ev_score=0.005,
+        ev_score=0.25,   # EV = 25% of net_debit (0.005 BTC per contract)
         qty=0.0,
     )
 
@@ -451,3 +451,181 @@ class TestDailyLossLimit:
 
         # net_debit=0.02, close_credit=0.005, qty=1 → pnl = 0.005 - 0.02*1 = -0.015
         assert engine._today_pnl == pytest.approx(0.005 - 0.02 * 1.0)
+
+
+# ── Fix 1: Negative-EV filter ─────────────────────────────────────────────────
+
+class TestNegativeEvFilter:
+    def test_negative_ev_candidate_not_entered(self):
+        """A candidate with ev_score < 0 must be rejected before entry."""
+        executor = MagicMock()
+        candidate = _make_candidate()
+        candidate.ev_score = -0.35  # EV is -35% of debit — clearly negative
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="Approved")
+
+            engine, _ = _make_engine(executor=executor)
+            status = engine.scan_tick()
+
+        executor.enter_spread.assert_not_called()
+        assert status.open_positions == 0
+
+    def test_positive_ev_candidate_is_entered(self):
+        """A candidate with ev_score > 0 must pass the EV filter."""
+        executor = MagicMock()
+        candidate = _make_candidate()
+        candidate.ev_score = 0.25
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="Approved")
+            executor.enter_spread.return_value = {
+                "near_prem": candidate.near_bid,
+                "far_prem":  candidate.far_ask,
+                "net_debit": candidate.net_debit,
+                "qty":       1.0,
+            }
+
+            engine, _ = _make_engine(executor=executor)
+            status = engine.scan_tick()
+
+        executor.enter_spread.assert_called_once()
+
+
+# ── Fix 2: Stale-IV monitor message ───────────────────────────────────────────
+
+class TestMonitorSkippedNoIv:
+    def _open_pos(self, trade_id: int = 1) -> dict:
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return {
+            "trade_id":        trade_id,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       90_000.0,
+            "near_days":       10,
+            "far_days":        35,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def test_all_skipped_message_not_ok(self):
+        """When all IV checks are skipped, the message must NOT say 'All positions OK.'"""
+        engine, _ = _make_engine()
+        pos = self._open_pos()
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=None)  # stale feed
+            status = engine.monitor_tick()
+
+        assert "All positions OK" not in status.message
+        assert "skipped" in status.message.lower()
+        assert "no IV" in status.message or "no iv" in status.message.lower()
+
+    def test_partial_skip_message_contains_both(self):
+        """When some positions are skipped and one is actioned, both appear in the message."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.005
+
+        engine, _ = _make_engine(executor=executor)
+        pos_good = self._open_pos(trade_id=1)
+        pos_stale = self._open_pos(trade_id=2)
+
+        def _get_iv_side_effect(pos):
+            return 0.80 if pos["trade_id"] == 1 else None
+
+        with patch.object(engine, "_load_all_open_positions",
+                          side_effect=[[pos_good, pos_stale], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(side_effect=_get_iv_side_effect)
+            status = engine.monitor_tick()
+
+        assert "skipped" in status.message.lower()
+        assert "trade_id=1" in status.message
+
+
+# ── Fix 3: daily_pnl reflects unrealized MTM ─────────────────────────────────
+
+class TestDailyPnlUnrealized:
+    def _open_pos(self) -> dict:
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return {
+            "trade_id":        1,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       90_000.0,
+            "near_days":       10,
+            "far_days":        35,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def test_daily_pnl_includes_unrealized(self):
+        """daily_pnl in EngineStatus must include unrealized MTM when positions are held."""
+        engine, _ = _make_engine()
+        pos = self._open_pos()
+        # spread value = 0.025, net_debit = 0.02, qty = 1 → unrealized = +0.005
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.25, "OK")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            status = engine.monitor_tick()
+
+        assert status.daily_pnl == pytest.approx(0.005)  # (0.025 - 0.02) * 1.0
+
+    def test_daily_pnl_zero_when_iv_skipped(self):
+        """Unrealized P&L contribution is 0 when IV is missing (position not valued)."""
+        engine, _ = _make_engine()
+        pos = self._open_pos()
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=None)
+            status = engine.monitor_tick()
+
+        assert status.daily_pnl == pytest.approx(0.0)
+
+    def test_daily_pnl_combines_realized_and_unrealized(self):
+        """daily_pnl is the sum of already-realized closes and current MTM."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.005
+
+        engine, _ = _make_engine(executor=executor)
+        engine._today_pnl = -0.01  # a previous realized loss
+
+        pos = self._open_pos()
+        # spread value = 0.025 → unrealized = +0.005
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.25, "OK")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            status = engine.monitor_tick()
+
+        assert status.daily_pnl == pytest.approx(-0.01 + 0.005)
