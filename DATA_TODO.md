@@ -59,7 +59,7 @@ Data is stored in `backtest/historic_data/options.duckdb`.
 
 ## Phase D5 — Validation with Sample Data
 
-- [ ] Download a free 1-day Tardis sample for BTC options (https://tardis.dev/datasets)
+- [ ] Download a free 1-day Tardis sample for BTC options (<https://tardis.dev/datasets>)
 - [ ] Map Tardis CSV columns to `option_chain` schema; import via `loader.py` or direct insert
 - [ ] Run `BacktestEngine` on the Tardis sample — confirm zero errors
 - [ ] Cross-check one timestamp: compare DB output row vs Tardis CSV row field by field

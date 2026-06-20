@@ -8,14 +8,16 @@ def _load_env(path: str = ".env") -> None:
                 _line = _line.strip()
                 if _line and not _line.startswith("#") and "=" in _line:
                     _k, _, _v = _line.partition("=")
-                    _os.environ.setdefault(_k.strip(), _v.strip())
+                    _val = _v.strip().strip('"').strip("'")
+                    _os.environ[_k.strip()] = _val
     except FileNotFoundError:
         pass
 
 _load_env()
 
 # Assets to trade
-ASSETS = ["BTC", "ETH", "SOL"]
+#ASSETS = ["BTC", "ETH", "SOL"]
+ASSETS = ["ETH"]
 
 # Calendar horizons (days to expiry)
 NEAR_DAYS_OPTIONS = [7, 14]

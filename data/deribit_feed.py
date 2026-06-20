@@ -20,10 +20,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Awaitable
 
 import websockets
 import websockets.exceptions
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +147,13 @@ class DeribitFeed:
             "public/get_instruments",
             {"currency": asset, "kind": "option", "expired": False},
         )
-        names = [r["instrument_name"] for r in result]
+        now = datetime.now(timezone.utc).timestamp() * 1000  # ms
+        min_ms = config.NEAR_DAYS_OPTIONS[0]  * 86_400_000
+        max_ms = config.FAR_DAYS_OPTIONS[-1]  * 86_400_000
+        names = [
+            r["instrument_name"] for r in result
+            if min_ms <= (r["expiration_timestamp"] - now) <= max_ms * 2
+        ]
         self._instruments[asset] = names
         return names
 
@@ -220,7 +229,7 @@ class DeribitFeed:
         # Deribit accepts up to 500 channels per subscribe call
         for chunk_start in range(0, len(channels), 500):
             chunk = channels[chunk_start: chunk_start + 500]
-            await self._rpc("public/subscribe", {"channels": chunk})
+            await self._rpc("public/subscribe", {"channels": chunk}, timeout=60.0)
 
     async def _handle_message(self, raw: str | bytes) -> None:
         try:
