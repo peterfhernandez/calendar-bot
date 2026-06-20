@@ -139,11 +139,11 @@ class TestDryRunExecutor:
         assert fill["net_debit"] == candidate.net_debit
         assert fill["qty"] == candidate.qty
 
-    def test_close_spread_returns_debit(self):
+    def test_close_spread_returns_debit_times_qty(self):
         exe = DryRunExecutor()
-        pos = {"trade_id": 1, "asset": "BTC", "strike": 90000, "net_debit": 0.02}
+        pos = {"trade_id": 1, "asset": "BTC", "strike": 90000, "net_debit": 0.02, "qty": 2.0}
         result = exe.close_spread(pos)
-        assert result == 0.02
+        assert result == pytest.approx(0.02 * 2.0)
 
     def test_roll_near_leg_returns_true(self):
         exe = DryRunExecutor()
@@ -589,7 +589,8 @@ class TestDailyPnlUnrealized:
         """daily_pnl in EngineStatus must include unrealized MTM when positions are held."""
         engine, _ = _make_engine()
         pos = self._open_pos()
-        # spread value = 0.025, net_debit = 0.02, qty = 1 → unrealized = +0.005
+        # sv=0.025 (already qty-weighted, qty=1), net_debit=0.02 per unit
+        # unrealized = sv - net_debit * qty = 0.025 - 0.02 * 1.0 = 0.005
         with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
              patch("strategy.decision.check_calendar_status",
                    return_value=("ok", 0.025, 1.25, "OK")):
@@ -597,7 +598,7 @@ class TestDailyPnlUnrealized:
             engine._get_iv = MagicMock(return_value=0.80)
             status = engine.monitor_tick()
 
-        assert status.daily_pnl == pytest.approx(0.005)  # (0.025 - 0.02) * 1.0
+        assert status.daily_pnl == pytest.approx(0.005)  # 0.025 - 0.02 * 1.0
 
     def test_daily_pnl_zero_when_iv_skipped(self):
         """Unrealized P&L contribution is 0 when IV is missing (position not valued)."""
@@ -629,3 +630,200 @@ class TestDailyPnlUnrealized:
             status = engine.monitor_tick()
 
         assert status.daily_pnl == pytest.approx(-0.01 + 0.005)
+
+
+# ── Fix 4: New-position grace period (no instant TP on entry) ─────────────────
+
+class TestNewPositionGracePeriod:
+    """
+    A position entered by scan_tick must be skipped by a monitor_tick that runs
+    in the same scheduler cycle.  Without this guard the monitor can compute a
+    wildly-different B-S spread value from the actual fill price and trigger a
+    spurious TP or stop immediately after entry.
+    """
+
+    def _open_pos(self, trade_id: int = 4, near_days: int = 10,
+                  far_days: int = 35) -> dict:
+        near_label = _future_label(near_days)
+        far_label  = _future_label(far_days)
+        return {
+            "trade_id":        trade_id,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       90_000.0,
+            "near_days":       near_days,
+            "far_days":        far_days,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def test_newly_entered_position_skipped_on_first_monitor(self):
+        """Position in _just_entered must not trigger close, even at 1000% of debit."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 20.0  # would be a huge TP
+
+        engine, _ = _make_engine(executor=executor)
+        pos = self._open_pos(trade_id=4)
+
+        # Simulate that trade_id=4 was just entered this scan tick
+        engine._just_entered.add(4)
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("tp", 20.0, 10.0, "TAKE-PROFIT")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            status = engine.monitor_tick()
+
+        # Must NOT close despite TP signal
+        executor.close_spread.assert_not_called()
+
+    def test_grace_period_cleared_after_monitor_tick(self):
+        """_just_entered must be empty after monitor_tick so the next tick evaluates normally."""
+        engine, _ = _make_engine()
+        engine._just_entered.add(4)
+
+        pos = self._open_pos(trade_id=4)
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.25, "OK")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
+        assert len(engine._just_entered) == 0
+
+    def test_position_evaluated_on_second_monitor_tick(self):
+        """After grace period is cleared, TP is triggered normally on the next monitor tick."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 20.0
+
+        engine, _ = _make_engine(executor=executor)
+        pos = self._open_pos(trade_id=4)
+
+        # First monitor tick — grace period active, no close
+        engine._just_entered.add(4)
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("tp", 20.0, 10.0, "TAKE-PROFIT")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+        executor.close_spread.assert_not_called()
+
+        # Second monitor tick — grace period cleared, close fires
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("tp", 20.0, 10.0, "TAKE-PROFIT")), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+        executor.close_spread.assert_called_once()
+
+
+# ── Fix 5: Realized P&L computed from spread_value, not executor return ────────
+
+class TestClosePositionPnl:
+    """
+    _close_position must compute P&L from the observed spread value returned by
+    check_calendar_status, not from the executor's close_spread return value.
+    In dry-run mode the executor returns net_debit × qty (i.e. "got back what we
+    paid"), which would always produce pnl = 0.
+    """
+
+    def _open_pos(self, trade_id: int = 1, net_debit: float = 0.02,
+                  qty: float = 1.5) -> dict:
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return {
+            "trade_id":        trade_id,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             qty,
+            "net_debit":       net_debit,
+            "spot_open":       90_000.0,
+            "near_days":       10,
+            "far_days":        35,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def test_tp_pnl_uses_spread_value_not_executor_return(self):
+        """
+        sv=0.21 is qty-weighted total; net_debit=0.02/unit, qty=1.5.
+        pnl = sv - net_debit * qty = 0.21 - 0.02 * 1.5 = 0.18
+        The executor return (net_debit * qty = 0.03) must NOT be used.
+        """
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.03  # = net_debit * qty → would give pnl=0
+
+        engine, _ = _make_engine(executor=executor)
+        pos = self._open_pos(net_debit=0.02, qty=1.5)
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("tp", 0.21, 10.5, "TAKE-PROFIT")), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
+        expected_pnl = 0.21 - 0.02 * 1.5  # sv - net_debit*qty = 0.18
+        assert engine._today_pnl == pytest.approx(expected_pnl)
+
+    def test_stop_pnl_uses_spread_value(self):
+        """
+        sv=0.005 is qty-weighted total; net_debit=0.02/unit, qty=1.0.
+        pnl = sv - net_debit * qty = 0.005 - 0.02 * 1.0 = -0.015
+        """
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.02  # would give pnl=0
+
+        engine, _ = _make_engine(executor=executor)
+        pos = self._open_pos(net_debit=0.02, qty=1.0)
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
+        expected_pnl = 0.005 - 0.02 * 1.0  # sv - net_debit*qty = -0.015
+        assert engine._today_pnl == pytest.approx(expected_pnl)
+
+    def test_expiry_close_falls_back_to_executor_return(self):
+        """
+        When closing due to expiry (no sv available), P&L falls back to
+        executor return value minus entry debit.
+        """
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.025  # net credit on expiry close
+
+        engine, _ = _make_engine(executor=executor)
+        pos = self._open_pos(net_debit=0.02, qty=1.0)
+        pos["expiry_near"] = _future_label(-2)  # expired
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine.monitor_tick()
+
+        expected_pnl = 0.025 - 0.02 * 1.0  # = 0.005
+        assert engine._today_pnl == pytest.approx(expected_pnl)

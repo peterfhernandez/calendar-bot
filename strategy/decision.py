@@ -196,6 +196,7 @@ class DecisionEngine:
         self._state           = BotState.IDLE
         self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
         self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
+        self._just_entered: set[int] = set()  # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -276,6 +277,7 @@ class DecisionEngine:
             trade = self._enter(candidate, open_positions)
             if trade is not None:
                 open_positions.append(_trade_to_position(trade))
+                self._just_entered.add(trade.id)
                 entered += 1
 
             # Re-check limit after every entry
@@ -329,6 +331,10 @@ class DecisionEngine:
                 unrealized_pnl += unr
 
         self._unrealized_pnl = unrealized_pnl
+
+        # Clear grace-period set after each monitor pass so positions are
+        # evaluated normally from the next tick onward.
+        self._just_entered.clear()
 
         # Refresh after actions
         open_positions = self._load_all_open_positions()
@@ -405,6 +411,16 @@ class DecisionEngine:
         option_type = pos.get("option_type", "Call")
         trade_id    = pos["trade_id"]
 
+        # Skip positions entered in this same scan tick — the B-S spread value
+        # computed from cache IV can differ substantially from the actual fill
+        # price, causing spurious TP/stop signals the moment the trade is booked.
+        if trade_id in self._just_entered:
+            logger.debug(
+                "trade_id=%d grace skip — entered this scan tick, deferring first check",
+                trade_id,
+            )
+            return None, 0.0
+
         spot = self._cache.get_spot(asset)
         if spot is None or spot <= 0:
             logger.warning("No spot for %s — skipping monitor of trade %d", asset, trade_id)
@@ -427,10 +443,10 @@ class DecisionEngine:
         logger.info("trade_id=%d  %s", trade_id, msg)
 
         if status == "stop":
-            return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)"), 0.0
+            return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv), 0.0
 
         if status == "tp":
-            return self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)"), 0.0
+            return self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv), 0.0
 
         # Roll trigger: near leg approaching expiry and no exit signal yet
         if near_days_left <= _ROLL_TRIGGER_DAYS:
@@ -440,21 +456,45 @@ class DecisionEngine:
             # If roll fails, close cleanly
             return self._close_position(pos, spot, "Roll failed — closing"), 0.0
 
-        # Position held — compute unrealized P&L vs entry debit
-        unrealized = (sv - pos.get("net_debit", 0.0)) * pos.get("qty", 1.0)
+        # Position held — compute unrealized P&L vs entry debit.
+        # sv is already qty-weighted (spread_value multiplies by qty internally),
+        # so total debit is net_debit * qty — do NOT multiply the difference by qty again.
+        unrealized = sv - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
         return None, unrealized
 
-    def _close_position(self, pos: dict, spot: float, reason: str) -> str:
-        """Close a position and record it in the database."""
+    def _close_position(
+        self,
+        pos: dict,
+        spot: float,
+        reason: str,
+        spread_value: float | None = None,
+    ) -> str:
+        """
+        Close a position and record it in the database.
+
+        Parameters
+        ----------
+        spread_value
+            Current mark-to-market spread value per unit, as returned by
+            check_calendar_status.  When provided this is used to compute P&L
+            directly (more accurate than relying on the executor's return value,
+            which in dry-run mode just echoes the entry debit).  Falls back to
+            the executor return value when None (e.g. expiry or roll-fail close).
+        """
         trade_id = pos["trade_id"]
         net_debit = pos.get("net_debit", 0.0)
+        qty = pos.get("qty", 1.0)
 
         close_credit = self._executor.close_spread(pos)
         if close_credit is None:
             logger.error("Executor failed to close trade_id=%d", trade_id)
             return f"trade_id={trade_id} close FAILED"
 
-        pnl = close_credit - net_debit * pos.get("qty", 1.0)
+        if spread_value is not None:
+            # spread_value is already qty-weighted; net_debit is per-unit
+            pnl = spread_value - net_debit * qty
+        else:
+            pnl = close_credit - net_debit * qty
         result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
         # Override label to reflect close reason when it's explicit
         if "Take-profit" in reason:
