@@ -119,17 +119,17 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 8 — Backtesting
 
-- [ ] Implement `backtest/loader.py`
-  - [ ] Ingest historical Deribit option chain snapshots (CSV or JSON)
-  - [ ] Normalise to same schema as `chain_cache.py`
-- [ ] Implement `backtest/engine.py`
-  - [ ] Replay chain snapshots through scanner + decision engine
-  - [ ] Record all trades, P&L, and decision points
-  - [ ] Output summary: win rate, avg P&L, max drawdown, Sharpe
-- [ ] Run backtest across at least 2 distinct vol regimes before going live
-  - [ ] Identify 4 distinct vol regimes
-  - [ ] Setup a script to run the backtest on these 4 regimes
-  - [ ] make sure that output summaries are clearly displayed for all regimes. Display: regime name, win rate, avg p&l, max drawdown, sharpe
+- [x] Implement `backtest/loader.py`
+  - [x] Ingest historical Deribit option chain snapshots (CSV or JSON)
+  - [x] Normalise to same schema as `chain_cache.py`
+- [x] Implement `backtest/engine.py`
+  - [x] Replay chain snapshots through scanner + decision engine
+  - [x] Record all trades, P&L, and decision points
+  - [x] Output summary: win rate, avg P&L, max drawdown, Sharpe
+- [x] Run backtest across at least 2 distinct vol regimes before going live
+  - [x] Identify 4 distinct vol regimes
+  - [x] Setup a script to run the backtest on these 4 regimes
+  - [x] make sure that output summaries are clearly displayed for all regimes. Display: regime name, win rate, avg p&l, max drawdown, sharpe
 
 ---
 
@@ -163,4 +163,5 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - Keep optionsStrat repo for manual/paper trading — the bot is a separate project
 - Any bug fixed in optionsStrat `strategies/calendar.py` or `trading/executor.py` should be ported to `calendar-bot` core modules
 - `scratch/scratch_notifier.py` — end-to-end verification script for the Notifier; runs 8 sections covering dispatch, deduplication, cooldown expiry, all helper methods, skip-when-unconfigured, and payload correctness (19 checks, no live network calls). Run with `python -m scratch.scratch_notifier` from the repo root.
+- `scratch/scratch_backtest.py` — end-to-end verification for the backtesting harness; generates synthetic BTC data for 4 vol regimes (High Vol Contango, Low Vol Weak Contango, IV Spike/Collapse, Stable Sideways), runs BacktestEngine on each, and prints a formatted summary table. Also exercises loader CSV/JSON round-trips and BacktestChainCache. Run with `python -m scratch.scratch_backtest` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
