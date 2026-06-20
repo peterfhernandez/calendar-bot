@@ -122,16 +122,24 @@ class TestLoadCalendarState:
     def test_empty_db_returns_defaults(self, db):
         state = load_calendar_state("BTC", db_path=db)
         assert state == {
-            "open": None, "total_pnl": 0.0, "wins": 0,
+            "open_positions": [], "total_pnl": 0.0, "wins": 0,
             "losses": 0, "trades": 0, "broker": None,
         }
 
     def test_open_trade_shows_in_state(self, db):
         _open_trade(db)
         state = load_calendar_state("BTC", db_path=db)
-        assert state["open"] is not None
-        assert state["open"]["asset"] == "BTC"
+        assert len(state["open_positions"]) == 1
+        assert state["open_positions"][0]["asset"] == "BTC"
         assert state["trades"] == 0  # not yet closed
+
+    def test_multiple_open_trades_all_returned(self, db):
+        _open_trade(db, strike=100_000.0)
+        _open_trade(db, strike=105_000.0)
+        state = load_calendar_state("BTC", db_path=db)
+        assert len(state["open_positions"]) == 2
+        strikes = {p["strike"] for p in state["open_positions"]}
+        assert strikes == {100_000.0, 105_000.0}
 
     def test_closed_trade_counted(self, db):
         trade = _open_trade(db)
@@ -140,7 +148,7 @@ class TestLoadCalendarState:
             spot_close=101_000.0, pnl=150.0, result="Win", db_path=db,
         )
         state = load_calendar_state("BTC", db_path=db)
-        assert state["open"] is None
+        assert state["open_positions"] == []
         assert state["trades"] == 1
         assert state["wins"] == 1
         assert state["losses"] == 0
@@ -162,8 +170,8 @@ class TestLoadCalendarState:
         _open_trade(db, asset="ETH", strike=3000.0)
         btc_state = load_calendar_state("BTC", db_path=db)
         eth_state = load_calendar_state("ETH", db_path=db)
-        assert btc_state["open"]["asset"] == "BTC"
-        assert eth_state["open"]["asset"] == "ETH"
+        assert btc_state["open_positions"][0]["asset"] == "BTC"
+        assert eth_state["open_positions"][0]["asset"] == "ETH"
 
 
 # ── get_calendar_stats ───────────────────────────────────────────────────────

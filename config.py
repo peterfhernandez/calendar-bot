@@ -30,8 +30,9 @@ MIN_OI_NEAR     = 100    # minimum open interest on near-leg strike
 MIN_OI_FAR      = 100    # minimum open interest on far-leg strike
 
 # Position sizing
-MAX_LOSS_PCT  = 0.02  # max 2% of portfolio per trade
-MAX_POSITIONS = 3     # max concurrent open calendar spreads
+MAX_LOSS_PCT       = 0.02  # max 2% of portfolio per trade
+MAX_POSITIONS      = 3     # max concurrent open calendar spreads
+MAX_TOTAL_RISK_PCT = 0.06  # hard 6% total capital-at-risk across all open positions
 
 # Risk-free rate used in Black-Scholes pricing.
 # Deribit crypto options have no financing cost baked in, so 0.0 is the

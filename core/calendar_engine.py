@@ -155,8 +155,9 @@ def check_calendar_status(
     option_type = op["option_type"]
 
     sv  = spread_value(spot, strike, T_near, T_far, RISK_FREE_RATE, iv, qty, option_type)
-    pct = sv / net_debit if net_debit > 0 else 0.0
-    pnl = sv - net_debit
+    total_debit = net_debit * qty
+    pct = sv / total_debit if total_debit > 0 else 0.0
+    pnl = sv - total_debit
 
     if pct <= STOP_PCT:
         msg = (

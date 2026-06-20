@@ -38,11 +38,12 @@ class SizeResult:
 
 
 def size_candidate(
-    candidate:       CalendarCandidate,
-    portfolio_value: float,
-    open_positions:  list[dict],
-    max_loss_pct:    float | None = None,
-    max_positions:   int   | None = None,
+    candidate:          CalendarCandidate,
+    portfolio_value:    float,
+    open_positions:     list[dict],
+    max_loss_pct:       float | None = None,
+    max_positions:      int   | None = None,
+    max_total_risk_pct: float | None = None,
 ) -> SizeResult:
     """
     Compute the approved contract quantity for a calendar spread candidate.
@@ -60,14 +61,18 @@ def size_candidate(
         Max fraction of portfolio at risk per trade (default: config.MAX_LOSS_PCT).
     max_positions
         Max concurrent open positions (default: config.MAX_POSITIONS).
+    max_total_risk_pct
+        Hard cap on total capital-at-risk across all open positions as a fraction
+        of portfolio value (default: config.MAX_TOTAL_RISK_PCT).
 
     Returns
     -------
     SizeResult
         qty > 0 if approved; qty == 0 with reason if blocked.
     """
-    max_loss_pct = max_loss_pct if max_loss_pct is not None else config.MAX_LOSS_PCT
-    max_positions = max_positions if max_positions is not None else config.MAX_POSITIONS
+    max_loss_pct       = max_loss_pct       if max_loss_pct       is not None else config.MAX_LOSS_PCT
+    max_positions      = max_positions      if max_positions       is not None else config.MAX_POSITIONS
+    max_total_risk_pct = max_total_risk_pct if max_total_risk_pct is not None else config.MAX_TOTAL_RISK_PCT
 
     # ── Concurrent position limit ─────────────────────────────────────────────
     if len(open_positions) >= max_positions:
@@ -97,10 +102,27 @@ def size_candidate(
                 ),
             )
 
+    # ── Total portfolio risk budget ───────────────────────────────────────────
+    # Capital already at risk = sum of (net_debit × qty) for all open positions.
+    # The new trade must not push total risk past the configured hard cap.
+    risk_in_use = sum(
+        p.get("net_debit", 0.0) * p.get("qty", 0.0) for p in open_positions
+    )
+    max_total_risk_usd = portfolio_value * max_total_risk_pct
+    risk_remaining     = max_total_risk_usd - risk_in_use
+    if risk_remaining <= 0:
+        return SizeResult(
+            qty=0.0,
+            reason=(
+                f"Total risk budget exhausted  "
+                f"(in_use=${risk_in_use:.2f}, limit=${max_total_risk_usd:.2f})"
+            ),
+        )
+
     # ── Size from max-loss budget ─────────────────────────────────────────────
-    # Maximum USD we're willing to lose on this trade = portfolio * max_loss_pct.
-    # Worst case loss per contract = net_debit (the full premium paid).
-    max_loss_usd = portfolio_value * max_loss_pct
+    # Maximum USD we're willing to lose on this trade = portfolio * max_loss_pct,
+    # clamped to whatever budget remains under the total risk cap.
+    max_loss_usd = min(portfolio_value * max_loss_pct, risk_remaining)
     if candidate.net_debit <= 0:
         return SizeResult(qty=0.0, reason="net_debit is zero or negative")
 
@@ -121,9 +143,9 @@ def size_candidate(
 
     logger.debug(
         "Sized %s %s strike=%.0f: qty=%.1f  "
-        "(max_loss_usd=%.2f, net_debit=%.2f)",
+        "(max_loss_usd=%.2f, net_debit=%.2f, risk_in_use=%.2f, risk_cap=%.2f)",
         candidate.asset, candidate.option_type, candidate.strike,
-        qty, max_loss_usd, candidate.net_debit,
+        qty, max_loss_usd, candidate.net_debit, risk_in_use, max_total_risk_usd,
     )
     return SizeResult(
         qty=qty,

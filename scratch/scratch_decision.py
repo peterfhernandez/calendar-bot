@@ -57,9 +57,8 @@ def _print_open_positions() -> None:
     any_open = False
     for asset in config.ASSETS:
         state = load_calendar_state(asset, db_path=_SCRATCH_DB)
-        if state["open"]:
+        for pos in state["open_positions"]:
             any_open = True
-            pos = state["open"]
             print(
                 f"    [{pos['trade_id']}] {pos['asset']} {pos.get('option_type','')} "
                 f"K={pos['strike']:,.0f}  near={pos['expiry_near']}  far={pos['expiry_far']}  "
@@ -130,7 +129,7 @@ async def main() -> None:
     # ── Advice ───────────────────────────────────────────────────────────────
     print()
     if scan_status.open_positions == 0 and not any(
-        load_calendar_state(a, db_path=_SCRATCH_DB)["open"] for a in config.ASSETS
+        load_calendar_state(a, db_path=_SCRATCH_DB)["open_positions"] for a in config.ASSETS
     ):
         print("  Tip: no positions entered. Try relaxing filters in config.py")
         print("       (MIN_IV_CONTANGO, MIN_POP, MIN_OI_NEAR/FAR) or wait for")

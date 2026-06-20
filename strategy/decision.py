@@ -121,7 +121,7 @@ class DryRunExecutor:
             "[DRY-RUN] Would close trade_id=%s  asset=%s  strike=%.0f",
             position.get("trade_id"), position.get("asset"), position.get("strike", 0),
         )
-        return position.get("net_debit", 0.0)
+        return position.get("net_debit", 0.0) * position.get("qty", 1.0)
 
     def roll_near_leg(self, position: dict, new_candidate: CalendarCandidate) -> bool:
         logger.info(
@@ -427,6 +427,11 @@ class DecisionEngine:
 
         pnl = close_credit - net_debit * pos.get("qty", 1.0)
         result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
+        # Override label to reflect close reason when it's explicit
+        if "Take-profit" in reason:
+            result = "Win (Auto TP)"
+        elif "Stop-loss" in reason:
+            result = "Loss (Auto Stop)"
 
         close_calendar_trade(
             trade_id=trade_id,
@@ -496,8 +501,7 @@ class DecisionEngine:
         positions: list[dict] = []
         for asset in config.ASSETS:
             state = load_calendar_state(asset, db_path=self._db_path)
-            if state["open"]:
-                positions.append(state["open"])
+            positions.extend(state["open_positions"])
         return positions
 
     def _get_iv(self, pos: dict) -> float | None:

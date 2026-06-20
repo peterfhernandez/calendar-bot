@@ -194,7 +194,8 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
     """
     Reconstruct trading state for an asset from trade history.
 
-    Returns dict with keys: open, total_pnl, wins, losses, trades, broker.
+    Returns dict with keys: open_positions, total_pnl, wins, losses, trades, broker.
+    ``open_positions`` is a list of all currently open position dicts (may be empty).
     """
     init_db(db_path)
     with get_connection(db_path) as conn:
@@ -204,7 +205,7 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
         ).fetchall()
 
     if not rows:
-        return {"open": None, "total_pnl": 0.0, "wins": 0, "losses": 0, "trades": 0, "broker": None}
+        return {"open_positions": [], "total_pnl": 0.0, "wins": 0, "losses": 0, "trades": 0, "broker": None}
 
     trades = [_row_to_trade(r) for r in rows]
     closed = [t for t in trades if t.result not in _OPEN_STATUSES]
@@ -214,36 +215,36 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
     )
     total_pnl = sum(t.pnl for t in closed if t.pnl is not None)
 
-    open_position = None
-    for trade in reversed(trades):
-        if trade.result in _OPEN_STATUSES:
-            open_position = {
-                "trade_id":        trade.id,
-                "status":          trade.result,
-                "asset":           trade.asset,
-                "option_type":     trade.option_type,
-                "strike":          trade.strike,
-                "expiry_near":     trade.expiry_near,
-                "expiry_far":      trade.expiry_far,
-                "qty":             trade.qty,
-                "net_debit":       trade.net_debit,
-                "spot_open":       trade.spot_open,
-                "near_days":       trade.near_days,
-                "far_days":        trade.far_days,
-                "near_instrument": trade.near_instrument,
-                "far_instrument":  trade.far_instrument,
-                "open_fees":       trade.open_fees,
-                "close_fees":      trade.close_fees,
-            }
-            break
+    open_positions = [
+        {
+            "trade_id":        trade.id,
+            "status":          trade.result,
+            "asset":           trade.asset,
+            "option_type":     trade.option_type,
+            "strike":          trade.strike,
+            "expiry_near":     trade.expiry_near,
+            "expiry_far":      trade.expiry_far,
+            "qty":             trade.qty,
+            "net_debit":       trade.net_debit,
+            "spot_open":       trade.spot_open,
+            "near_days":       trade.near_days,
+            "far_days":        trade.far_days,
+            "near_instrument": trade.near_instrument,
+            "far_instrument":  trade.far_instrument,
+            "open_fees":       trade.open_fees,
+            "close_fees":      trade.close_fees,
+        }
+        for trade in trades
+        if trade.result in _OPEN_STATUSES
+    ]
 
     return {
-        "open":      open_position,
-        "total_pnl": total_pnl,
-        "wins":      wins,
-        "losses":    len(closed) - wins,
-        "trades":    len(closed),
-        "broker":    trades[-1].broker,
+        "open_positions": open_positions,
+        "total_pnl":      total_pnl,
+        "wins":           wins,
+        "losses":         len(closed) - wins,
+        "trades":         len(closed),
+        "broker":         trades[-1].broker,
     }
 
 
