@@ -69,10 +69,14 @@ Data is stored in `backtest/historic_data/options.duckdb`.
 
 ## Phase D6 — Scheduled Collection
 
-- [ ] Decide where to run collector: alongside `bot.py` or as a separate process
-- [ ] Add collector invocation to `bot.py` scheduler (APScheduler job, every 5 min)
-  — OR —
-- [ ] Write a standalone `collect.py` entry point that runs the collector loop independently
+- [x] Decide where to run collector: **standalone** (`collect.py`) or **alongside bot** (`bot.py --collect`)
+- [x] Write a standalone `collect.py` entry point that runs the collector loop independently
+- [x] Add `--collect` flag to `bot.py` to run the collector as a concurrent task alongside the bot
+  - [x] `--once` flag for smoke-testing (collects one snapshot and exits)
+  - [x] `--assets`, `--interval`, `--db` overrides
+  - [x] `--log-level` and `--log-file` (rotating, 10 MB × 5) options
+  - [x] Graceful SIGINT/SIGTERM shutdown (finishes current cycle, then exits cleanly)
+  - [x] Hourly DB summary logged for health monitoring
 - [ ] Confirm collector survives a 24-hour run without memory growth or errors
 - [ ] Set a calendar reminder to check coverage after 2 weeks and 4 weeks
 
@@ -102,5 +106,8 @@ Data is stored in `backtest/historic_data/options.duckdb`.
 - Scratch: `scratch/scratch_data_collector.py` — connects to Deribit paper API, collects one ETH
   snapshot, prints summary stats and the first 3 ticker rows. Run with
   `python -m scratch.scratch_data_collector` from the repo root.
+- Scratch: `scratch/scratch_collect.py` — smoke-tests `collect.py --once` via subprocess; verifies
+  rows are written and the second run appends more rows. Run with
+  `python -m scratch.scratch_collect` from the repo root.
 - `config.py` optional overrides: `COLLECTOR_INTERVAL_SEC` (default 300), `COLLECTOR_ASSETS`
   (default same as `ASSETS`)

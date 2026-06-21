@@ -16,8 +16,8 @@ def _load_env(path: str = ".env") -> None:
 _load_env()
 
 # Assets to trade
-#ASSETS = ["BTC", "ETH", "SOL"]
-ASSETS = ["ETH", "SOL"]
+ASSETS = ["BTC", "ETH", "SOL"]
+#ASSETS = ["ETH", "SOL"]
 
 # Calendar horizons (days to expiry)
 NEAR_DAYS_OPTIONS = [7, 14]

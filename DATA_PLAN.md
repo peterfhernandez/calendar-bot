@@ -14,7 +14,7 @@ option chain at a single point in time.  Each row in a frame is one
 `TickerSnapshot`:
 
 | Field | Description |
-|---|---|
+| --- | --- |
 | `timestamp` | Unix epoch (seconds) |
 | `instrument` | Deribit instrument name, e.g. `BTC-27JUN25-100000-C` |
 | `asset` | `BTC` or `ETH` |
@@ -36,7 +36,7 @@ need at least **6–12 months** of data covering multiple volatility regimes.
 required for historical data.**  Key endpoints:
 
 | Endpoint | What it returns |
-|---|---|
+| --- | --- |
 | `GET /api/v2/public/get_instruments` | All active instruments for an asset + kind |
 | `GET /api/v2/public/get_book_summary_by_currency` | Summary (mark price, IV, bid, ask, OI) for all options on an asset — one call per asset per snapshot |
 | `GET /api/v2/public/get_index_price` | Spot index price for BTC or ETH |
@@ -63,7 +63,7 @@ archive.  This is the cleanest approach because:
 Several providers offer Deribit option chain history:
 
 | Provider | Free Tier | Data Available |
-|---|---|---|
+| --- | --- | --- |
 | **Tardis.dev** | 1-day free samples per instrument | Full Deribit option chain, tick-level. Paid plans from ~$19/month |
 | **Deribit History (CSV exports)** | Free via the web UI for your own account trades | Trade history only, not full chain |
 | **Amberdata** | Free trial | Options data including IV surface |
@@ -101,7 +101,7 @@ and a backtest process.
 think "SQLite for analytics."
 
 | Property | SQLite | DuckDB |
-|---|---|---|
+| --- | --- | --- |
 | Embedded (no server) | ✓ | ✓ |
 | Python stdlib | ✓ | ✗ (pip install duckdb) |
 | Analytical query speed | Moderate | Excellent |
@@ -230,7 +230,7 @@ output) so `BacktestEngine.run()` needs no changes.
 ## SQL Query Scripts (`backtest/sql/`)
 
 | Script | Purpose |
-|---|---|
+| --- | --- |
 | `schema.sql` | Create tables and indexes from scratch |
 | `query_frames.sql` | Pull a date range for one asset |
 | `summary_stats.sql` | Row counts, earliest/latest ts, assets present |
@@ -257,7 +257,7 @@ Before running a backtest from DB data:
 ## Effort Estimate
 
 | Task | Effort |
-|---|---|
+| --- | --- |
 | Write `schema.sql` and create DB | 1–2 hours |
 | Write `data_collector.py` | 4–8 hours |
 | Write `data_loader_db.py` | 2–4 hours |

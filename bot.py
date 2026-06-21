@@ -9,9 +9,10 @@ until SIGINT/SIGTERM, then both are shut down cleanly.
 
 Usage
 -----
-    python bot.py              # paper trading (DERIBIT_PAPER = True in config)
-    python bot.py --live       # live trading  (sets DERIBIT_PAPER = False)
+    python bot.py                        # paper trading (DERIBIT_PAPER = True in config)
+    python bot.py --live                 # live trading  (sets DERIBIT_PAPER = False)
     python bot.py --portfolio 50000
+    python bot.py --collect              # also run the data collector alongside the bot
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from monitor.loop import BotLoop, configure_logging
 logger = logging.getLogger("bot")
 
 
-async def _run(portfolio_value: float, paper: bool) -> None:
+async def _run(portfolio_value: float, paper: bool, collect: bool) -> None:
     configure_logging()
     logging.getLogger("strategy.decision").setLevel(logging.DEBUG)
     logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
@@ -49,27 +50,38 @@ async def _run(portfolio_value: float, paper: bool) -> None:
     )
 
     logger.info(
-        "Starting calendar bot  paper=%s  assets=%s  portfolio=%.2f",
+        "Starting calendar bot  paper=%s  assets=%s  portfolio=%.2f  collect=%s",
         paper,
         config.ASSETS,
         portfolio_value,
+        collect,
     )
 
-    # Run the feed and the scheduler loop concurrently
-    feed_task = asyncio.create_task(feed.start(), name="feed")
-    loop_task = asyncio.create_task(loop.run(),  name="loop")
+    tasks: list[asyncio.Task] = []
+    tasks.append(asyncio.create_task(feed.start(), name="feed"))
+    tasks.append(asyncio.create_task(loop.run(),  name="loop"))
 
-    # Wait for the loop to finish (triggered by stop() or a signal).
-    # Cancel the feed afterwards so we don't leave a dangling WS connection.
+    if collect:
+        from backtest.data_collector import run_loop as collector_loop
+        tasks.append(asyncio.create_task(collector_loop(), name="collector"))
+        logger.info("Data collector running alongside bot.")
+
+    # Wait for the trading loop to finish (triggered by stop() or a signal),
+    # then tear everything else down.
+    loop_task = next(t for t in tasks if t.get_name() == "loop")
+    feed_task = next(t for t in tasks if t.get_name() == "feed")
+
     try:
         await loop_task
     finally:
         await feed.stop()
-        feed_task.cancel()
-        try:
-            await feed_task
-        except asyncio.CancelledError:
-            pass
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     logger.info("Bot exited cleanly.")
 
@@ -87,10 +99,16 @@ def main() -> None:
         default=10_000.0,
         help="Portfolio value in USD used for position sizing (default: 10000)",
     )
+    parser.add_argument(
+        "--collect",
+        action="store_true",
+        default=False,
+        help="Also run the data collector to build historical data (default: off)",
+    )
     args = parser.parse_args()
 
     paper = not args.live
-    asyncio.run(_run(portfolio_value=args.portfolio, paper=paper))
+    asyncio.run(_run(portfolio_value=args.portfolio, paper=paper, collect=args.collect))
 
 
 if __name__ == "__main__":
