@@ -30,6 +30,8 @@ logger = logging.getLogger("bot")
 
 async def _run(portfolio_value: float, paper: bool) -> None:
     configure_logging()
+    logging.getLogger("strategy.decision").setLevel(logging.DEBUG)
+    logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
 
     cache = ChainCache()
 

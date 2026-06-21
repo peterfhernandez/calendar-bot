@@ -17,7 +17,7 @@ _load_env()
 
 # Assets to trade
 #ASSETS = ["BTC", "ETH", "SOL"]
-ASSETS = ["ETH", "BTC"]
+ASSETS = ["ETH", "SOL"]
 
 # Calendar horizons (days to expiry)
 NEAR_DAYS_OPTIONS = [7, 14]

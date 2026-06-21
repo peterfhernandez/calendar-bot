@@ -256,8 +256,8 @@ class DecisionEngine:
         for candidate in candidates:
             if candidate.ev_score < config.MIN_EV:
                 logger.debug(
-                    "RANK skip: negative EV (%.4f) for %s %s strike=%.0f",
-                    candidate.ev_score, candidate.asset, candidate.option_type, candidate.strike,
+                    "RANK skip: EV %.4f below MIN_EV %.4f for %s %s strike=%.0f",
+                    candidate.ev_score, config.MIN_EV, candidate.asset, candidate.option_type, candidate.strike,
                 )
                 continue
 
