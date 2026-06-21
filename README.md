@@ -31,13 +31,15 @@ This bot automates the full lifecycle:
 | Parameter | Default | Description |
 |---|---|---|
 | Assets | BTC, ETH | Underlyings to trade |
-| Near leg | 7–14 days | Short option expiry |
-| Far leg | 30–60 days | Long option expiry |
+| Near leg | 1–14 days | Short option expiry (1d, 7d, 14d) |
+| Far leg | 7–60 days | Long option expiry (7d, 14d, 30d, 45d, 60d) |
 | Min IV contango | 2% | Front IV must exceed back IV by at least this |
 | Min prob of profit | 45% | Entry filter |
-| Max loss per trade | 2% of portfolio | Position sizing |
+| Max loss per trade | 2% of available cash | Position sizing (based on live account cash, not static budget) |
 | Stop loss | 50% of debit | Auto-close trigger |
 | Take profit | 150% of debit | Auto-close trigger |
+| Min leg bid/ask size | 1 contract | Liquidity gate — both legs must have real size |
+| Max leg spread | 15% of mid | Liquidity gate — wide-spread legs are rejected |
 
 ---
 
@@ -45,7 +47,14 @@ This bot automates the full lifecycle:
 
 The bot is a separate project (`calendar-bot/`) that ports the core pricing, fee, and broker logic from [optionsStrat](../optionsStrat) and adds a live data feed, ranking engine, decision state machine, and hardened order execution.
 
-See [BOT_PLAN.md](BOT_PLAN.md) for the detailed implementation plan and scaffolding.
+Key architectural components:
+
+- **Portfolio tracker** (`portfolio/tracker.py`) — fetches live account equity from Deribit, tracks available cash and used margin, and feeds real deployable capital into the sizing engine. Replaces the static `BUDGET_USD` config parameter.
+- **Liquidity gate** (in `strategy/decision.py`) — two-stage filter: coarse OI check in the scanner, then a fine bid/ask size and spread check just before order submission. Both legs must pass or the trade is skipped.
+- **Combo orders** (in `execution/executor.py`) — both legs submitted atomically via Deribit's combo order API, eliminating leg risk. Falls back to sequential individual legs only if the combo times out and both legs have sufficient liquidity; the fallback cancels the near leg immediately if the far leg fails.
+- **Notifications** (`alerts/notifier.py`, wired into `strategy/decision.py`) — every decision point (entry, stop, TP, roll, close, daily limit, error) fires an email and/or Telegram alert with deduplication.
+
+See [BOT_PLAN.md](BOT_PLAN.md) for the full design and [BOT_TODO.md](BOT_TODO.md) for progress.
 
 ---
 

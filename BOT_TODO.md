@@ -133,6 +133,87 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
+## Phase 8b — Portfolio Tracker
+
+- [ ] Implement `portfolio/tracker.py`
+  - [ ] Fetch account summary from Deribit REST API (`/private/get_account_summary`) on startup and after every position change
+  - [ ] Track available cash = equity − used margin
+  - [ ] Track used margin = sum of net debits on open positions
+  - [ ] Track unrealized P&L (MTM) and realized P&L today
+  - [ ] Provide `portfolio_view()` returning a formatted snapshot for logging and the terminal dashboard
+  - [ ] Reconcile Deribit reported equity against SQLite position table; log discrepancies
+- [ ] Integrate portfolio tracker into `strategy/sizer.py`
+  - [ ] Replace static `BUDGET_USD` with `portfolio.available_cash`
+  - [ ] `sizer.py` rejects sizing if `available_cash < min_trade_cost`
+- [ ] Integrate portfolio tracker into `strategy/decision.py`
+  - [ ] `scan_tick` calls `portfolio.refresh()` before sizing; skips entry if cash is insufficient
+- [ ] Integrate portfolio tracker into `monitor/loop.py`
+  - [ ] Log a portfolio snapshot at each scan cycle
+- [ ] Write unit tests `tests/test_portfolio.py`
+  - [ ] Mock Deribit REST responses; verify available_cash calculation
+  - [ ] Verify reconciliation warning fires when equity and SQLite totals diverge
+- [ ] Add `scratch/scratch_portfolio.py` — connects to paper API and prints live portfolio snapshot
+
+---
+
+## Phase 8c — Liquidity Gate
+
+- [ ] Add liquidity config parameters to `config.py`: `MIN_LEG_BID_SIZE`, `MIN_LEG_ASK_SIZE`, `MAX_LEG_SPREAD_PCT`
+- [ ] Update `strategy/scanner.py` coarse filter
+  - [ ] Reject candidates where either leg has zero bid or zero ask in the cache
+- [ ] Add liquidity gate to `strategy/decision.py` (fine filter, runs just before order submission)
+  - [ ] Check `bid_size >= MIN_LEG_BID_SIZE` and `ask_size >= MIN_LEG_ASK_SIZE` for both legs
+  - [ ] Check `(ask - bid) / mid <= MAX_LEG_SPREAD_PCT` for both legs
+  - [ ] Log and skip any candidate failing the gate; do not retry until next scan cycle
+- [ ] Update `strategy/scanner.py` unit tests to cover liquidity filter scenarios
+- [ ] Update `strategy/decision.py` unit tests: `TestLiquidityGate`
+
+---
+
+## Phase 8d — Combo Orders and Individual-Leg Fallback
+
+- [ ] Verify `data/deribit_feed.py` and `execution/executor.py` both use `wss://test.deribit.com/ws/api/v2` when `DERIBIT_PAPER = True`
+- [ ] Verify `.env` uses separate test keys: `DERIBIT_TEST_CLIENT_ID`, `DERIBIT_TEST_CLIENT_SECRET`
+- [ ] Add startup banner in `bot.py` logging `PAPER` or `LIVE` environment prominently; refuse to start live without `DAILY_LOSS_LIMIT` set
+- [ ] Implement combo order path in `execution/executor.py`
+  - [ ] Submit both legs as a Deribit combo order at a net debit limit price
+  - [ ] Poll for fill up to `COMBO_FILL_TIMEOUT_SEC`; return fill details on success
+- [ ] Implement individual-leg fallback in `execution/executor.py`
+  - [ ] Only triggered if combo times out and both legs pass the liquidity gate
+  - [ ] Submit near leg; on success submit far leg; on far-leg failure immediately cancel near leg
+  - [ ] Log a WARNING whenever the fallback path is used
+- [ ] Add `COMBO_FILL_TIMEOUT_SEC` to `config.py`
+- [ ] Update executor unit tests: `TestComboOrder`, `TestIndividualLegFallback`, `TestFallbackCancelsNearOnFarFailure`
+- [ ] Update `scratch/scratch_executor.py` with combo order and fallback scenarios
+
+---
+
+## Phase 8e — 1-Day Near Legs
+
+- [ ] Add `1` to `NEAR_DAYS_OPTIONS` in `config.py`
+- [ ] Update `strategy/scanner.py` to enforce valid near/far pairs: near < far (prevents 1d/1d or 7d/7d)
+- [ ] Confirm scanner correctly pairs 1d near with 7d and 14d far legs only (not 30d+ which would be unusual)
+- [ ] Update scanner unit tests to cover 1d near-leg pairs
+
+---
+
+## Phase 8f — Notification Wiring
+
+- [ ] Wire notifier calls into `strategy/decision.py`
+  - [ ] `notify_entry(trade)` after successful fill in `scan_tick`
+  - [ ] `notify_stop(trade, pnl)` when stop-loss triggers in `monitor_tick`
+  - [ ] `notify_take_profit(trade, pnl)` when take-profit triggers in `monitor_tick`
+  - [ ] `notify_roll(trade)` when near leg is rolled in `monitor_tick`
+  - [ ] `notify_close(trade, pnl)` when position closes at expiry in `monitor_tick`
+  - [ ] `notify_daily_limit(daily_pnl)` when daily loss limit is breached
+  - [ ] `notify_error(exc)` in exception handlers in `bot.py` and `monitor/loop.py`
+  - [ ] `notify_warning(msg)` when individual-leg fallback is used
+- [ ] Add startup self-test in `bot.py`: send "Bot started" notification on launch; log warning if it fails but do not abort
+- [ ] Verify all alert config keys present in `config.py`: `ALERT_EMAIL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- [ ] Add `scratch/scratch_notify_live.py` — sends a real test alert via configured SMTP and Telegram; confirms delivery end-to-end
+
+---
+
 ## Phase 9 — Paper Trading Validation
 
 - [ ] Run bot in paper mode (`DERIBIT_PAPER = True`) for minimum 4 weeks
