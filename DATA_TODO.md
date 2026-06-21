@@ -9,51 +9,51 @@ Data is stored in `backtest/historic_data/options.duckdb`.
 
 ## Phase D1 — Database Setup
 
-- [ ] Install DuckDB: `pip install duckdb` and add to `requirements.txt`
-- [ ] Create `backtest/sql/` folder
-- [ ] Write `backtest/sql/schema.sql`
-  - [ ] `option_chain` table with all `TickerSnapshot` fields
-  - [ ] Indexes on `(ts)`, `(asset, ts)`, `(instrument, ts)`
-  - [ ] `collection_runs` metadata table
-- [ ] Create `backtest/historic_data/` folder (add `.gitkeep`; add `*.duckdb` to `.gitignore`)
-- [ ] Run `schema.sql` to initialise `backtest/historic_data/options.duckdb`
-- [ ] Verify schema with DuckDB CLI: `DESCRIBE option_chain;`
+- [x] Install DuckDB: `pip install duckdb` and add to `requirements.txt`
+- [x] Create `backtest/sql/` folder
+- [x] Write `backtest/sql/schema.sql`
+  - [x] `option_chain` table with all `TickerSnapshot` fields
+  - [x] Indexes on `(ts)`, `(asset, ts)`, `(instrument, ts)`
+  - [x] `collection_runs` metadata table
+- [x] Create `backtest/historic_data/` folder (add `.gitkeep`; add `*.duckdb` to `.gitignore`)
+- [x] Run `schema.sql` to initialise `backtest/historic_data/options.duckdb`
+- [x] Verify schema with DuckDB CLI: `DESCRIBE option_chain;`
 
 ---
 
 ## Phase D2 — Data Collector
 
-- [ ] Implement `backtest/data_collector.py`
-  - [ ] Poll `GET /api/v2/public/get_book_summary_by_currency` for BTC and ETH
-  - [ ] Poll `GET /api/v2/public/get_index_price` for spot price
-  - [ ] Normalise API response to `option_chain` schema
-  - [ ] Write snapshot rows to DuckDB in a single transaction
-  - [ ] Log each run to `collection_runs` table (rows added, status, timestamps)
-  - [ ] Configurable poll interval (default 5 minutes)
-  - [ ] Graceful error handling: log and retry on HTTP errors; never crash the loop
+- [x] Implement `backtest/data_collector.py`
+  - [x] Poll `GET /api/v2/public/get_book_summary_by_currency` for BTC and ETH
+  - [x] Poll `GET /api/v2/public/get_index_price` for spot price
+  - [x] Normalise API response to `option_chain` schema
+  - [x] Write snapshot rows to DuckDB in a single transaction
+  - [x] Log each run to `collection_runs` table (rows added, status, timestamps)
+  - [x] Configurable poll interval (default 5 minutes via `COLLECTOR_INTERVAL_SEC`)
+  - [x] Graceful error handling: log and retry on HTTP errors; never crash the loop
 - [ ] Manual smoke test: run collector for 30 minutes; confirm rows appear in DB
-- [ ] Write `backtest/sql/summary_stats.sql` — row counts, date range, assets
+- [x] Write `backtest/sql/summary_stats.sql` — row counts, date range, assets
 
 ---
 
 ## Phase D3 — SQL Query Scripts
 
-- [ ] Write `backtest/sql/query_frames.sql` — pull frames for a given asset + date range
-- [ ] Write `backtest/sql/data_gaps.sql` — find gaps > N minutes between consecutive timestamps
-- [ ] Write `backtest/sql/instrument_coverage.sql` — list instruments and their data span
+- [x] Write `backtest/sql/query_frames.sql` — pull frames for a given asset + date range
+- [x] Write `backtest/sql/data_gaps.sql` — find gaps > N minutes between consecutive timestamps
+- [x] Write `backtest/sql/instrument_coverage.sql` — list instruments and their data span
 
 ---
 
 ## Phase D4 — DB-Backed Loader
 
-- [ ] Implement `backtest/data_loader_db.py`
-  - [ ] `load_frames_from_db(db_path, asset, start, end)` returns `list[Frame]`
-  - [ ] Groups rows by timestamp into frames (same output shape as `loader.py`)
-  - [ ] Warns if gap between consecutive frames exceeds `max_gap_minutes`
-  - [ ] Compatible with `BacktestEngine.run()` — no changes needed to engine
-- [ ] Write unit tests `tests/test_data_loader_db.py`
-  - [ ] Test with an in-memory DuckDB populated with synthetic rows
-  - [ ] Verify frame grouping, ordering, and gap warnings
+- [x] Implement `backtest/data_loader_db.py`
+  - [x] `load_frames_from_db(db_path, asset, start, end)` returns `list[Frame]`
+  - [x] Groups rows by timestamp into frames (same output shape as `loader.py`)
+  - [x] Warns if gap between consecutive frames exceeds `max_gap_minutes`
+  - [x] Compatible with `BacktestEngine.run()` — no changes needed to engine
+- [x] Write unit tests `tests/test_data_loader_db.py`
+  - [x] Test with an in-memory DuckDB populated with synthetic rows
+  - [x] Verify frame grouping, ordering, and gap warnings
 
 ---
 
@@ -91,9 +91,16 @@ Data is stored in `backtest/historic_data/options.duckdb`.
 ## Notes
 
 - The Deribit public REST API requires no API key for market data endpoints
-- DuckDB `.duckdb` files must be added to `.gitignore` (they will be large)
+- DuckDB `.duckdb` files must be added to `.gitignore` (they will be large) ✓
 - `loader.py` (CSV/JSON) is **not replaced** — keep it for one-off sample files
 - At 5-minute cadence, expect ~130,000 rows/day per asset (~260,000/day for BTC+ETH)
 - At that rate, 12 weeks of data ≈ ~22 million rows — well within DuckDB's comfort zone
+- Timestamps are stored as naive UTC in DuckDB (tzinfo stripped before insert) to avoid
+  local-timezone shift on Windows. All query code strips tzinfo before passing to DuckDB.
 - Do not run the collector against the Deribit **live** endpoint unless `DERIBIT_PAPER = False`
   — paper endpoint (`test.deribit.com`) is fine for data collection since market data is identical
+- Scratch: `scratch/scratch_data_collector.py` — connects to Deribit paper API, collects one ETH
+  snapshot, prints summary stats and the first 3 ticker rows. Run with
+  `python -m scratch.scratch_data_collector` from the repo root.
+- `config.py` optional overrides: `COLLECTOR_INTERVAL_SEC` (default 300), `COLLECTOR_ASSETS`
+  (default same as `ASSETS`)
