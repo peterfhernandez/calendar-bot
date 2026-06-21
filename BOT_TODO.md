@@ -170,11 +170,29 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
-## Phase 8d — Combo Orders and Individual-Leg Fallback
+## Phase 8d — Trading Mode (Test vs Live) and Combo Orders
 
-- [ ] Verify `data/deribit_feed.py` and `execution/executor.py` both use `wss://test.deribit.com/ws/api/v2` when `DERIBIT_PAPER = True`
-- [ ] Verify `.env` uses separate test keys: `DERIBIT_TEST_CLIENT_ID`, `DERIBIT_TEST_CLIENT_SECRET`
-- [ ] Add startup banner in `bot.py` logging `PAPER` or `LIVE` environment prominently; refuse to start live without `DAILY_LOSS_LIMIT` set
+### Trading mode
+
+- [ ] Replace `DERIBIT_PAPER = True/False` with `TRADING_MODE = "paper" | "test" | "live"` in `config.py`
+  - [ ] Default value is `"paper"`
+  - [ ] Add derived constants `DERIBIT_WS_URL` and `DERIBIT_REST_URL` (test URL for paper+test, live URL for live)
+  - [ ] Remove all references to `DERIBIT_PAPER` from every module
+- [ ] Update `data/deribit_feed.py` to read `DERIBIT_WS_URL` from config (no hard-coded URLs)
+- [ ] Update `execution/executor.py` to branch on `TRADING_MODE`:
+  - [ ] `"paper"` → dry-run path: log the order, return a simulated fill, never call the Deribit API
+  - [ ] `"test"` or `"live"` → real order submission using `DERIBIT_WS_URL` / `DERIBIT_REST_URL`
+- [ ] Add separate `.env` keys: `DERIBIT_TEST_CLIENT_ID`, `DERIBIT_TEST_CLIENT_SECRET` (shared by paper + test), `DERIBIT_LIVE_CLIENT_ID`, `DERIBIT_LIVE_CLIENT_SECRET`; `config.py` selects the right pair
+- [ ] Add prominent startup banner in `bot.py`:
+  - [ ] Paper: `*** PAPER MODE — data from test.deribit.com, no orders placed ***`
+  - [ ] Test: `*** TEST MODE — orders will be placed on test.deribit.com ***`
+  - [ ] Live: `*** LIVE MODE — REAL MONEY on www.deribit.com ***`
+- [ ] `bot.py` refuses to start when `TRADING_MODE == "live"` and `DAILY_LOSS_LIMIT` is not set
+- [ ] All `scratch_*.py` scripts check `TRADING_MODE` at startup and abort with an error if it is `"live"`
+- [ ] Update unit tests: any test that previously checked `DERIBIT_PAPER` now checks `TRADING_MODE`
+
+### Combo orders and fallback
+
 - [ ] Implement combo order path in `execution/executor.py`
   - [ ] Submit both legs as a Deribit combo order at a net debit limit price
   - [ ] Poll for fill up to `COMBO_FILL_TIMEOUT_SEC`; return fill details on success

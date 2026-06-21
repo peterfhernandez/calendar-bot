@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 *.log
 *.duckdb
+*.duckdb.wal
 .pytest_cache/
 dist/
 build/

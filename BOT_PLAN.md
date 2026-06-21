@@ -191,14 +191,48 @@ The `alerts/notifier.py` module is implemented but not wired into the live execu
 - Add a `scratch/scratch_notify_live.py` that sends a test alert via the real SMTP/Telegram config
 - Add a startup self-test in `bot.py` that sends a "Bot started" notification; if it fails, log a warning but do not abort
 
-### 11. Test Trading via test.deribit.com *(new — light effort)*
+### 11. Trading Mode — Paper, Test, and Live *(new — light effort)*
 
-The existing paper trading flag (`DERIBIT_PAPER = True`) routes to `test.deribit.com`. This needs to be verified end-to-end:
+The bot supports three operational modes selected by `TRADING_MODE` in `config.py`:
 
-- Confirm `deribit_feed.py` and `executor.py` both use `wss://test.deribit.com/ws/api/v2` when `DERIBIT_PAPER = True`
-- Confirm authentication uses test API keys (separate from live keys; stored in `.env` as `DERIBIT_TEST_CLIENT_ID` and `DERIBIT_TEST_CLIENT_SECRET`)
-- Add a startup check that logs which environment is active (`PAPER` or `LIVE`) prominently
-- `bot.py` should refuse to start if `DERIBIT_PAPER = False` and the daily loss limit is not set
+| Mode | Data feed | Order execution | Real money? | API keys |
+| --- | --- | --- | --- | --- |
+| `"paper"` | test.deribit.com | Dry-run only (no orders sent) | No | `DERIBIT_TEST_CLIENT_ID` / `SECRET` |
+| `"test"` | test.deribit.com | Orders placed on test.deribit.com | No | `DERIBIT_TEST_CLIENT_ID` / `SECRET` |
+| `"live"` | <www.deribit.com> | Orders placed on <www.deribit.com> | **Yes** | `DERIBIT_LIVE_CLIENT_ID` / `SECRET` |
+
+**Paper mode** is the default and safest starting point. It connects to the test exchange to get real market structure and pricing, but the executor runs in dry-run mode — orders are logged and simulated locally without ever being sent to Deribit. This is the mode used by all scratch scripts and backtesting.
+
+**Test mode** uses the same test exchange but actually submits orders. Use this to verify the full order lifecycle (combo submission, fill detection, order manager reconciliation) before risking real capital.
+
+**Live mode** connects to the production exchange and places real orders with real money.
+
+**Implementation requirements:**
+
+- `data/deribit_feed.py` reads `DERIBIT_WS_URL` from config; the URL is the same for `"paper"` and `"test"` (test exchange) and different for `"live"`
+- `execution/executor.py` checks `TRADING_MODE`:
+  - `"paper"` → dry-run path (log the order, return a simulated fill, never call the API)
+  - `"test"` or `"live"` → real order submission path, using the appropriate REST/WS URL
+- `config.py` exposes `DERIBIT_WS_URL` and `DERIBIT_REST_URL` as derived constants so no other module hard-codes a URL
+- On startup, `bot.py` prints a prominent banner identifying the active mode:
+  - `*** PAPER MODE — data from test.deribit.com, no orders placed ***`
+  - `*** TEST MODE — orders will be placed on test.deribit.com ***`
+  - `*** LIVE MODE — REAL MONEY on www.deribit.com ***`
+- `bot.py` refuses to start in `"live"` mode if `DAILY_LOSS_LIMIT` is not set to a positive value
+- Scratch scripts (`scratch_*.py`) check `TRADING_MODE` and abort if it is `"live"` — scratch scripts must never touch the live exchange
+
+**Separate API keys:**
+
+Test and live accounts are entirely separate on Deribit. Both key pairs are stored in `.env` (never committed):
+
+```python
+DERIBIT_TEST_CLIENT_ID=...
+DERIBIT_TEST_CLIENT_SECRET=...
+DERIBIT_LIVE_CLIENT_ID=...
+DERIBIT_LIVE_CLIENT_SECRET=...
+```
+
+`config.py` selects the right pair: test keys for `"paper"` and `"test"` modes; live keys for `"live"` mode.
 
 ---
 
@@ -292,7 +326,7 @@ calendar-bot/
 | Runaway losses in volatile market | Hard daily loss limit; halt + alert if breached |
 | Cash over-commitment | Portfolio tracker enforces `available_cash` check before every entry |
 | Silent notification failures | Startup self-test notification; warning logged but bot continues |
-| Wrong environment (live vs test) | Startup banner logs PAPER/LIVE; bot refuses to start live without daily loss limit set |
+| Wrong environment | Startup banner clearly states PAPER / TEST / LIVE; bot refuses to start in live mode without DAILY_LOSS_LIMIT; scratch scripts abort if TRADING_MODE == "live" |
 
 ---
 
@@ -385,13 +419,28 @@ TAKE_PROFIT_PCT   = 1.50    # close if spread worth > 150% of debit
 SCAN_INTERVAL_SEC    = 300   # 5 minutes
 MONITOR_INTERVAL_SEC = 60    # 1 minute
 
-# Broker
-DERIBIT_PAPER     = True     # set False for live trading
-DAILY_LOSS_LIMIT  = 500      # USD — halt bot if exceeded
+# Trading mode:
+#   "paper" → data from test.deribit.com, dry-run execution (no orders sent)
+#   "test"  → data from test.deribit.com, orders placed on test.deribit.com
+#   "live"  → data from www.deribit.com,  orders placed on www.deribit.com (real money)
+TRADING_MODE  = "paper"
+
+# Derived URLs — do not hard-code these elsewhere
+_LIVE = TRADING_MODE == "live"
+DERIBIT_WS_URL   = "wss://www.deribit.com/ws/api/v2"  if _LIVE else "wss://test.deribit.com/ws/api/v2"
+DERIBIT_REST_URL = "https://www.deribit.com"           if _LIVE else "https://test.deribit.com"
+
+DAILY_LOSS_LIMIT  = 500      # USD — halt bot if exceeded (required for live mode)
 
 # Alerts (set in .env, referenced here for documentation)
 # ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
 # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#
+# API keys (set in .env — never commit)
+# Paper and test modes share test-exchange credentials:
+# DERIBIT_TEST_CLIENT_ID, DERIBIT_TEST_CLIENT_SECRET
+# Live mode uses production credentials:
+# DERIBIT_LIVE_CLIENT_ID, DERIBIT_LIVE_CLIENT_SECRET
 ```
 
 ---

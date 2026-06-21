@@ -29,7 +29,7 @@ This bot automates the full lifecycle:
 ## Key parameters
 
 | Parameter | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | Assets | BTC, ETH | Underlyings to trade |
 | Near leg | 1–14 days | Short option expiry (1d, 7d, 14d) |
 | Far leg | 7–60 days | Long option expiry (7d, 14d, 30d, 45d, 60d) |
@@ -58,14 +58,33 @@ See [BOT_PLAN.md](BOT_PLAN.md) for the full design and [BOT_TODO.md](BOT_TODO.md
 
 ---
 
-## Paper trading first
+## Trading modes
 
-The bot defaults to Deribit's **paper trading** environment (`DERIBIT_PAPER = True`). Validate performance for at least 4–6 weeks in paper mode before switching to live. Key things to verify in paper mode:
+The bot supports three operational modes set by `TRADING_MODE` in `config.py`:
 
-- Scanner selects setups that actually profit at expiry
+| Mode | Data feed | Order execution | Real money? |
+| --- | --- | --- | --- |
+| `"paper"` *(default)* | test.deribit.com | Dry-run — logged locally, no orders sent | No |
+| `"test"` | test.deribit.com | Real orders on test.deribit.com | No |
+| `"live"` | <www.deribit.com> | Real orders on <www.deribit.com> | **Yes** |
+
+**Paper mode** connects to the test exchange for live market data and pricing, but the executor never sends an order — all fills are simulated locally. This is the mode used by all scratch / debug scripts and is the recommended starting point.
+
+**Test mode** connects to the same test exchange and actually submits orders. Use this to verify the full order lifecycle (combo submission, fill detection, reconciliation) before risking real capital.
+
+**Live mode** connects to the production exchange and places real orders with real money.
+
+API credentials are stored in `.env` (never committed). Paper and test share the test-exchange key pair (`DERIBIT_TEST_CLIENT_ID` / `SECRET`); live uses a separate production key pair (`DERIBIT_LIVE_CLIENT_ID` / `SECRET`).
+
+On startup the bot prints a prominent banner identifying the active mode. It refuses to start in `"live"` mode if `DAILY_LOSS_LIMIT` is not configured. Scratch scripts abort if `TRADING_MODE` is `"live"`.
+
+**Run in paper mode, then test mode, for at least 4 weeks total before switching to live.** Key things to verify:
+
+- Scanner selects setups that profit at expiry
 - Stop-loss and take-profit triggers fire correctly
 - Roll logic produces better outcomes than outright close
 - Daily loss limit halts the bot as expected
+- Notifications arrive for every decision event
 
 ---
 
@@ -80,7 +99,7 @@ The bot defaults to Deribit's **paper trading** environment (`DERIBIT_PAPER = Tr
 ## Relationship to optionsStrat
 
 | optionsStrat | calendar-bot |
-|---|---|
+| --- | --- |
 | Manual paper trading UI | Fully automated |
 | Single position at a time | Up to 3 concurrent positions |
 | Interactive spot/IV input | Live Deribit WebSocket feed |
