@@ -938,3 +938,78 @@ class TestMarketSpreadValue:
 
         market_sv = engine._get_market_spread_value(pos)
         assert market_sv is None
+
+
+# ── Bug fix: negative spread value clamped to zero ───────────────────────────
+
+class TestNegativeSpreadValueClamped:
+    """
+    Regression test for the halt caused by an inverted market spread.
+
+    When the near leg's mid exceeds the far leg's mid (stale or thin data),
+    (far_mid - near_mid) is negative.  Multiplied by a large qty this becomes
+    a catastrophic phantom loss that triggers the daily loss limit.
+
+    _get_market_spread_value must clamp the result to >= 0.
+    """
+
+    def _open_pos(self, near_instr: str, far_instr: str, qty: float = 1.0) -> dict:
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return {
+            "trade_id":        99,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             qty,
+            "net_debit":       50.0,
+            "spot_open":       90_000.0,
+            "near_days":       10,
+            "far_days":        35,
+            "near_instrument": near_instr,
+            "far_instrument":  far_instr,
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def test_inverted_spread_clamped_to_zero(self):
+        """When near_mid > far_mid, spread value must be 0, not negative."""
+        near_instr = "BTC-10DAY-90000-C"
+        far_instr  = "BTC-35DAY-90000-C"
+
+        near_snap = _make_snap(near_instr, bid=500.0, ask=510.0)   # near_mid=505
+        far_snap  = _make_snap(far_instr,  bid=100.0, ask=110.0)   # far_mid=105 (inverted)
+
+        cache = MagicMock()
+        cache.get_spot.return_value = 90_000.0
+        cache.get_chain.return_value = [near_snap, far_snap]
+
+        pos = self._open_pos(near_instr, far_instr, qty=100.0)
+        engine, _ = _make_engine(cache=cache)
+
+        market_sv = engine._get_market_spread_value(pos)
+        # Without clamp: (105 - 505) * 100 = -40000 → catastrophic
+        # With clamp: max(0, 105 - 505) * 100 = 0
+        assert market_sv == pytest.approx(0.0)
+
+    def test_normal_spread_unaffected_by_clamp(self):
+        """A positive spread value must pass through unchanged."""
+        near_instr = "BTC-10DAY-90000-C"
+        far_instr  = "BTC-35DAY-90000-C"
+
+        near_snap = _make_snap(near_instr, bid=100.0, ask=110.0)   # near_mid=105
+        far_snap  = _make_snap(far_instr,  bid=200.0, ask=220.0)   # far_mid=210
+
+        cache = MagicMock()
+        cache.get_spot.return_value = 90_000.0
+        cache.get_chain.return_value = [near_snap, far_snap]
+
+        pos = self._open_pos(near_instr, far_instr, qty=2.0)
+        engine, _ = _make_engine(cache=cache)
+
+        market_sv = engine._get_market_spread_value(pos)
+        # (210 - 105) * 2 = 210
+        assert market_sv == pytest.approx(210.0)

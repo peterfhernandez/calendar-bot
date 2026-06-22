@@ -37,6 +37,8 @@ MIN_EV          = 0.05   # minimum expected value as a fraction of net_debit.
 MAX_LOSS_PCT       = 0.02  # max 2% of portfolio per trade
 MAX_POSITIONS      = 5     # max concurrent open calendar spreads
 MAX_TOTAL_RISK_PCT = 0.09  # hard 6% total capital-at-risk across all open positions
+MAX_QTY            = 100.0  # hard cap on contracts per trade — guards against near-zero debit producing absurd sizes
+MIN_NET_DEBIT      = 0.10   # USD — reject candidates whose debit is so small it cannot be sized sensibly
 
 # Risk-free rate used in Black-Scholes pricing.
 # Deribit crypto options have no financing cost baked in, so 0.0 is the

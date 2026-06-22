@@ -311,3 +311,46 @@ class TestSizeCandidate:
         c = _dummy_candidate(net_debit=100.0)
         result = size_candidate(c, portfolio_value=12_500.0, open_positions=[], max_loss_pct=0.02)
         assert result.qty == pytest.approx(2.5)
+
+
+# ── Bug fix: near-zero debit guard and MAX_QTY cap ───────────────────────────
+
+class TestSizerSafetyGuards:
+    """
+    Regression tests for two bugs that caused the bot to halt:
+    1. A near-zero net_debit produced an absurd quantity (22k+ contracts).
+    2. No hard cap on quantity existed, so the outsized position compounded
+       a small negative spread value into a catastrophic phantom loss.
+    """
+
+    def test_near_zero_debit_rejected(self):
+        """net_debit below MIN_NET_DEBIT must be blocked, not sized to 20k+ contracts."""
+        c = _dummy_candidate(net_debit=0.0091)
+        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
+        assert result.qty == 0.0
+        assert "minimum" in result.reason.lower()
+
+    def test_normal_debit_still_passes(self):
+        """A sensible debit above MIN_NET_DEBIT must still be approved."""
+        c = _dummy_candidate(net_debit=100.0)
+        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
+        assert result.qty > 0.0
+
+    def test_qty_capped_at_max_qty(self, monkeypatch):
+        """Even if debit passes the floor, qty must never exceed MAX_QTY."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_QTY", 5.0)
+        monkeypatch.setattr(cfg, "MIN_NET_DEBIT", 0.10)
+        # max_loss=200 / net_debit=0.50 = 400 contracts → should be capped to 5
+        c = _dummy_candidate(net_debit=0.50)
+        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
+        assert result.qty == pytest.approx(5.0)
+
+    def test_qty_cap_does_not_affect_normal_sizing(self, monkeypatch):
+        """When raw qty is already below MAX_QTY, the cap has no effect."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_QTY", 100.0)
+        monkeypatch.setattr(cfg, "MIN_NET_DEBIT", 0.10)
+        c = _dummy_candidate(net_debit=100.0)
+        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
+        assert result.qty == pytest.approx(2.0)  # unchanged

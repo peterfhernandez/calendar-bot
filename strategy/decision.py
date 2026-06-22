@@ -620,7 +620,10 @@ class DecisionEngine:
 
         if near_mid is None or far_mid is None:
             return None
-        return (far_mid - near_mid) * pos.get("qty", 1.0)
+        # A calendar spread cannot be worth less than zero — clamp guards against
+        # stale/inverted market data producing a negative spread value that, when
+        # multiplied by a large quantity, generates an enormous phantom loss.
+        return max(0.0, far_mid - near_mid) * pos.get("qty", 1.0)
 
     def _status(
         self,

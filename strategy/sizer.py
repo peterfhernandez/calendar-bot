@@ -126,10 +126,25 @@ def size_candidate(
     if candidate.net_debit <= 0:
         return SizeResult(qty=0.0, reason="net_debit is zero or negative")
 
+    min_net_debit = getattr(config, "MIN_NET_DEBIT", 0.10)
+    if candidate.net_debit < min_net_debit:
+        return SizeResult(
+            qty=0.0,
+            reason=(
+                f"net_debit {candidate.net_debit:.4f} below minimum {min_net_debit:.4f} "
+                f"— spread is effectively free and cannot be sized safely"
+            ),
+        )
+
     raw_qty = max_loss_usd / candidate.net_debit
 
     # Round down to one decimal place (Deribit minimum increment is 0.1 for options)
     qty = max(0.0, math.floor(raw_qty * 10) / 10)
+
+    # Hard cap to prevent runaway sizes from low-debit candidates that slip past the floor
+    max_qty = getattr(config, "MAX_QTY", 100.0)
+    if qty > max_qty:
+        qty = math.floor(max_qty * 10) / 10
 
     if qty < _MIN_QTY:
         return SizeResult(
