@@ -33,6 +33,13 @@ MIN_EV          = 0.05   # minimum expected value as a fraction of net_debit.
                          # e.g. a candidate with net_debit=0.02 BTC and ev_score=0.25
                          # has an expected profit of 25% of the debit (0.005 BTC per contract).
 
+# Liquidity gate (applied just before order submission)
+MIN_LEG_BID_SIZE       = 1      # minimum bid-size (contracts) per leg — requires bid_size in TickerSnapshot
+MIN_LEG_ASK_SIZE       = 1      # minimum ask-size (contracts) per leg — requires ask_size in TickerSnapshot
+MAX_LEG_SPREAD_PCT     = 0.05   # reject if (ask-bid)/mid > 5% on either leg
+MAX_ENTRY_PREMIUM      = 0.10   # reject if net_debit > spread_mid * (1 + 10%)
+COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individual-leg fallback
+
 # Position sizing
 MAX_LOSS_PCT       = 0.02  # max 2% of portfolio per trade
 MAX_POSITIONS      = 5     # max concurrent open calendar spreads

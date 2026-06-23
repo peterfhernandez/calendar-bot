@@ -85,11 +85,11 @@ def _make_candidate(near_days: int = 10, far_days: int = 35) -> CalendarCandidat
         near_iv=0.90,
         far_iv=0.70,
         iv_contango=0.20,
-        near_ask=0.03,
-        near_bid=0.02,
-        far_ask=0.04,
-        far_bid=0.035,
-        net_debit=0.02,
+        near_ask=0.0255,
+        near_bid=0.0245,   # near_mid=0.025, spread=4% — passes 5% gate
+        far_ask=0.0445,
+        far_bid=0.0435,    # far_mid=0.044,  spread=2.3% — passes 5% gate
+        net_debit=0.02,    # far_ask-near_bid=0.0445-0.0245=0.02; spread_mid=0.019; premium≈5.3%
         near_oi=500.0,
         far_oi=500.0,
         pop=0.55,
@@ -1013,3 +1013,148 @@ class TestNegativeSpreadValueClamped:
         market_sv = engine._get_market_spread_value(pos)
         # (210 - 105) * 2 = 210
         assert market_sv == pytest.approx(210.0)
+
+
+# ── Liquidity gate: per-leg spread check ─────────────────────────────────────
+
+class TestLiquidityGate:
+    """
+    The liquidity gate (_check_liquidity_gate) must block candidates whose
+    per-leg bid/ask spread exceeds MAX_LEG_SPREAD_PCT, and candidates where
+    the entry debit exceeds the spread mid by more than MAX_ENTRY_PREMIUM.
+
+    Integration: scan_tick must not call enter_spread on any blocked candidate.
+    """
+
+    def _wide_near_candidate(self) -> CalendarCandidate:
+        """Near leg has a 20% bid/ask spread — exceeds 5% gate."""
+        c = _make_candidate()
+        c.near_bid = 90.0
+        c.near_ask = 110.0   # (110-90)/100 = 20% spread
+        c.far_bid  = 200.0
+        c.far_ask  = 202.0   # 1% spread — fine
+        c.net_debit = c.far_ask - c.near_bid  # = 112
+        return c
+
+    def _wide_far_candidate(self) -> CalendarCandidate:
+        """Far leg has a 20% bid/ask spread — exceeds 5% gate."""
+        c = _make_candidate()
+        c.near_bid = 90.0
+        c.near_ask = 92.0    # 2.2% spread — fine
+        c.far_bid  = 180.0
+        c.far_ask  = 220.0   # (220-180)/200 = 20% spread
+        c.net_debit = c.far_ask - c.near_bid  # = 130
+        return c
+
+    def _high_premium_candidate(self) -> CalendarCandidate:
+        """Net debit is 34% above spread mid — exceeds 10% entry premium gate.
+
+        near_mid=95, far_mid=105, spread_mid=10
+        net_debit = far_ask - near_bid = 108 - 92 = 16
+        premium = (16-10)/10 = 60% > 10%
+        """
+        c = _make_candidate()
+        c.near_bid = 92.0
+        c.near_ask = 98.0    # near_mid = 95, spread_pct = 6/95 ≈ 6.3% > 5% FAILS leg gate first
+        # Use tight spreads so only premium check fires
+        c.near_bid = 94.0
+        c.near_ask = 96.0    # near_mid=95, spread=2/95≈2.1% — fine
+        c.far_bid  = 104.0
+        c.far_ask  = 106.0   # far_mid=105, spread=2/105≈1.9% — fine
+        c.net_debit = 16.0   # = far_ask(106) - near_bid(94) = 12 ... let's set manually
+        # spread_mid = 105 - 95 = 10; net_debit = 16 → premium = (16-10)/10 = 60%
+        return c
+
+    def _good_candidate(self) -> CalendarCandidate:
+        """All checks pass: tight spreads, debit close to mid."""
+        c = _make_candidate()
+        c.near_bid = 94.0
+        c.near_ask = 96.0    # near_mid=95, spread≈2.1%
+        c.far_bid  = 104.0
+        c.far_ask  = 106.0   # far_mid=105, spread≈1.9%
+        c.net_debit = 10.5   # = far_ask - near_bid = 106-94=12 → but let's set to 10.5
+        # spread_mid=10, debit=10.5 → premium=5% ≤ 10% — passes
+        return c
+
+    # ── Unit: _check_liquidity_gate ───────────────────────────────────────────
+
+    def test_wide_near_leg_blocked(self):
+        engine, _ = _make_engine()
+        reason = engine._check_liquidity_gate(self._wide_near_candidate())
+        assert reason is not None
+        assert "near-leg" in reason
+
+    def test_wide_far_leg_blocked(self):
+        engine, _ = _make_engine()
+        reason = engine._check_liquidity_gate(self._wide_far_candidate())
+        assert reason is not None
+        assert "far-leg" in reason
+
+    def test_high_entry_premium_blocked(self):
+        engine, _ = _make_engine()
+        reason = engine._check_liquidity_gate(self._high_premium_candidate())
+        assert reason is not None
+        assert "entry premium" in reason
+
+    def test_good_candidate_passes(self):
+        engine, _ = _make_engine()
+        reason = engine._check_liquidity_gate(self._good_candidate())
+        assert reason is None
+
+    # ── Integration: scan_tick respects the gate ──────────────────────────────
+
+    def test_scan_tick_blocks_wide_spread_candidate(self):
+        """scan_tick must not call enter_spread when the liquidity gate rejects."""
+        executor = MagicMock()
+        candidate = self._wide_near_candidate()
+        candidate.ev_score = 0.25
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="Approved")
+
+            engine, _ = _make_engine(executor=executor)
+            status = engine.scan_tick()
+
+        executor.enter_spread.assert_not_called()
+        assert status.open_positions == 0
+
+    def test_scan_tick_blocks_high_premium_candidate(self):
+        """scan_tick must not call enter_spread when entry premium is too high."""
+        executor = MagicMock()
+        candidate = self._high_premium_candidate()
+        candidate.ev_score = 0.25
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="Approved")
+
+            engine, _ = _make_engine(executor=executor)
+            status = engine.scan_tick()
+
+        executor.enter_spread.assert_not_called()
+        assert status.open_positions == 0
+
+    def test_scan_tick_allows_good_candidate(self):
+        """A candidate passing all gate checks must reach enter_spread."""
+        executor = MagicMock()
+        candidate = self._good_candidate()
+        candidate.ev_score = 0.25
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="Approved")
+            executor.enter_spread.return_value = {
+                "near_prem": candidate.near_bid,
+                "far_prem":  candidate.far_ask,
+                "net_debit": candidate.net_debit,
+                "qty":       1.0,
+            }
+
+            engine, _ = _make_engine(executor=executor)
+            status = engine.scan_tick()
+
+        executor.enter_spread.assert_called_once()

@@ -158,15 +158,16 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 8c — Liquidity Gate
 
-- [ ] Add liquidity config parameters to `config.py`: `MIN_LEG_BID_SIZE`, `MIN_LEG_ASK_SIZE`, `MAX_LEG_SPREAD_PCT`
+- [x] Add liquidity config parameters to `config.py`: `MIN_LEG_BID_SIZE`, `MIN_LEG_ASK_SIZE`, `MAX_LEG_SPREAD_PCT = 0.05`, `MAX_ENTRY_PREMIUM = 0.10`, `COMBO_FILL_TIMEOUT_SEC = 30`
 - [ ] Update `strategy/scanner.py` coarse filter
   - [ ] Reject candidates where either leg has zero bid or zero ask in the cache
-- [ ] Add liquidity gate to `strategy/decision.py` (fine filter, runs just before order submission)
-  - [ ] Check `bid_size >= MIN_LEG_BID_SIZE` and `ask_size >= MIN_LEG_ASK_SIZE` for both legs
-  - [ ] Check `(ask - bid) / mid <= MAX_LEG_SPREAD_PCT` for both legs
-  - [ ] Log and skip any candidate failing the gate; do not retry until next scan cycle
+- [x] Add liquidity gate to `strategy/decision.py` (`_check_liquidity_gate`, runs just before order submission)
+  - [ ] Check `bid_size >= MIN_LEG_BID_SIZE` and `ask_size >= MIN_LEG_ASK_SIZE` for both legs (requires adding `bid_size`/`ask_size` to `TickerSnapshot`)
+  - [x] Check `(ask - bid) / mid <= MAX_LEG_SPREAD_PCT` for both legs
+  - [x] Check `net_debit <= spread_mid * (1 + MAX_ENTRY_PREMIUM)` — prevents entering positions that start deeply underwater due to bid/ask friction
+  - [x] Log and skip any candidate failing the gate; do not retry until next scan cycle
 - [ ] Update `strategy/scanner.py` unit tests to cover liquidity filter scenarios
-- [ ] Update `strategy/decision.py` unit tests: `TestLiquidityGate`
+- [x] Update `strategy/decision.py` unit tests: `TestLiquidityGate` (11 new tests, 50 total passing)
 
 ---
 
@@ -264,6 +265,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - `scratch/scratch_notifier.py` — end-to-end verification script for the Notifier; runs 8 sections covering dispatch, deduplication, cooldown expiry, all helper methods, skip-when-unconfigured, and payload correctness (19 checks, no live network calls). Run with `python -m scratch.scratch_notifier` from the repo root.
 - `scratch/scratch_backtest.py` — end-to-end verification for the backtesting harness; generates synthetic BTC data for 4 vol regimes (High Vol Contango, Low Vol Weak Contango, IV Spike/Collapse, Stable Sideways), runs BacktestEngine on each, and prints a formatted summary table. Also exercises loader CSV/JSON round-trips and BacktestChainCache. Run with `python -m scratch.scratch_backtest` from the repo root.
 - `scratch/scratch_three_fixes.py` — demonstrates three bug fixes: (1) negative-EV trade rejection, (2) correct stale-IV monitor message, (3) daily_pnl reflecting unrealized MTM. Run with `python -m scratch.scratch_three_fixes` from the repo root.
+- `scratch/scratch_entry_gate.py` — demonstrates the liquidity gate: 7 scenarios covering per-leg spread rejection, entry premium rejection (including the live trade_id=5 scenario), and a clean candidate that passes all checks. Run with `python -m scratch.scratch_entry_gate` from the repo root.
 - `scratch/scratch_sizer_fixes.py` — demonstrates the two fixes for the 2026-06-22 halt: (1) near-zero debit guard in sizer, (2) negative spread value clamped to zero. Run with `python -m scratch.scratch_sizer_fixes` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
@@ -279,4 +281,5 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - [x] **Spurious TP from B-S spread_value mismatch** — `check_calendar_status` now accepts an optional `market_sv` parameter; `_monitor_position` computes the current spread as `(far_mid - near_mid) * qty` from live cache bid/ask and passes it as `market_sv`. B-S is used only as a fallback when leg prices are absent from the cache. This fixes cases where B-S (using a single uniform IV) computed sv ~10× above the actual market spread (e.g. $2266 vs $178 for a BTC 61000-C calendar), triggering instant spurious TPs. New helper: `_get_market_spread_value`. Tests: `TestMarketSpreadValue`.
 - [x] **daily_pnl inflated by double-qty multiplication** — `spread_value()` returns a qty-weighted total (B-S price × qty), but `_monitor_position` was treating it as per-unit and multiplying by qty again: `(sv - net_debit) * qty`. For a position with qty=8.5 this inflated the unrealized P&L by ~8.5×, producing values like $2900 instead of ~$40. Fixed to `sv - net_debit * qty`. Same double-qty bug fixed in the `spread_value` path of `_close_position`. Tests: `TestClosePositionPnl`, `TestDailyPnlUnrealized` (assertions updated to reflect correct formula).
 - [x] **Near-zero debit produces absurd quantity (halt incident 2026-06-22)** — sizer divided `max_loss_usd / net_debit` with `net_debit=0.0091`, yielding 22,062 contracts. Added `MIN_NET_DEBIT = 0.10` to `config.py`; `strategy/sizer.py` now rejects candidates below this floor. Added `MAX_QTY = 100.0` as a hard cap so any debit that slips past the floor still cannot produce a runaway position size. Tests: `TestSizerSafetyGuards` in `tests/test_scanner.py`. Scratch: `scratch/scratch_sizer_fixes.py`.
+- [x] **Entry premium gate (2026-06-23 churn diagnosis)** — trade_id=5 entered at $60.60/unit when market spread mid was ~$40.25 (51% premium over fair value), stopped out in 31 minutes. Two new config params: `MAX_LEG_SPREAD_PCT = 0.05` (tightened from 0.15) and `MAX_ENTRY_PREMIUM = 0.10`. `_check_liquidity_gate` in `strategy/decision.py` blocks any candidate where either leg's bid/ask spread exceeds 5% of mid, or where net_debit exceeds spread_mid by more than 10%. Tests: `TestLiquidityGate` in `tests/test_decision.py`. Scratch: `scratch/scratch_entry_gate.py`.
 - [x] **Inverted market spread triggers phantom $52M loss (halt incident 2026-06-22)** — when `near_mid > far_mid` (stale/thin data), `_get_market_spread_value` returned a negative value; multiplied by the absurd 22k-contract qty this produced a ~$52M phantom loss that breached the daily loss limit. Fixed by clamping `max(0.0, far_mid - near_mid)` before multiplying — a calendar spread value cannot be negative. Tests: `TestNegativeSpreadValueClamped` in `tests/test_decision.py`. Scratch: `scratch/scratch_sizer_fixes.py`.

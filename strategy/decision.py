@@ -267,6 +267,15 @@ class DecisionEngine:
                 continue
 
             candidate.qty = size.qty
+
+            gate_reason = self._check_liquidity_gate(candidate)
+            if gate_reason:
+                logger.debug(
+                    "LIQUIDITY GATE skip: %s for %s %s strike=%.0f",
+                    gate_reason, candidate.asset, candidate.option_type, candidate.strike,
+                )
+                continue
+
             logger.info(
                 "RANK approved: %s %s strike=%.0f  qty=%.1f  ev=%.4f",
                 candidate.asset, candidate.option_type, candidate.strike,
@@ -348,6 +357,53 @@ class DecisionEngine:
             summary = "; ".join(actions) if actions else "All positions OK."
 
         return self._status(f"Monitor: {summary}", open_positions)
+
+    # ── Liquidity gate ────────────────────────────────────────────────────────
+
+    def _check_liquidity_gate(self, candidate: CalendarCandidate) -> str | None:
+        """
+        Fine liquidity gate applied just before order submission.
+
+        Two checks:
+        1. Per-leg bid/ask spread must be <= MAX_LEG_SPREAD_PCT of mid.
+           Wide spreads signal thin books and inflate entry cost.
+        2. Net entry debit must be <= spread_mid * (1 + MAX_ENTRY_PREMIUM).
+           This catches cases where the bid/ask friction on two legs combines
+           to make the trade start deeply underwater (e.g. paying $60 for a
+           spread whose mid is $40).
+
+        Returns a rejection reason string, or None if the candidate passes.
+        """
+        near_mid = (candidate.near_bid + candidate.near_ask) / 2 if (candidate.near_bid > 0 and candidate.near_ask > 0) else 0.0
+        far_mid  = (candidate.far_bid  + candidate.far_ask)  / 2 if (candidate.far_bid  > 0 and candidate.far_ask  > 0) else 0.0
+
+        if near_mid > 0:
+            near_spread_pct = (candidate.near_ask - candidate.near_bid) / near_mid
+            if near_spread_pct > config.MAX_LEG_SPREAD_PCT:
+                return (
+                    f"near-leg spread {near_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
+                    f"{config.MAX_LEG_SPREAD_PCT:.1%}"
+                )
+
+        if far_mid > 0:
+            far_spread_pct = (candidate.far_ask - candidate.far_bid) / far_mid
+            if far_spread_pct > config.MAX_LEG_SPREAD_PCT:
+                return (
+                    f"far-leg spread {far_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
+                    f"{config.MAX_LEG_SPREAD_PCT:.1%}"
+                )
+
+        spread_mid = far_mid - near_mid
+        if spread_mid > 0:
+            premium = (candidate.net_debit - spread_mid) / spread_mid
+            if premium > config.MAX_ENTRY_PREMIUM:
+                return (
+                    f"entry premium {premium:.1%} > MAX_ENTRY_PREMIUM "
+                    f"{config.MAX_ENTRY_PREMIUM:.1%} "
+                    f"(debit={candidate.net_debit:.4f}, spread_mid={spread_mid:.4f})"
+                )
+
+        return None
 
     # ── Entry logic ───────────────────────────────────────────────────────────
 
