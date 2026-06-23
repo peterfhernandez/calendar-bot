@@ -40,6 +40,8 @@ def _make_snap(
     ask: float = 110.0,
     open_interest: float = 500.0,
     spot: float = 100_000.0,
+    bid_size: float = 10.0,
+    ask_size: float = 10.0,
 ) -> TickerSnapshot:
     expiry_str = _future_date(expiry_days)
     instrument = f"{asset}-{expiry_str}-{strike}-{opt_type}"
@@ -52,6 +54,8 @@ def _make_snap(
         bid=bid,
         ask=ask,
         open_interest=open_interest,
+        bid_size=bid_size,
+        ask_size=ask_size,
         timestamp=time.time(),
     )
 
@@ -239,6 +243,48 @@ class TestScan:
         assert c.be_hi > c.be_lo
         assert 0.0 <= c.pop <= 1.0
         assert c.near_days < c.far_days
+
+
+# ── Coarse liquidity filter (zero bid/ask) ────────────────────────────────────
+
+class TestScannerLiquidityFilter:
+    """
+    Scanner must reject any candidate where either leg has a zero bid or
+    zero ask price (no quoted market → entry cost is unreliable).
+    """
+
+    def _base_snaps(self, near_bid=4800.0, near_ask=5200.0,
+                    far_bid=8200.0, far_ask=8800.0) -> list[TickerSnapshot]:
+        return [
+            _make_snap("BTC", 7,  100_000, "C", mark_iv=0.90,
+                       bid=near_bid, ask=near_ask, open_interest=600),
+            _make_snap("BTC", 30, 100_000, "C", mark_iv=0.75,
+                       bid=far_bid,  ask=far_ask,  open_interest=600),
+        ]
+
+    def _scan(self, snaps):
+        cache = _make_cache(snaps)
+        return scan(
+            cache, assets=["BTC"],
+            near_days_options=[7], far_days_options=[30],
+            min_oi_near=100, min_oi_far=100,
+            min_iv_contango=0.02, min_pop=0.01,
+        )
+
+    def test_passes_with_valid_bids_asks(self):
+        assert len(self._scan(self._base_snaps())) >= 1
+
+    def test_rejects_zero_near_bid(self):
+        assert len(self._scan(self._base_snaps(near_bid=0.0))) == 0
+
+    def test_rejects_zero_near_ask(self):
+        assert len(self._scan(self._base_snaps(near_ask=0.0))) == 0
+
+    def test_rejects_zero_far_bid(self):
+        assert len(self._scan(self._base_snaps(far_bid=0.0))) == 0
+
+    def test_rejects_zero_far_ask(self):
+        assert len(self._scan(self._base_snaps(far_ask=0.0))) == 0
 
 
 # ── size_candidate ────────────────────────────────────────────────────────────

@@ -48,6 +48,8 @@ class TickerSnapshot:
     bid:        float        # best bid in USD
     ask:        float        # best ask in USD
     open_interest: float     # open interest in contracts
+    bid_size:   float = 0.0  # best bid quantity (contracts); 0 = no size data
+    ask_size:   float = 0.0  # best ask quantity (contracts); 0 = no size data
     timestamp:  float = field(default_factory=time.time)
 
     @property
@@ -273,6 +275,8 @@ class DeribitFeed:
             bids  = data.get("best_bid_price") or data.get("bid_price") or 0
             asks  = data.get("best_ask_price") or data.get("ask_price") or 0
             oi    = float(data.get("open_interest") or 0)
+            bid_sz = float(data.get("best_bid_amount") or 0)
+            ask_sz = float(data.get("best_ask_amount") or 0)
 
             # Deribit mark_price for options is in BTC/ETH terms — convert to USD
             if spot > 0 and mp < 10:
@@ -295,6 +299,8 @@ class DeribitFeed:
                 bid=bids,
                 ask=asks,
                 open_interest=oi,
+                bid_size=bid_sz,
+                ask_size=ask_sz,
             )
         except (KeyError, ValueError, TypeError):
             logger.debug("Could not parse ticker for %s: %s", instrument, data)

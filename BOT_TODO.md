@@ -159,15 +159,15 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 ## Phase 8c — Liquidity Gate
 
 - [x] Add liquidity config parameters to `config.py`: `MIN_LEG_BID_SIZE`, `MIN_LEG_ASK_SIZE`, `MAX_LEG_SPREAD_PCT = 0.05`, `MAX_ENTRY_PREMIUM = 0.10`, `COMBO_FILL_TIMEOUT_SEC = 30`
-- [ ] Update `strategy/scanner.py` coarse filter
-  - [ ] Reject candidates where either leg has zero bid or zero ask in the cache
+- [x] Update `strategy/scanner.py` coarse filter
+  - [x] Reject candidates where either leg has zero bid or zero ask in the cache
 - [x] Add liquidity gate to `strategy/decision.py` (`_check_liquidity_gate`, runs just before order submission)
-  - [ ] Check `bid_size >= MIN_LEG_BID_SIZE` and `ask_size >= MIN_LEG_ASK_SIZE` for both legs (requires adding `bid_size`/`ask_size` to `TickerSnapshot`)
+  - [x] Check `bid_size >= MIN_LEG_BID_SIZE` and `ask_size >= MIN_LEG_ASK_SIZE` for both legs (requires adding `bid_size`/`ask_size` to `TickerSnapshot`)
   - [x] Check `(ask - bid) / mid <= MAX_LEG_SPREAD_PCT` for both legs
   - [x] Check `net_debit <= spread_mid * (1 + MAX_ENTRY_PREMIUM)` — prevents entering positions that start deeply underwater due to bid/ask friction
   - [x] Log and skip any candidate failing the gate; do not retry until next scan cycle
-- [ ] Update `strategy/scanner.py` unit tests to cover liquidity filter scenarios
-- [x] Update `strategy/decision.py` unit tests: `TestLiquidityGate` (11 new tests, 50 total passing)
+- [x] Update `strategy/scanner.py` unit tests to cover liquidity filter scenarios (4 new tests in `TestScannerLiquidityFilter`)
+- [x] Update `strategy/decision.py` unit tests: `TestLiquidityGate` (6 new bid/ask size tests added, 88 total passing)
 
 ---
 

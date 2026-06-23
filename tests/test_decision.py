@@ -38,7 +38,8 @@ def _future_label(days: int) -> str:
 
 
 def _make_snap(instrument: str, mark_iv: float = 0.80, oi: float = 500,
-               bid: float = 0.02, ask: float = 0.03) -> TickerSnapshot:
+               bid: float = 0.02, ask: float = 0.03,
+               bid_size: float = 0.0, ask_size: float = 0.0) -> TickerSnapshot:
     asset = instrument.split("-")[0]
     return TickerSnapshot(
         instrument=instrument,
@@ -49,6 +50,8 @@ def _make_snap(instrument: str, mark_iv: float = 0.80, oi: float = 500,
         ask=ask,
         mark_iv=mark_iv,
         open_interest=oi,
+        bid_size=bid_size,
+        ask_size=ask_size,
         timestamp=datetime.now(timezone.utc).timestamp(),
     )
 
@@ -64,9 +67,12 @@ def _make_cache(near_days: int = 10, far_days: int = 35) -> MagicMock:
     near_snap = _make_snap(near_instr, mark_iv=0.90)  # higher IV → contango
     far_snap  = _make_snap(far_instr,  mark_iv=0.70)
 
+    snap_map = {near_instr: near_snap, far_instr: far_snap}
+
     cache = MagicMock()
     cache.get_spot.return_value = 90_000.0
     cache.get_chain.return_value = [near_snap, far_snap]
+    cache.get.side_effect = lambda instr: snap_map.get(instr)
     return cache
 
 
@@ -1158,3 +1164,87 @@ class TestLiquidityGate:
             status = engine.scan_tick()
 
         executor.enter_spread.assert_called_once()
+
+    # ── Bid/ask size checks ───────────────────────────────────────────────────
+
+    def _engine_with_size_snaps(self, near_bid_sz: float, near_ask_sz: float,
+                                 far_bid_sz: float, far_ask_sz: float):
+        """Return (engine, candidate) with a cache that reports the given leg sizes."""
+        candidate = self._good_candidate()
+        near_snap = _make_snap(
+            candidate.near_instrument,
+            bid=candidate.near_bid, ask=candidate.near_ask,
+            bid_size=near_bid_sz, ask_size=near_ask_sz,
+        )
+        far_snap = _make_snap(
+            candidate.far_instrument,
+            bid=candidate.far_bid, ask=candidate.far_ask,
+            bid_size=far_bid_sz, ask_size=far_ask_sz,
+        )
+        cache = MagicMock()
+        cache.get.side_effect = {
+            candidate.near_instrument: near_snap,
+            candidate.far_instrument:  far_snap,
+        }.get
+        engine, _ = _make_engine(cache=cache)
+        return engine, candidate
+
+    def test_near_bid_size_too_small_blocked(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_LEG_BID_SIZE", 2)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=1.0, near_ask_sz=5.0, far_bid_sz=5.0, far_ask_sz=5.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None
+        assert "near-leg bid_size" in reason
+
+    def test_near_ask_size_too_small_blocked(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_LEG_ASK_SIZE", 2)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=5.0, near_ask_sz=1.0, far_bid_sz=5.0, far_ask_sz=5.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None
+        assert "near-leg ask_size" in reason
+
+    def test_far_bid_size_too_small_blocked(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_LEG_BID_SIZE", 2)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=5.0, near_ask_sz=5.0, far_bid_sz=1.0, far_ask_sz=5.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None
+        assert "far-leg bid_size" in reason
+
+    def test_far_ask_size_too_small_blocked(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_LEG_ASK_SIZE", 2)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=5.0, near_ask_sz=5.0, far_bid_sz=5.0, far_ask_sz=1.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None
+        assert "far-leg ask_size" in reason
+
+    def test_zero_size_skips_size_check(self, monkeypatch):
+        """bid_size=0 means the exchange did not report size data — skip, not reject."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_LEG_BID_SIZE", 100)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=0.0, near_ask_sz=0.0, far_bid_sz=0.0, far_ask_sz=0.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is None
+
+    def test_sufficient_size_passes(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_LEG_BID_SIZE", 1)
+        monkeypatch.setattr(cfg, "MIN_LEG_ASK_SIZE", 1)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=5.0, near_ask_sz=5.0, far_bid_sz=5.0, far_ask_sz=5.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is None

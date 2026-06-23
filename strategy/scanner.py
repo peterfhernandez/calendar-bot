@@ -185,6 +185,14 @@ def _eval_candidate(
     """
     Evaluate a single near/far pair. Returns None if any filter fails.
     """
+    # ── Coarse liquidity filter ───────────────────────────────────────────────
+    # Reject instruments with no quoted market — zero bid or zero ask means
+    # no real liquidity and entry cost cannot be estimated reliably.
+    if near_snap.bid <= 0 or near_snap.ask <= 0:
+        return None
+    if far_snap.bid <= 0 or far_snap.ask <= 0:
+        return None
+
     # ── OI filter ─────────────────────────────────────────────────────────────
     if near_snap.open_interest < min_oi_near:
         return None

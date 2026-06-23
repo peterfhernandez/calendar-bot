@@ -364,13 +364,16 @@ class DecisionEngine:
         """
         Fine liquidity gate applied just before order submission.
 
-        Two checks:
+        Three checks:
         1. Per-leg bid/ask spread must be <= MAX_LEG_SPREAD_PCT of mid.
            Wide spreads signal thin books and inflate entry cost.
         2. Net entry debit must be <= spread_mid * (1 + MAX_ENTRY_PREMIUM).
            This catches cases where the bid/ask friction on two legs combines
            to make the trade start deeply underwater (e.g. paying $60 for a
            spread whose mid is $40).
+        3. Both legs must have bid_size >= MIN_LEG_BID_SIZE and
+           ask_size >= MIN_LEG_ASK_SIZE — ensures there is real size to hit/lift.
+           (Only checked when the cache provides non-zero size data.)
 
         Returns a rejection reason string, or None if the candidate passes.
         """
@@ -401,6 +404,35 @@ class DecisionEngine:
                     f"entry premium {premium:.1%} > MAX_ENTRY_PREMIUM "
                     f"{config.MAX_ENTRY_PREMIUM:.1%} "
                     f"(debit={candidate.net_debit:.4f}, spread_mid={spread_mid:.4f})"
+                )
+
+        # ── Bid/ask size check (requires live cache snapshot) ─────────────────
+        near_snap = self._cache.get(candidate.near_instrument)
+        far_snap  = self._cache.get(candidate.far_instrument)
+
+        if near_snap is not None and near_snap.bid_size > 0:
+            if near_snap.bid_size < config.MIN_LEG_BID_SIZE:
+                return (
+                    f"near-leg bid_size {near_snap.bid_size:.1f} < MIN_LEG_BID_SIZE "
+                    f"{config.MIN_LEG_BID_SIZE}"
+                )
+        if near_snap is not None and near_snap.ask_size > 0:
+            if near_snap.ask_size < config.MIN_LEG_ASK_SIZE:
+                return (
+                    f"near-leg ask_size {near_snap.ask_size:.1f} < MIN_LEG_ASK_SIZE "
+                    f"{config.MIN_LEG_ASK_SIZE}"
+                )
+        if far_snap is not None and far_snap.bid_size > 0:
+            if far_snap.bid_size < config.MIN_LEG_BID_SIZE:
+                return (
+                    f"far-leg bid_size {far_snap.bid_size:.1f} < MIN_LEG_BID_SIZE "
+                    f"{config.MIN_LEG_BID_SIZE}"
+                )
+        if far_snap is not None and far_snap.ask_size > 0:
+            if far_snap.ask_size < config.MIN_LEG_ASK_SIZE:
+                return (
+                    f"far-leg ask_size {far_snap.ask_size:.1f} < MIN_LEG_ASK_SIZE "
+                    f"{config.MIN_LEG_ASK_SIZE}"
                 )
 
         return None
