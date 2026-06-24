@@ -9,6 +9,7 @@ from db.state import (
     close_calendar_trade,
     load_calendar_state,
     get_calendar_stats,
+    update_near_leg,
 )
 
 
@@ -220,3 +221,58 @@ class TestGetCalendarStats:
         _open_trade(db)  # stays open
         stats = get_calendar_stats(db_path=db)
         assert stats["trades"] == 0
+
+
+# ── update_near_leg ───────────────────────────────────────────────────────────
+
+class TestUpdateNearLeg:
+    def test_updates_near_instrument_and_expiry(self, db):
+        trade = _open_trade(db)
+        updated = update_near_leg(
+            trade.id,
+            new_near_instrument="BTC-14JUN26-100000-C",
+            new_expiry_near="14JUN26",
+            db_path=db,
+        )
+        assert updated.near_instrument == "BTC-14JUN26-100000-C"
+        assert updated.expiry_near == "14JUN26"
+
+    def test_sets_result_to_near_leg_rolled(self, db):
+        trade = _open_trade(db)
+        updated = update_near_leg(
+            trade.id,
+            new_near_instrument="BTC-14JUN26-100000-C",
+            new_expiry_near="14JUN26",
+            db_path=db,
+        )
+        assert updated.result == "Near Leg Rolled"
+
+    def test_far_leg_and_other_fields_unchanged(self, db):
+        trade = _open_trade(db)
+        updated = update_near_leg(
+            trade.id,
+            new_near_instrument="BTC-14JUN26-100000-C",
+            new_expiry_near="14JUN26",
+            db_path=db,
+        )
+        assert updated.far_instrument == trade.far_instrument
+        assert updated.strike == trade.strike
+        assert updated.net_debit == trade.net_debit
+
+    def test_reflected_in_load_calendar_state(self, db):
+        trade = _open_trade(db)
+        update_near_leg(
+            trade.id,
+            new_near_instrument="BTC-14JUN26-100000-C",
+            new_expiry_near="14JUN26",
+            db_path=db,
+        )
+        state = load_calendar_state("BTC", db_path=db)
+        assert len(state["open_positions"]) == 1
+        pos = state["open_positions"][0]
+        assert pos["near_instrument"] == "BTC-14JUN26-100000-C"
+        assert pos["expiry_near"] == "14JUN26"
+
+    def test_raises_on_unknown_trade_id(self, db):
+        with pytest.raises(ValueError, match="not found"):
+            update_near_leg(9999, "BTC-14JUN26-100000-C", "14JUN26", db_path=db)

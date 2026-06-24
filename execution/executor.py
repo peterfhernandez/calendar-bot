@@ -844,6 +844,15 @@ class CalendarExecutor:
 
     def roll_near_leg(self, position: dict, new_candidate: CalendarCandidate) -> bool:
         """Roll the near leg to new_candidate.  Returns True on success."""
+        # Fix 3: paper mode is a dry-run — log intent and return success without
+        # hitting the API.  The real update is handled by the caller (decision.py).
+        if config.TRADING_MODE == "paper":
+            logger.info(
+                "[DRY-RUN] Would roll near leg of trade_id=%s → %s",
+                position.get("trade_id"), new_candidate.near_instrument,
+            )
+            return True
+
         try:
             return self._run(
                 _async_roll_near_leg(

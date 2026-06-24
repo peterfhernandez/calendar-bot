@@ -248,6 +248,34 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
     }
 
 
+def update_near_leg(
+    trade_id: int,
+    new_near_instrument: str,
+    new_expiry_near: str,
+    db_path: Path = DB_PATH,
+) -> CalendarTrade:
+    """Update a trade's near leg after a successful roll."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        trade = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        if not trade:
+            raise ValueError(f"Calendar trade ID {trade_id} not found")
+        conn.execute(
+            """
+            UPDATE calendar_trades
+            SET near_instrument = ?, expiry_near = ?, result = 'Near Leg Rolled'
+            WHERE id = ?
+            """,
+            (new_near_instrument, new_expiry_near, trade_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+    return _row_to_trade(row)
+
+
 def get_calendar_stats(asset: Optional[str] = None, db_path: Path = DB_PATH) -> dict:
     """
     Aggregate performance statistics for closed calendar trades.

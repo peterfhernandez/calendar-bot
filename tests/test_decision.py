@@ -1410,3 +1410,143 @@ class TestNotificationWiring:
         notifier.notify_stop.assert_not_called()
         notifier.notify_take_profit.assert_not_called()
         notifier.notify_close.assert_not_called()
+
+
+# ── Roll bug fixes ────────────────────────────────────────────────────────────
+
+class TestRollFixes:
+    """
+    Tests for the 5 roll-loop bug fixes:
+      1. DB updated after roll (update_near_leg called)
+      2. In-memory pos dict updated after roll
+      3. Paper mode short-circuit in executor (tested via DryRunExecutor path)
+      4. _rolled_this_tick guard prevents double-roll in same tick
+      5. Same-instrument check skips no-op rolls
+    """
+
+    def _make_expiring_pos(self, trade_id: int = 99, near_days: int = 1) -> dict:
+        """Position whose near leg is within _ROLL_TRIGGER_DAYS."""
+        near_label = _future_label(near_days)
+        far_label  = _future_label(35)
+        return {
+            "trade_id":        trade_id,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       90_000.0,
+            "near_days":       near_days,
+            "far_days":        35,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    # Fix 1 & 2: DB and in-memory update after successful roll
+    def test_db_and_memory_updated_after_roll(self):
+        new_near_label = _future_label(7)
+        new_near_instr = f"BTC-{new_near_label}-90000-C"
+        new_candidate = _make_candidate(near_days=7, far_days=35)
+        new_candidate.near_instrument = new_near_instr
+
+        executor = MagicMock()
+        executor.roll_near_leg.return_value = True
+        engine, db_path = _make_engine(executor=executor)
+
+        pos = self._make_expiring_pos()
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.update_near_leg") as mock_update:
+            mock_scan.return_value = [new_candidate]
+            engine._try_roll(pos, spot=90_000.0)
+
+            # Fix 1: DB update called with new near details
+            mock_update.assert_called_once_with(
+                pos["trade_id"], new_near_instr, new_near_label,
+                db_path=engine._db_path,
+            )
+            # Fix 2: in-memory dict updated
+            assert pos["near_instrument"] == new_near_instr
+            assert pos["expiry_near"] == new_near_label
+
+    # Fix 4: _rolled_this_tick guard
+    def test_rolled_this_tick_set_after_roll(self):
+        new_near_label = _future_label(7)
+        new_candidate = _make_candidate(near_days=7, far_days=35)
+        new_candidate.near_instrument = f"BTC-{new_near_label}-90000-C"
+
+        executor = MagicMock()
+        executor.roll_near_leg.return_value = True
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expiring_pos(trade_id=42)
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.update_near_leg"):
+            mock_scan.return_value = [new_candidate]
+            engine._try_roll(pos, spot=90_000.0)
+
+        assert 42 in engine._rolled_this_tick
+
+    def test_rolled_this_tick_prevents_second_monitor_call(self):
+        """Position already in _rolled_this_tick is skipped by _monitor_position."""
+        engine, _ = _make_engine()
+        pos = self._make_expiring_pos(trade_id=7)
+        engine._rolled_this_tick.add(7)
+        action, unr = engine._monitor_position(pos)
+        assert action is None
+        assert unr == 0.0
+
+    def test_rolled_this_tick_cleared_after_monitor_tick(self):
+        engine, _ = _make_engine()
+        engine._rolled_this_tick.add(99)
+        # monitor_tick with no positions clears the set
+        with patch.object(engine, "_load_all_open_positions", return_value=[]):
+            engine.monitor_tick()
+        assert len(engine._rolled_this_tick) == 0
+
+    # Fix 5: same-instrument guard
+    def test_skip_roll_when_new_near_same_as_current(self):
+        near_label = _future_label(1)
+        same_near_instr = f"BTC-{near_label}-90000-C"
+        candidate = _make_candidate(near_days=1, far_days=35)
+        candidate.near_instrument = same_near_instr
+
+        executor = MagicMock()
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expiring_pos(near_days=1)
+        pos["near_instrument"] = same_near_instr  # current == new
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.update_near_leg") as mock_update:
+            mock_scan.return_value = [candidate]
+            result = engine._try_roll(pos, spot=90_000.0)
+
+        assert result is False
+        executor.roll_near_leg.assert_not_called()
+        mock_update.assert_not_called()
+
+    def test_roll_proceeds_when_new_near_is_different(self):
+        old_near_label = _future_label(1)
+        new_near_label = _future_label(7)
+        new_near_instr = f"BTC-{new_near_label}-90000-C"
+        candidate = _make_candidate(near_days=7, far_days=35)
+        candidate.near_instrument = new_near_instr
+
+        executor = MagicMock()
+        executor.roll_near_leg.return_value = True
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expiring_pos(near_days=1)
+        pos["near_instrument"] = f"BTC-{old_near_label}-90000-C"
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.update_near_leg"):
+            mock_scan.return_value = [candidate]
+            result = engine._try_roll(pos, spot=90_000.0)
+
+        assert result is True
+        executor.roll_near_leg.assert_called_once()

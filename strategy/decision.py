@@ -44,6 +44,7 @@ from db.state import (
     create_calendar_trade,
     get_calendar_stats,
     load_calendar_state,
+    update_near_leg,
     DB_PATH,
 )
 from portfolio.tracker import PortfolioTracker
@@ -207,7 +208,8 @@ class DecisionEngine:
         self._state           = BotState.IDLE
         self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
         self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
-        self._just_entered: set[int] = set()  # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
+        self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
+        self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -359,6 +361,8 @@ class DecisionEngine:
         open_positions = self._load_all_open_positions()
         if not open_positions:
             self._state = BotState.IDLE
+            self._just_entered.clear()
+            self._rolled_this_tick.clear()
             return self._status("Monitor: no open positions.", [])
 
         self._state = BotState.MONITOR
@@ -377,9 +381,9 @@ class DecisionEngine:
 
         self._unrealized_pnl = unrealized_pnl
 
-        # Clear grace-period set after each monitor pass so positions are
-        # evaluated normally from the next tick onward.
+        # Clear per-tick guard sets so the next tick evaluates all positions fresh.
         self._just_entered.clear()
+        self._rolled_this_tick.clear()
 
         # Refresh after actions
         open_positions = self._load_all_open_positions()
@@ -550,6 +554,15 @@ class DecisionEngine:
             )
             return None, 0.0
 
+        # Fix 4: skip if already rolled this monitor tick (belt-and-suspenders guard
+        # against the roll loop bug — the DB update in _try_roll is the primary fix).
+        if trade_id in self._rolled_this_tick:
+            logger.debug(
+                "trade_id=%d already rolled this tick — deferring re-evaluation",
+                trade_id,
+            )
+            return None, 0.0
+
         spot = self._cache.get_spot(asset)
         if spot is None or spot <= 0:
             logger.warning("No spot for %s — skipping monitor of trade %d", asset, trade_id)
@@ -673,7 +686,6 @@ class DecisionEngine:
         the executor to roll if one is found.
         """
         candidates = scan(self._cache, assets=[pos["asset"]])
-        # Find a candidate matching the same strike and option type
         target_strike = pos["strike"]
         opt_type      = pos.get("option_type", "Call")
         matches = [
@@ -689,17 +701,45 @@ class DecisionEngine:
 
         new_candidate = matches[0]
         new_candidate.qty = pos.get("qty", 1.0)
+
+        # Fix 5: skip if the scanner returned the same near instrument we already hold —
+        # this means no later expiry is available yet; rolling would be a no-op.
+        if new_candidate.near_instrument == pos.get("near_instrument"):
+            logger.info(
+                "Roll: new near instrument (%s) is the same as current — skipping",
+                new_candidate.near_instrument,
+            )
+            return False
+
         success = self._executor.roll_near_leg(pos, new_candidate)
         if success:
+            trade_id        = pos["trade_id"]
+            new_near_instr  = new_candidate.near_instrument
+            new_expiry_near = _instrument_expiry_label(new_near_instr)
+
             logger.info(
                 "ROLL trade_id=%d  → new near=%s",
-                pos["trade_id"], new_candidate.near_instrument,
+                trade_id, new_near_instr,
             )
+
+            # Fix 1: persist the new near leg to the DB so _days_left reads fresh data.
+            try:
+                update_near_leg(trade_id, new_near_instr, new_expiry_near, db_path=self._db_path)
+            except Exception as exc:
+                logger.error("Roll: failed to update near leg in DB for trade_id=%d: %s", trade_id, exc)
+
+            # Fix 2: update the in-memory dict so this tick's logic sees the new expiry.
+            pos["near_instrument"] = new_near_instr
+            pos["expiry_near"]     = new_expiry_near
+
+            # Fix 4: mark as rolled so the same tick won't evaluate this position again.
+            self._rolled_this_tick.add(trade_id)
+
             if self._notifier:
                 try:
                     self._notifier.notify_roll(
-                        pos["trade_id"], pos.get("asset", ""),
-                        pos.get("strike", 0.0), new_candidate.near_instrument,
+                        trade_id, pos.get("asset", ""),
+                        pos.get("strike", 0.0), new_near_instr,
                     )
                 except Exception as exc:
                     logger.warning("notify_roll failed: %s", exc)

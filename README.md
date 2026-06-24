@@ -39,7 +39,8 @@ This bot automates the full lifecycle:
 | Stop loss | 50% of debit | Auto-close trigger |
 | Take profit | 150% of debit | Auto-close trigger |
 | Min leg bid/ask size | 1 contract | Liquidity gate — both legs must have real size |
-| Max leg spread | 15% of mid | Liquidity gate — wide-spread legs are rejected |
+| Max leg spread | 5% of mid | Liquidity gate — wide-spread legs are rejected |
+| Max entry premium | 10% over spread mid | Liquidity gate — prevents entering deeply underwater due to bid/ask friction |
 
 ---
 
