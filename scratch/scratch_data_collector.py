@@ -27,9 +27,9 @@ from pathlib import Path
 
 import config
 
-if not config.DERIBIT_PAPER:
+if config.TRADING_MODE == "live":
     print("ERROR: scratch files must not run against the live exchange. "
-          "Set DERIBIT_PAPER = True in config.py.")
+          "Set TRADING_MODE='paper' in config.py.")
     sys.exit(1)
 
 logging.basicConfig(

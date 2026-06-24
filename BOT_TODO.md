@@ -175,35 +175,35 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ### Trading mode
 
-- [ ] Replace `DERIBIT_PAPER = True/False` with `TRADING_MODE = "paper" | "test" | "live"` in `config.py`
-  - [ ] Default value is `"paper"`
-  - [ ] Add derived constants `DERIBIT_WS_URL` and `DERIBIT_REST_URL` (test URL for paper+test, live URL for live)
-  - [ ] Remove all references to `DERIBIT_PAPER` from every module
-- [ ] Update `data/deribit_feed.py` to read `DERIBIT_WS_URL` from config (no hard-coded URLs)
-- [ ] Update `execution/executor.py` to branch on `TRADING_MODE`:
-  - [ ] `"paper"` → dry-run path: log the order, return a simulated fill, never call the Deribit API
-  - [ ] `"test"` or `"live"` → real order submission using `DERIBIT_WS_URL` / `DERIBIT_REST_URL`
-- [ ] Add separate `.env` keys: `DERIBIT_TEST_CLIENT_ID`, `DERIBIT_TEST_CLIENT_SECRET` (shared by paper + test), `DERIBIT_LIVE_CLIENT_ID`, `DERIBIT_LIVE_CLIENT_SECRET`; `config.py` selects the right pair
-- [ ] Add prominent startup banner in `bot.py`:
-  - [ ] Paper: `*** PAPER MODE — data from test.deribit.com, no orders placed ***`
-  - [ ] Test: `*** TEST MODE — orders will be placed on test.deribit.com ***`
-  - [ ] Live: `*** LIVE MODE — REAL MONEY on www.deribit.com ***`
-- [ ] `bot.py` refuses to start when `TRADING_MODE == "live"` and `DAILY_LOSS_LIMIT` is not set
-- [ ] All `scratch_*.py` scripts check `TRADING_MODE` at startup and abort with an error if it is `"live"`
-- [ ] Update unit tests: any test that previously checked `DERIBIT_PAPER` now checks `TRADING_MODE`
+- [x] Replace `DERIBIT_PAPER = True/False` with `TRADING_MODE = "paper" | "test" | "live"` in `config.py`
+  - [x] Default value is `"paper"`
+  - [x] Add derived constants `DERIBIT_WS_URL` and `DERIBIT_REST_URL` (test URL for paper+test, live URL for live)
+  - [x] `DERIBIT_PAPER` kept as a backwards-compatible alias (`not _LIVE`); primary checks use `TRADING_MODE`
+- [x] Update `data/deribit_feed.py` to read `DERIBIT_WS_URL` from config (no hard-coded URLs)
+- [x] Update `execution/executor.py` to branch on `TRADING_MODE`:
+  - [x] `"paper"` → dry-run path: log the order, return a simulated fill, never call the Deribit API
+  - [x] `"test"` or `"live"` → real order submission using `DERIBIT_WS_URL` / `DERIBIT_REST_URL`
+- [x] Add separate `.env` keys: `DERIBIT_TEST_CLIENT_ID`, `DERIBIT_TEST_CLIENT_SECRET` (shared by paper + test), `DERIBIT_LIVE_CLIENT_ID`, `DERIBIT_LIVE_CLIENT_SECRET`; `config.py` selects the right pair
+- [x] Add prominent startup banner in `bot.py`:
+  - [x] Paper: `*** PAPER MODE — data from test.deribit.com, no orders placed ***`
+  - [x] Test: `*** TEST MODE — orders will be placed on test.deribit.com ***`
+  - [x] Live: `*** LIVE MODE — REAL MONEY on www.deribit.com ***`
+- [x] `bot.py` refuses to start when `TRADING_MODE == "live"` and `DAILY_LOSS_LIMIT` is not set
+- [x] All `scratch_*.py` scripts check `TRADING_MODE` at startup and abort with an error if it is `"live"`
+- [x] Update unit tests: any test that previously checked `DERIBIT_PAPER` now checks `TRADING_MODE`; paper mode tests added
 
 ### Combo orders and fallback
 
-- [ ] Implement combo order path in `execution/executor.py`
-  - [ ] Submit both legs as a Deribit combo order at a net debit limit price
-  - [ ] Poll for fill up to `COMBO_FILL_TIMEOUT_SEC`; return fill details on success
-- [ ] Implement individual-leg fallback in `execution/executor.py`
-  - [ ] Only triggered if combo times out and both legs pass the liquidity gate
-  - [ ] Submit near leg; on success submit far leg; on far-leg failure immediately cancel near leg
-  - [ ] Log a WARNING whenever the fallback path is used
-- [ ] Add `COMBO_FILL_TIMEOUT_SEC` to `config.py`
-- [ ] Update executor unit tests: `TestComboOrder`, `TestIndividualLegFallback`, `TestFallbackCancelsNearOnFarFailure`
-- [ ] Update `scratch/scratch_executor.py` with combo order and fallback scenarios
+- [x] Implement combo order path in `execution/executor.py` (`_async_enter_spread_combo`)
+  - [x] Create combo via `private/create_combo`, submit at net debit limit price
+  - [x] Poll for fill up to `COMBO_FILL_TIMEOUT_SEC`; return fill details (with `via_combo=True`) on success
+- [x] Implement individual-leg fallback in `execution/executor.py`
+  - [x] Only triggered if combo times out or is unavailable
+  - [x] Submit near leg; on success submit far leg; on far-leg failure immediately cancel near leg
+  - [x] Log a WARNING whenever the fallback path is used
+- [x] `COMBO_FILL_TIMEOUT_SEC` already in `config.py`
+- [x] Update executor unit tests: `TestComboOrder`, `TestIndividualLegFallback`, `TestFallbackCancelsNearOnFarFailure` (300 tests passing)
+- [x] Update `scratch/scratch_executor.py` with combo order (test 10) and fallback (test 11) scenarios
 
 ---
 

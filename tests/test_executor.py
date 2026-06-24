@@ -30,6 +30,7 @@ from execution.order_manager import (
     TrackedOrder,
     reconcile_with_deribit,
 )
+import config
 from execution.executor import (
     SlippageError,
     LegRiskError,
@@ -40,6 +41,7 @@ from execution.executor import (
     _index_price,
     _usd_price,
     _async_enter_spread,
+    _async_enter_spread_combo,
     _async_close_spread,
     _async_roll_near_leg,
 )
@@ -182,6 +184,9 @@ class _MockRPCClient:
             return self._ticker_results[instrument]
         return {"best_bid_price": 0.002, "best_ask_price": 0.004, "index_price": 100_000.0}
 
+    async def create_combo(self, legs: list) -> dict:
+        raise RuntimeError("create_combo not supported in this mock (forces individual-leg fallback)")
+
 
 # ── Tests: utility functions ──────────────────────────────────────────────────
 
@@ -316,11 +321,12 @@ class TestAsyncEnterSpread:
         candidate = _make_candidate()
         mock_client = self._make_mock_client()
 
-        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
             mgr = OrderManager()
             result = self._run(
                 _async_enter_spread(
-                    candidate, paper=True, client_id="", client_secret="",
+                    candidate, client_id="", client_secret="",
                     order_manager=mgr, portfolio_value=50_000.0,
                 )
             )
@@ -341,11 +347,12 @@ class TestAsyncEnterSpread:
             order_states={"near-1": [{"order_id": "near-1", "order_state": "open"}]},  # never fills
         )
 
-        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
             mgr = OrderManager()
             result = self._run(
                 _async_enter_spread(
-                    candidate, paper=True, client_id="", client_secret="",
+                    candidate, client_id="", client_secret="",
                     order_manager=mgr, portfolio_value=50_000.0, order_timeout=0,
                 )
             )
@@ -368,12 +375,13 @@ class TestAsyncEnterSpread:
         )
         mock_client.place_order = bad_place_order  # type: ignore[method-assign]
 
-        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
             mgr = OrderManager()
             with pytest.raises(LegRiskError):
                 self._run(
                     _async_enter_spread(
-                        candidate, paper=True, client_id="", client_secret="",
+                        candidate, client_id="", client_secret="",
                         order_manager=mgr, portfolio_value=50_000.0,
                     )
                 )
@@ -385,16 +393,32 @@ class TestAsyncEnterSpread:
         # Fill in index fraction: 0.004 BTC = $400, intended was $200 → 100% deviation
         mock_client = self._make_mock_client(near_fill_price=0.004, far_fill_price=0.006)
 
-        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
             mgr = OrderManager()
             with pytest.raises(SlippageError):
                 # _async_enter_spread raises directly; CalendarExecutor catches it
                 self._run(
                     _async_enter_spread(
-                        candidate, paper=True, client_id="", client_secret="",
+                        candidate, client_id="", client_secret="",
                         order_manager=mgr, portfolio_value=50_000.0, slippage_pct=0.02,
                     )
                 )
+
+    def test_paper_mode_returns_simulated_fill(self):
+        """In paper mode, enter_spread returns a simulated fill without any API calls."""
+        candidate = _make_candidate()
+        with patch.object(config, "TRADING_MODE", "paper"):
+            mgr = OrderManager()
+            result = self._run(
+                _async_enter_spread(
+                    candidate, client_id="", client_secret="",
+                    order_manager=mgr, portfolio_value=50_000.0,
+                )
+            )
+        assert result is not None
+        assert result["net_debit"] == pytest.approx(candidate.net_debit)
+        assert result["near_order_id"] == "paper-near"
 
 
 # ── Tests: async_close_spread ─────────────────────────────────────────────────
@@ -425,7 +449,7 @@ class TestAsyncCloseSpread:
             mgr = OrderManager()
             credit = self._run(
                 _async_close_spread(
-                    position, paper=True, client_id="", client_secret="",
+                    position, client_id="", client_secret="",
                     order_manager=mgr,
                 )
             )
@@ -452,7 +476,7 @@ class TestAsyncCloseSpread:
             mgr = OrderManager()
             result = self._run(
                 _async_close_spread(
-                    position, paper=True, client_id="", client_secret="",
+                    position, client_id="", client_secret="",
                     order_manager=mgr, order_timeout=0,
                 )
             )
@@ -488,7 +512,7 @@ class TestAsyncRollNearLeg:
             mgr = OrderManager()
             ok = self._run(
                 _async_roll_near_leg(
-                    position, candidate, paper=True, client_id="", client_secret="",
+                    position, candidate, client_id="", client_secret="",
                     order_manager=mgr,
                 )
             )
@@ -516,7 +540,7 @@ class TestAsyncRollNearLeg:
             mgr = OrderManager()
             ok = self._run(
                 _async_roll_near_leg(
-                    position, candidate, paper=True, client_id="", client_secret="",
+                    position, candidate, client_id="", client_secret="",
                     order_manager=mgr, order_timeout=0,
                 )
             )
@@ -531,7 +555,6 @@ class TestCalendarExecutor:
 
     def _make_executor(self, **kwargs) -> CalendarExecutor:
         return CalendarExecutor(
-            paper=True,
             client_id="",
             client_secret="",
             portfolio_value=50_000.0,
@@ -552,12 +575,22 @@ class TestCalendarExecutor:
             },
         )
 
-        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
             exc = self._make_executor()
             result = exc.enter_spread(candidate)
 
         assert result is not None
         assert result["net_debit"] == pytest.approx(result["far_prem"] - result["near_prem"])
+
+    def test_enter_spread_paper_mode_returns_simulated_fill(self):
+        """In paper mode CalendarExecutor returns a simulated fill without network calls."""
+        candidate = _make_candidate()
+        with patch.object(config, "TRADING_MODE", "paper"):
+            exc = self._make_executor()
+            result = exc.enter_spread(candidate)
+        assert result is not None
+        assert result["near_order_id"] == "paper-near"
 
     def test_enter_spread_slippage_returns_none(self):
         # near_bid=$200 (intended). Fill at 0.004 BTC = $400 → 100% slippage → rejected.
@@ -567,7 +600,8 @@ class TestCalendarExecutor:
             order_states={"n1": [_filled_order_state("n1", 0.004)]},
         )
 
-        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
             exc = self._make_executor(slippage_pct=0.02)
             result = exc.enter_spread(candidate)
 
@@ -657,3 +691,166 @@ class TestReconciliation:
 
         with patch("execution.order_manager._fetch_deribit_open_orders", side_effect=mock_fetch):
             asyncio.run(reconcile_with_deribit(mgr, paper=True))  # must not raise
+
+
+# ── Tests: combo orders ───────────────────────────────────────────────────────
+
+class TestComboOrder:
+    """Tests for _async_enter_spread_combo."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_combo_fills_successfully(self):
+        """A combo order that fills immediately returns a fill dict with via_combo=True."""
+        candidate = _make_candidate()
+        combo_order_id = "combo-1"
+
+        class ComboMockClient(_MockRPCClient):
+            async def create_combo(self, legs):
+                return {"combo_id": "COMBO-BTC-NEAR-FAR", "instrument_name": "COMBO-BTC-NEAR-FAR"}
+
+            async def place_order(self, instrument, direction, amount, price, label=""):
+                self.placed_orders.append({"instrument": instrument, "direction": direction})
+                return {"order": {"order_id": combo_order_id, "order_state": "open", "price": price}}
+
+            async def get_order_state(self, order_id):
+                return {"order_id": order_id, "order_state": "filled", "average_price": 0.004, "legs": [
+                    {"direction": "sell", "price": 0.002},
+                    {"direction": "buy",  "price": 0.006},
+                ]}
+
+        mock_client = ComboMockClient()
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            mgr = OrderManager()
+            result = self._run(
+                _async_enter_spread_combo(
+                    candidate=candidate,
+                    client_id="", client_secret="",
+                    order_manager=mgr,
+                    amount=0.1,
+                    net_debit_limit_index=0.004,
+                    combo_timeout=5,
+                )
+            )
+
+        assert result is not None
+        assert result["via_combo"] is True
+
+    def test_combo_timeout_returns_none(self):
+        """A combo that never fills within the timeout returns None (triggers fallback)."""
+        candidate = _make_candidate()
+
+        class ComboMockClient(_MockRPCClient):
+            async def create_combo(self, legs):
+                return {"combo_id": "COMBO-BTC"}
+
+            async def place_order(self, instrument, direction, amount, price, label=""):
+                return {"order": {"order_id": "combo-1", "order_state": "open"}}
+
+            async def get_order_state(self, order_id):
+                return {"order_id": order_id, "order_state": "open"}  # never fills
+
+        mock_client = ComboMockClient()
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            mgr = OrderManager()
+            result = self._run(
+                _async_enter_spread_combo(
+                    candidate=candidate,
+                    client_id="", client_secret="",
+                    order_manager=mgr,
+                    amount=0.1,
+                    net_debit_limit_index=0.004,
+                    combo_timeout=0,  # immediate timeout
+                )
+            )
+
+        assert result is None
+
+    def test_combo_unavailable_returns_none(self):
+        """If create_combo raises, the combo path returns None (fallback to individual legs)."""
+        candidate = _make_candidate()
+        mock_client = _MockRPCClient()  # create_combo raises RuntimeError by default
+
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            mgr = OrderManager()
+            result = self._run(
+                _async_enter_spread_combo(
+                    candidate=candidate,
+                    client_id="", client_secret="",
+                    order_manager=mgr,
+                    amount=0.1,
+                    net_debit_limit_index=0.004,
+                    combo_timeout=5,
+                )
+            )
+
+        assert result is None
+
+
+class TestIndividualLegFallback:
+    """Verify the fallback path is used when combo is unavailable."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_falls_back_to_individual_legs_when_combo_unavailable(self):
+        """When create_combo raises, enter_spread falls back to individual-leg execution."""
+        candidate = _make_candidate()
+        # _MockRPCClient.create_combo raises by default → combo returns None → fallback
+        mock_client = _MockRPCClient(
+            place_order_results=[
+                _submitted_order_result("near-1", 0.002),
+                _submitted_order_result("far-1",  0.006),
+            ],
+            order_states={
+                "near-1": [_filled_order_state("near-1", 0.002)],
+                "far-1":  [_filled_order_state("far-1",  0.006)],
+            },
+        )
+
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
+            mgr = OrderManager()
+            result = self._run(
+                _async_enter_spread(
+                    candidate, client_id="", client_secret="",
+                    order_manager=mgr, portfolio_value=50_000.0,
+                )
+            )
+
+        assert result is not None
+        assert result.get("via_combo") is False
+        assert result["net_debit"] == pytest.approx(result["far_prem"] - result["near_prem"])
+
+
+class TestFallbackCancelsNearOnFarFailure:
+    """Verify the fallback cancels the near leg if the far leg fails."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_near_cancelled_when_far_leg_submit_fails(self):
+        """After near fills in individual-leg fallback, far leg failure raises LegRiskError."""
+        candidate = _make_candidate()
+
+        async def bad_place_order(instrument, direction, amount, price, label=""):
+            if direction == "sell":
+                return _submitted_order_result("near-1")
+            raise OSError("far leg connection reset")
+
+        mock_client = _MockRPCClient(
+            order_states={"near-1": [_filled_order_state("near-1", 0.002)]},
+        )
+        mock_client.place_order = bad_place_order  # type: ignore[method-assign]
+
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
+            mgr = OrderManager()
+            with pytest.raises(LegRiskError):
+                self._run(
+                    _async_enter_spread(
+                        candidate, client_id="", client_secret="",
+                        order_manager=mgr, portfolio_value=50_000.0,
+                    )
+                )

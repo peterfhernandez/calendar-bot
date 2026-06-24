@@ -74,8 +74,7 @@ def _open_db() -> duckdb.DuckDBPyConnection:
 # ── REST API helpers ─────────────────────────────────────────────────────────
 
 def _rest_base() -> str:
-    host = _PAPER_HOST if config.DERIBIT_PAPER else _LIVE_HOST
-    return f"https://{host}/api/v2/public"
+    return f"{config.DERIBIT_REST_URL}/api/v2/public"
 
 
 async def _get(session: aiohttp.ClientSession, endpoint: str, **params) -> dict:

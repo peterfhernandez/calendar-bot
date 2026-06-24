@@ -147,8 +147,8 @@ async def _run_loop(
     _ensure_schema(con)
 
     logger.info(
-        "Collector started — assets=%s  interval=%ds  db=%s  paper=%s",
-        assets, interval_sec, db_path, config.DERIBIT_PAPER,
+        "Collector started — assets=%s  interval=%ds  db=%s  mode=%s",
+        assets, interval_sec, db_path, config.TRADING_MODE,
     )
     _log_db_summary(db_path)
 
@@ -192,8 +192,8 @@ async def _run_once(assets: list[str], db_path: Path) -> None:
     _ensure_schema(con)
 
     logger.info(
-        "Single collection — assets=%s  db=%s  paper=%s",
-        assets, db_path, config.DERIBIT_PAPER,
+        "Single collection — assets=%s  db=%s  mode=%s",
+        assets, db_path, config.TRADING_MODE,
     )
 
     async with aiohttp.ClientSession() as session:

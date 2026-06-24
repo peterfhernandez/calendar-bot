@@ -503,7 +503,7 @@ class DecisionEngine:
             near_prem=fill["near_prem"],
             far_prem=fill["far_prem"],
             net_debit=fill["net_debit"],
-            broker="paper" if config.DERIBIT_PAPER else "live",
+            broker=config.TRADING_MODE,
             near_instrument=candidate.near_instrument,
             far_instrument=candidate.far_instrument,
             db_path=self._db_path,

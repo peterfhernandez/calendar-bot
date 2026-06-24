@@ -193,8 +193,8 @@ class BotLoop:
         self._scheduler.start()
 
         logger.info(
-            "BotLoop started  paper=%s  scan_interval=%ds  monitor_interval=%ds",
-            config.DERIBIT_PAPER,
+            "BotLoop started  mode=%s  scan_interval=%ds  monitor_interval=%ds",
+            config.TRADING_MODE,
             config.SCAN_INTERVAL_SEC,
             config.MONITOR_INTERVAL_SEC,
         )

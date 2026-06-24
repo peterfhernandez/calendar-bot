@@ -94,9 +94,7 @@ class PortfolioTracker:
         self._db_path       = db_path or DB_PATH
         self._client_id     = client_id     if client_id     is not None else config.DERIBIT_CLIENT_ID
         self._client_secret = client_secret if client_secret is not None else config.DERIBIT_CLIENT_SECRET
-        self._rest_url      = rest_url or (
-            "https://test.deribit.com" if config.DERIBIT_PAPER else "https://www.deribit.com"
-        )
+        self._rest_url      = rest_url or config.DERIBIT_REST_URL
 
         # Cached state — updated by refresh()
         self._equity_usd:          float = 0.0

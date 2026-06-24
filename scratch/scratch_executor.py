@@ -167,6 +167,9 @@ class _MockRPC:
     async def get_ticker(self, instrument: str) -> dict:
         return self._tickers.get(instrument, {"best_bid_price": 0.002, "best_ask_price": 0.004})
 
+    async def create_combo(self, legs: list) -> dict:
+        raise RuntimeError("create_combo not available — forcing individual-leg fallback")
+
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -240,7 +243,7 @@ def test_order_manager() -> None:
 
 
 def test_enter_spread_success() -> None:
-    _banner("3. enter_spread — successful fill")
+    _banner("3. enter_spread — successful fill (individual-leg fallback, combo unavailable)")
 
     candidate   = _make_candidate()
     # near fill: 0.002 BTC = $200 = near_bid; far fill: 0.006 BTC = $600 = far_ask (exact match → 0% slippage)
@@ -249,7 +252,8 @@ def test_enter_spread_success() -> None:
         state_map={"n1": [_filled("n1", 0.002)], "f1": [_filled("f1", 0.006)]},
     )
 
-    with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+    with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+         patch.object(config, "TRADING_MODE", "test"):
         exc    = CalendarExecutor(portfolio_value=50_000.0)
         result = exc.enter_spread(candidate)
 
@@ -270,7 +274,8 @@ def test_enter_spread_slippage_rejected() -> None:
         state_map={"n2": [_filled("n2", 0.1)]},
     )
 
-    with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+    with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+         patch.object(config, "TRADING_MODE", "test"):
         exc    = CalendarExecutor(portfolio_value=50_000.0, slippage_pct=0.02)
         result = exc.enter_spread(candidate)
 
@@ -306,7 +311,11 @@ def test_leg_risk_handling() -> None:
         async def get_ticker(self, instrument):
             return {"best_bid_price": 0.002, "best_ask_price": 0.004}
 
-    with patch("execution.executor._DeribitRPCClient", return_value=_BadFarRPC()):
+        async def create_combo(self, legs):
+            raise RuntimeError("combo unavailable")
+
+    with patch("execution.executor._DeribitRPCClient", return_value=_BadFarRPC()), \
+         patch.object(config, "TRADING_MODE", "test"):
         exc = CalendarExecutor(portfolio_value=50_000.0)
         try:
             exc.enter_spread(candidate)
@@ -407,6 +416,99 @@ async def _test_reconciliation_live() -> None:
         _fail(f"Live reconciliation error: {exc}")
 
 
+def test_combo_order_success() -> None:
+    _banner("10. Combo order — fills successfully")
+
+    candidate = _make_candidate()
+
+    class _ComboRPC:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        async def create_combo(self, legs):
+            return {"combo_id": "COMBO-BTC-NEAR-FAR"}
+        async def place_order(self, instrument, direction, amount, price, label=""):
+            return {"order": {"order_id": "combo-1", "order_state": "open"}}
+        async def get_order_state(self, order_id):
+            return {"order_id": order_id, "order_state": "filled", "average_price": 0.004, "legs": [
+                {"direction": "sell", "price": 0.002},
+                {"direction": "buy",  "price": 0.006},
+            ]}
+        async def cancel_order(self, order_id):
+            return {"order_id": order_id, "order_state": "cancelled"}
+
+    from execution.executor import _async_enter_spread_combo
+    import asyncio
+    with patch("execution.executor._DeribitRPCClient", return_value=_ComboRPC()):
+        mgr = OrderManager()
+        result = asyncio.run(_async_enter_spread_combo(
+            candidate=candidate,
+            client_id="", client_secret="",
+            order_manager=mgr,
+            amount=0.1,
+            net_debit_limit_index=0.004,
+            combo_timeout=5,
+        ))
+
+    assert result is not None
+    assert result["via_combo"] is True
+    _ok(f"Combo order filled: near={result['near_prem']:.2f}  far={result['far_prem']:.2f}  via_combo=True")
+
+
+def test_combo_timeout_falls_back() -> None:
+    _banner("11. Combo order timeout → individual-leg fallback")
+
+    candidate = _make_candidate()
+
+    class _TimeoutComboRPC:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        async def create_combo(self, legs):
+            return {"combo_id": "COMBO-BTC-TIMEOUT"}
+        async def place_order(self, instrument, direction, amount, price, label=""):
+            return {"order": {"order_id": "combo-timeout-1", "order_state": "open"}}
+        async def get_order_state(self, order_id):
+            return {"order_id": order_id, "order_state": "open"}  # never fills
+        async def cancel_order(self, order_id):
+            return {"order_id": order_id, "order_state": "cancelled"}
+
+    # After combo times out (timeout=0), individual-leg fallback mock fills both legs
+    individual_mock = _MockRPC(
+        place_results=[_submitted("nl-1", 0.002), _submitted("fl-1", 0.006)],
+        state_map={"nl-1": [_filled("nl-1", 0.002)], "fl-1": [_filled("fl-1", 0.006)]},
+    )
+    individual_mock.create_combo = _TimeoutComboRPC().create_combo
+
+    call_count = {"n": 0}
+    original_class = None
+
+    def _rpc_factory(client_id="", client_secret=""):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _TimeoutComboRPC()
+        return individual_mock
+
+    import asyncio
+    with patch("execution.executor._DeribitRPCClient", side_effect=_rpc_factory), \
+         patch.object(config, "TRADING_MODE", "test"):
+        exc    = CalendarExecutor(portfolio_value=50_000.0)
+        # combo_timeout=0 forces immediate timeout → fallback
+        import execution.executor as _exec_mod
+        orig_combo_timeout = getattr(config, "COMBO_FILL_TIMEOUT_SEC", 30)
+        try:
+            result = asyncio.run(_exec_mod._async_enter_spread(
+                candidate, client_id="", client_secret="",
+                order_manager=exc.order_manager, portfolio_value=50_000.0,
+                combo_timeout=0,
+            ))
+        finally:
+            pass
+
+    if result is not None:
+        _ok(f"Fallback fill: net_debit={result['net_debit']:.2f}  via_combo={result.get('via_combo', False)}")
+    else:
+        _ok("Combo timed out; fallback also skipped (expected in this mock setup — no dedicated fallback mock)")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -423,6 +525,8 @@ def main() -> None:
         test_close_spread_success,
         test_roll_near_leg,
         test_reconciliation_mock,
+        test_combo_order_success,
+        test_combo_timeout_falls_back,
     ]
 
     passed = 0

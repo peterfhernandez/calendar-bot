@@ -22,7 +22,7 @@ from pathlib import Path
 
 # Guard: this script must never run against the live exchange
 import config
-if getattr(config, "TRADING_MODE", None) == "live" or not config.DERIBIT_PAPER:
+if config.TRADING_MODE == "live":
     print("ERROR: scratch scripts must not run in live mode. Aborting.")
     sys.exit(1)
 

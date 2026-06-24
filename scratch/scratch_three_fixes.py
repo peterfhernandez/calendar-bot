@@ -27,8 +27,8 @@ from unittest.mock import MagicMock, patch
 import config
 
 # Guard: never run against live trading
-if not config.DERIBIT_PAPER:
-    print("ERROR: DERIBIT_PAPER is False — refusing to run scratch script on live account.")
+if config.TRADING_MODE == "live":
+    print("ERROR: TRADING_MODE is 'live' — refusing to run scratch script on live account.")
     sys.exit(1)
 
 from strategy.decision import DecisionEngine, BotState

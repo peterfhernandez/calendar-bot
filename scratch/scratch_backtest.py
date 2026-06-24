@@ -41,8 +41,8 @@ from datetime import datetime, timedelta, timezone
 
 import config
 
-if not config.DERIBIT_PAPER:
-    raise SystemExit("scratch_backtest.py must not run in live mode. Set DERIBIT_PAPER=True.")
+if config.TRADING_MODE == "live":
+    raise SystemExit("scratch_backtest.py must not run in live mode. Set TRADING_MODE='paper' in config.py.")
 
 logging.basicConfig(level=logging.WARNING)  # suppress decision-engine noise in output
 

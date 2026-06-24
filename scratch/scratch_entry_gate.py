@@ -22,7 +22,7 @@ import os
 
 # Abort if running against the live exchange
 import config
-if getattr(config, "TRADING_MODE", None) == "live" or not getattr(config, "DERIBIT_PAPER", True):
+if config.TRADING_MODE == "live":
     print("ERROR: scratch scripts must not run against the live exchange.")
     sys.exit(1)
 

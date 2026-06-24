@@ -9,8 +9,7 @@ until SIGINT/SIGTERM, then both are shut down cleanly.
 
 Usage
 -----
-    python bot.py                        # paper trading (DERIBIT_PAPER = True in config)
-    python bot.py --live                 # live trading  (sets DERIBIT_PAPER = False)
+    python bot.py                        # uses TRADING_MODE from config.py (default: paper)
     python bot.py --portfolio 50000
     python bot.py --collect              # also run the data collector alongside the bot
 """
@@ -29,7 +28,26 @@ from monitor.loop import BotLoop, configure_logging
 logger = logging.getLogger("bot")
 
 
-async def _run(portfolio_value: float, paper: bool, collect: bool) -> None:
+_BANNERS = {
+    "paper": "*** PAPER MODE — data from test.deribit.com, no orders placed ***",
+    "test":  "*** TEST MODE — orders will be placed on test.deribit.com ***",
+    "live":  "*** LIVE MODE — REAL MONEY on www.deribit.com ***",
+}
+
+
+def _check_startup() -> None:
+    """Validate config before starting; print the mode banner."""
+    mode = config.TRADING_MODE
+    if mode not in ("paper", "test", "live"):
+        raise SystemExit(f"Invalid TRADING_MODE={mode!r}. Must be 'paper', 'test', or 'live'.")
+    if mode == "live" and not (config.DAILY_LOSS_LIMIT and config.DAILY_LOSS_LIMIT > 0):
+        raise SystemExit(
+            "TRADING_MODE='live' requires DAILY_LOSS_LIMIT to be set to a positive value in config.py."
+        )
+    print(_BANNERS.get(mode, f"*** MODE: {mode} ***"), flush=True)
+
+
+async def _run(portfolio_value: float, collect: bool) -> None:
     configure_logging()
     logging.getLogger("strategy.decision").setLevel(logging.DEBUG)
     logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
@@ -38,7 +56,7 @@ async def _run(portfolio_value: float, paper: bool, collect: bool) -> None:
 
     feed = DeribitFeed(
         assets=config.ASSETS,
-        paper=paper,
+        paper=config.DERIBIT_PAPER,
         client_id=config.DERIBIT_CLIENT_ID,
         client_secret=config.DERIBIT_CLIENT_SECRET,
         on_ticker=cache.update,
@@ -50,8 +68,8 @@ async def _run(portfolio_value: float, paper: bool, collect: bool) -> None:
     )
 
     logger.info(
-        "Starting calendar bot  paper=%s  assets=%s  portfolio=%.2f  collect=%s",
-        paper,
+        "Starting calendar bot  mode=%s  assets=%s  portfolio=%.2f  collect=%s",
+        config.TRADING_MODE,
         config.ASSETS,
         portfolio_value,
         collect,
@@ -87,12 +105,9 @@ async def _run(portfolio_value: float, paper: bool, collect: bool) -> None:
 
 
 def main() -> None:
+    _check_startup()
+
     parser = argparse.ArgumentParser(description="Calendar Spread Bot")
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Use live Deribit endpoint (default: paper trading)",
-    )
     parser.add_argument(
         "--portfolio",
         type=float,
@@ -107,8 +122,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    paper = not args.live
-    asyncio.run(_run(portfolio_value=args.portfolio, paper=paper, collect=args.collect))
+    asyncio.run(_run(portfolio_value=args.portfolio, collect=args.collect))
 
 
 if __name__ == "__main__":

@@ -174,7 +174,7 @@ class DeribitFeed:
 
     @property
     def _endpoint(self) -> str:
-        return _WS_PAPER if self.paper else _WS_LIVE
+        return config.DERIBIT_WS_URL
 
     async def _connect_and_stream(self) -> None:
         logger.info("Connecting to %s", self._endpoint)

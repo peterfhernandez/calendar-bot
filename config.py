@@ -61,11 +61,33 @@ TAKE_PROFIT_PCT = 1.50  # close if spread value > 150% of debit paid
 SCAN_INTERVAL_SEC    = 300  # 5 minutes
 MONITOR_INTERVAL_SEC = 60   # 1 minute
 
-# Broker
-DERIBIT_PAPER         = True   # set False for live trading
-DAILY_LOSS_LIMIT      = 500    # USD — halt bot if breached
-DERIBIT_CLIENT_ID     = _os.environ.get("DERIBIT_CLIENT_ID",     "")
-DERIBIT_CLIENT_SECRET = _os.environ.get("DERIBIT_CLIENT_SECRET", "")
+# Trading mode:
+#   "paper" → test.deribit.com data, dry-run execution (no orders sent)
+#   "test"  → test.deribit.com data, orders placed on test.deribit.com
+#   "live"  → www.deribit.com data, orders placed on www.deribit.com (real money)
+TRADING_MODE = _os.environ.get("TRADING_MODE", "paper")
+
+# Derived URLs — do not hard-code these in other modules
+_LIVE = TRADING_MODE == "live"
+DERIBIT_WS_URL   = "wss://www.deribit.com/ws/api/v2"  if _LIVE else "wss://test.deribit.com/ws/api/v2"
+DERIBIT_REST_URL = "https://www.deribit.com"           if _LIVE else "https://test.deribit.com"
+
+# Backwards-compatible alias (True for paper or test, False for live)
+DERIBIT_PAPER = not _LIVE
+
+# API keys — stored in .env, never committed.
+# Paper and test modes share test-exchange credentials.
+# Live mode uses production credentials.
+DERIBIT_TEST_CLIENT_ID     = _os.environ.get("DERIBIT_TEST_CLIENT_ID",     "")
+DERIBIT_TEST_CLIENT_SECRET = _os.environ.get("DERIBIT_TEST_CLIENT_SECRET", "")
+DERIBIT_LIVE_CLIENT_ID     = _os.environ.get("DERIBIT_LIVE_CLIENT_ID",     "")
+DERIBIT_LIVE_CLIENT_SECRET = _os.environ.get("DERIBIT_LIVE_CLIENT_SECRET", "")
+
+# Active credentials selected by mode
+DERIBIT_CLIENT_ID     = DERIBIT_LIVE_CLIENT_ID     if _LIVE else DERIBIT_TEST_CLIENT_ID
+DERIBIT_CLIENT_SECRET = DERIBIT_LIVE_CLIENT_SECRET if _LIVE else DERIBIT_TEST_CLIENT_SECRET
+
+DAILY_LOSS_LIMIT = 500    # USD — halt bot if breached; required when TRADING_MODE == "live"
 
 # Alerts
 # SMTP credentials are read from env vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS

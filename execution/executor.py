@@ -46,9 +46,6 @@ from execution.order_manager import OrderManager, OrderState, TrackedOrder
 
 logger = logging.getLogger(__name__)
 
-_WS_PAPER = "wss://test.deribit.com/ws/api/v2"
-_WS_LIVE  = "wss://www.deribit.com/ws/api/v2"
-
 # ── Defaults (can be overridden in config.py) ─────────────────────────────────
 SLIPPAGE_LIMIT_PCT: float = getattr(config, "SLIPPAGE_LIMIT_PCT", 0.02)
 ORDER_TIMEOUT_SEC:  int   = getattr(config, "ORDER_TIMEOUT_SEC",  30)
@@ -94,8 +91,7 @@ class _DeribitRPCClient:
     keeps each executor call fully self-contained.
     """
 
-    def __init__(self, paper: bool, client_id: str, client_secret: str) -> None:
-        self.paper         = paper
+    def __init__(self, client_id: str = "", client_secret: str = "") -> None:
         self.client_id     = client_id
         self.client_secret = client_secret
         self._req_id       = 0
@@ -104,7 +100,7 @@ class _DeribitRPCClient:
 
     @property
     def _endpoint(self) -> str:
-        return _WS_PAPER if self.paper else _WS_LIVE
+        return config.DERIBIT_WS_URL
 
     async def __aenter__(self) -> "_DeribitRPCClient":
         self._ws = await websockets.connect(
@@ -196,6 +192,15 @@ class _DeribitRPCClient:
 
     async def get_order_state(self, order_id: str) -> dict:
         return await self._rpc("private/get_order_state", {"order_id": order_id})
+
+    async def create_combo(self, legs: list[dict]) -> dict:
+        """
+        Create a Deribit combo instrument from a list of leg definitions.
+
+        Each leg dict must have: instrument_name, direction ("buy"|"sell"), amount.
+        Returns the combo result including combo_id which can be used as an instrument name.
+        """
+        return await self._rpc("private/create_combo", {"trades": legs})
 
     async def get_open_orders(self, instrument: str | None = None) -> list[dict]:
         params: dict = {"kind": "option"}
@@ -289,27 +294,128 @@ async def _wait_for_fill(
 
 # ── Core async logic ──────────────────────────────────────────────────────────
 
+async def _async_enter_spread_combo(
+    candidate: CalendarCandidate,
+    client_id: str,
+    client_secret: str,
+    order_manager: OrderManager,
+    amount: float,
+    net_debit_limit_index: float,
+    combo_timeout: int,
+) -> dict | None:
+    """
+    Attempt to enter a calendar spread via a Deribit combo order.
+
+    Submits both legs atomically as a combo instrument. Returns a fill summary
+    dict on success, or None if the combo times out or fails. The caller is
+    responsible for falling back to individual legs on None.
+    """
+    asset      = candidate.asset
+    spot       = candidate.spot
+    near_instr = candidate.near_instrument
+    far_instr  = candidate.far_instrument
+
+    async with _DeribitRPCClient(client_id, client_secret) as client:
+        try:
+            combo_result = await client.create_combo([
+                {"instrument_name": near_instr, "direction": "sell", "amount": amount},
+                {"instrument_name": far_instr,  "direction": "buy",  "amount": amount},
+            ])
+        except Exception as exc:
+            logger.debug("create_combo failed (%s) — will use individual legs", exc)
+            return None
+
+        combo_id = combo_result.get("combo_id") or combo_result.get("instrument_name")
+        if not combo_id:
+            logger.debug("create_combo returned no combo_id — will use individual legs")
+            return None
+
+        try:
+            order_result = await client.place_order(
+                combo_id, "buy", amount, net_debit_limit_index,
+                label=f"CAL-COMBO-{asset}",
+            )
+        except Exception as exc:
+            logger.debug("Combo order placement failed (%s) — will use individual legs", exc)
+            return None
+
+        combo_order_id = order_result["order"]["order_id"]
+        order_manager.track(TrackedOrder(
+            order_id=combo_order_id, instrument=combo_id,
+            direction="buy", amount=amount, limit_price=net_debit_limit_index,
+            label=f"CAL-COMBO-{asset}",
+        ))
+
+        try:
+            final_state = await _wait_for_fill(client, combo_order_id, combo_timeout)
+        except OrderTimeoutError:
+            logger.info("Combo order timed out after %ds — falling back to individual legs", combo_timeout)
+            try:
+                await client.cancel_order(combo_order_id)
+            except Exception:
+                pass
+            order_manager.update(combo_order_id, OrderState.CANCELLED)
+            return None
+        except RuntimeError as exc:
+            logger.warning("Combo order rejected (%s) — falling back to individual legs", exc)
+            order_manager.update(combo_order_id, OrderState.CANCELLED)
+            return None
+
+        order_manager.update(combo_order_id, OrderState.FILLED)
+
+        # Extract per-leg fill prices from the combo fill result
+        legs_filled = final_state.get("legs", [])
+        near_fill_index = next(
+            (l.get("price", net_debit_limit_index) for l in legs_filled if l.get("direction") == "sell"),
+            net_debit_limit_index,
+        )
+        far_fill_index = next(
+            (l.get("price", net_debit_limit_index) for l in legs_filled if l.get("direction") == "buy"),
+            net_debit_limit_index + net_debit_limit_index,
+        )
+
+        near_fill_usd = _usd_price(near_fill_index, spot, asset)
+        far_fill_usd  = _usd_price(far_fill_index,  spot, asset)
+
+        logger.info(
+            "Combo fill: near=%.4f  far=%.4f  net_debit=%.4f",
+            near_fill_usd, far_fill_usd, far_fill_usd - near_fill_usd,
+        )
+        return {
+            "near_prem":          near_fill_usd,
+            "far_prem":           far_fill_usd,
+            "net_debit":          far_fill_usd - near_fill_usd,
+            "qty":                amount,
+            "near_order_id":      combo_order_id,
+            "far_order_id":       combo_order_id,
+            "near_instrument":    near_instr,
+            "far_instrument":     far_instr,
+            "near_fill_price":    near_fill_index,
+            "far_fill_price":     far_fill_index,
+            "via_combo":          True,
+        }
+
+
 async def _async_enter_spread(
     candidate: CalendarCandidate,
-    paper: bool,
     client_id: str,
     client_secret: str,
     order_manager: OrderManager,
     portfolio_value: float,
     slippage_pct: float = SLIPPAGE_LIMIT_PCT,
     order_timeout: int = ORDER_TIMEOUT_SEC,
+    combo_timeout: int | None = None,
 ) -> dict | None:
     """
     Async implementation of enter_spread.
 
-    Strategy:
-      1. Fetch live tickers for both legs to get current mid prices.
-      2. Check that our intended prices are within slippage bounds.
-      3. Submit near leg sell (limit at near_bid).
-      4. Wait for fill.
-      5. Submit far leg buy (limit at far_ask).
-      6. Wait for fill.
-      7. If step 5/6 fails after retries, close near leg and raise LegRiskError.
+    Execution strategy (when TRADING_MODE != "paper"):
+      1. Try a Deribit combo order — both legs atomic, no leg risk.
+      2. If the combo times out (after combo_timeout seconds), fall back to
+         sequential individual legs.  The fallback logs a WARNING and cancels
+         the near leg immediately if the far leg fails.
+
+    In "paper" mode the order is simulated locally; no API calls are made.
     """
     asset = candidate.asset
     spot  = candidate.spot
@@ -324,16 +430,57 @@ async def _async_enter_spread(
     near_instr = candidate.near_instrument
     far_instr  = candidate.far_instrument
 
-    # Convert our intended USD prices to index fractions for Deribit
+    # Convert intended USD prices to index fractions for Deribit
     near_limit = _index_price(candidate.near_bid, spot, asset)
     far_limit  = _index_price(candidate.far_ask,  spot, asset)
-    # Keep intended prices in USD for slippage comparison
-    near_intended_usd = candidate.near_bid   # we intend to sell at bid
-    far_intended_usd  = candidate.far_ask    # we intend to buy at ask
+    near_intended_usd = candidate.near_bid
+    far_intended_usd  = candidate.far_ask
+
+    # ── Paper mode: dry-run — no API calls ───────────────────────────────────
+    if config.TRADING_MODE == "paper":
+        logger.info(
+            "[PAPER] Simulated fill: near=%.4f  far=%.4f  qty=%.4f",
+            candidate.near_bid, candidate.far_ask, amount,
+        )
+        return {
+            "near_prem":       candidate.near_bid,
+            "far_prem":        candidate.far_ask,
+            "net_debit":       candidate.net_debit,
+            "qty":             amount,
+            "near_order_id":   "paper-near",
+            "far_order_id":    "paper-far",
+            "near_instrument": near_instr,
+            "far_instrument":  far_instr,
+            "near_fill_price": near_limit,
+            "far_fill_price":  far_limit,
+            "via_combo":       False,
+        }
+
+    # ── Live / test: try combo order first ────────────────────────────────────
+    effective_combo_timeout = combo_timeout if combo_timeout is not None else getattr(config, "COMBO_FILL_TIMEOUT_SEC", 30)
+    net_debit_limit_index   = far_limit - near_limit  # net debit as index fraction
+
+    combo_fill = await _async_enter_spread_combo(
+        candidate=candidate,
+        client_id=client_id,
+        client_secret=client_secret,
+        order_manager=order_manager,
+        amount=amount,
+        net_debit_limit_index=net_debit_limit_index,
+        combo_timeout=effective_combo_timeout,
+    )
+    if combo_fill is not None:
+        return combo_fill
+
+    # ── Individual-leg fallback (WARNING logged) ──────────────────────────────
+    logger.warning(
+        "Falling back to individual legs for %s %s (combo timed out or unavailable)",
+        asset, near_instr,
+    )
 
     near_order_id: str | None = None
 
-    async with _DeribitRPCClient(paper, client_id, client_secret) as client:
+    async with _DeribitRPCClient(client_id, client_secret) as client:
         # ── Near leg (sell) ───────────────────────────────────────────────────
         for attempt in range(MAX_RETRIES):
             try:
@@ -406,7 +553,6 @@ async def _async_enter_spread(
                     await asyncio.sleep(_RETRY_DELAYS[attempt])
 
         if not far_order_id:
-            # Far leg never submitted — close near leg to avoid naked short
             logger.error("Far leg submit exhausted retries; closing near leg to avoid leg risk")
             try:
                 await client.place_order(near_instr, "buy", amount, near_limit * 1.05,
@@ -434,15 +580,13 @@ async def _async_enter_spread(
         order_manager.update(far_order_id, OrderState.FILLED, fill_price=far_fill_price)
         logger.info("Far leg filled: price=%.4f", far_fill_price)
 
-    # ── Compute fill summary ──────────────────────────────────────────────────
     near_prem_usd = _usd_price(near_fill_price, spot, asset)
     far_prem_usd  = _usd_price(far_fill_price,  spot, asset)
-    net_debit     = far_prem_usd - near_prem_usd
 
     return {
         "near_prem":          near_prem_usd,
         "far_prem":           far_prem_usd,
-        "net_debit":          net_debit,
+        "net_debit":          far_prem_usd - near_prem_usd,
         "qty":                amount,
         "near_order_id":      near_order_id,
         "far_order_id":       far_order_id,
@@ -450,12 +594,12 @@ async def _async_enter_spread(
         "far_instrument":     far_instr,
         "near_fill_price":    near_fill_price,
         "far_fill_price":     far_fill_price,
+        "via_combo":          False,
     }
 
 
 async def _async_close_spread(
     position: dict,
-    paper: bool,
     client_id: str,
     client_secret: str,
     order_manager: OrderManager,
@@ -473,7 +617,7 @@ async def _async_close_spread(
     far_instr  = position["far_instrument"]
     amount     = position["qty"]
 
-    async with _DeribitRPCClient(paper, client_id, client_secret) as client:
+    async with _DeribitRPCClient(client_id, client_secret) as client:
         # Get current mid prices for slippage reference
         try:
             near_ticker = await client.get_ticker(near_instr)
@@ -534,7 +678,6 @@ async def _async_close_spread(
 async def _async_roll_near_leg(
     position: dict,
     new_candidate: CalendarCandidate,
-    paper: bool,
     client_id: str,
     client_secret: str,
     order_manager: OrderManager,
@@ -552,7 +695,7 @@ async def _async_roll_near_leg(
     amount     = position["qty"]
     new_near   = new_candidate.near_instrument
 
-    async with _DeribitRPCClient(paper, client_id, client_secret) as client:
+    async with _DeribitRPCClient(client_id, client_secret) as client:
         # Buy back old near leg
         try:
             ticker = await client.get_ticker(near_instr)
@@ -611,13 +754,15 @@ class CalendarExecutor:
     All methods are synchronous; they spin up a temporary async event loop
     so they can be called from a non-async scheduler tick.
 
+    Execution mode is determined by config.TRADING_MODE:
+    - "paper" → dry-run (no API calls; fills are simulated locally)
+    - "test"  → real orders on test.deribit.com
+    - "live"  → real orders on www.deribit.com
+
     Parameters
     ----------
-    paper
-        True for Deribit testnet (default), False for live.
     client_id / client_secret
-        Deribit API credentials.  Public market data works without creds,
-        but order placement requires authenticated access.
+        Deribit API credentials.  Defaults to config values for the active mode.
     portfolio_value
         Current portfolio value in USD, used for position sizing.
     order_manager
@@ -630,15 +775,15 @@ class CalendarExecutor:
 
     def __init__(
         self,
-        paper:          bool  = True,
-        client_id:      str   = "",
-        client_secret:  str   = "",
+        client_id:       str   = "",
+        client_secret:   str   = "",
         portfolio_value: float = 10_000.0,
-        order_manager:  OrderManager | None = None,
-        slippage_pct:   float = SLIPPAGE_LIMIT_PCT,
-        order_timeout:  int   = ORDER_TIMEOUT_SEC,
+        order_manager:   OrderManager | None = None,
+        slippage_pct:    float = SLIPPAGE_LIMIT_PCT,
+        order_timeout:   int   = ORDER_TIMEOUT_SEC,
+        # Legacy: paper=True/False still accepted but ignored; mode comes from config
+        paper:           bool | None = None,
     ) -> None:
-        self.paper           = paper
         self.client_id       = client_id or config.DERIBIT_CLIENT_ID
         self.client_secret   = client_secret or config.DERIBIT_CLIENT_SECRET
         self.portfolio_value = portfolio_value
@@ -664,7 +809,6 @@ class CalendarExecutor:
             return self._run(
                 _async_enter_spread(
                     candidate,
-                    paper=self.paper,
                     client_id=self.client_id,
                     client_secret=self.client_secret,
                     order_manager=self.order_manager,
@@ -688,7 +832,6 @@ class CalendarExecutor:
             return self._run(
                 _async_close_spread(
                     position,
-                    paper=self.paper,
                     client_id=self.client_id,
                     client_secret=self.client_secret,
                     order_manager=self.order_manager,
@@ -706,7 +849,6 @@ class CalendarExecutor:
                 _async_roll_near_leg(
                     position,
                     new_candidate,
-                    paper=self.paper,
                     client_id=self.client_id,
                     client_secret=self.client_secret,
                     order_manager=self.order_manager,

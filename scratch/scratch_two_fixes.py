@@ -31,8 +31,8 @@ from unittest.mock import MagicMock, patch
 
 import config
 
-if not config.DERIBIT_PAPER:
-    print("scratch_two_fixes.py: DERIBIT_PAPER is False — refusing to run.")
+if config.TRADING_MODE == "live":
+    print("scratch_two_fixes.py: TRADING_MODE is 'live' — refusing to run.")
     sys.exit(0)
 
 from data.deribit_feed import TickerSnapshot
