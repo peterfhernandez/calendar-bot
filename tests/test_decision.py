@@ -1248,3 +1248,165 @@ class TestLiquidityGate:
         )
         reason = engine._check_liquidity_gate(candidate)
         assert reason is None
+
+
+# ── Notification wiring ───────────────────────────────────────────────────────
+
+class TestNotificationWiring:
+    """
+    DecisionEngine must call the appropriate Notifier methods at each event.
+    All tests use a MagicMock notifier — no real network calls are made.
+    """
+
+    def _engine_with_notifier(self, executor=None):
+        notifier = MagicMock()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        engine = DecisionEngine(
+            cache=_make_cache(),
+            portfolio_value=10_000.0,
+            executor=executor,
+            db_path=db_path,
+            daily_loss_limit=500.0,
+            notifier=notifier,
+        )
+        return engine, notifier, db_path
+
+    def _open_pos(self, trade_id: int = 1) -> dict:
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return {
+            "trade_id":        trade_id,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       90_000.0,
+            "near_days":       10,
+            "far_days":        35,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+            "open_fees":       0.0,
+            "close_fees":      0.0,
+        }
+
+    def test_notify_entry_called_after_successful_fill(self):
+        """notify_entry must fire once when a trade is successfully entered."""
+        executor = MagicMock()
+        executor.enter_spread.return_value = {
+            "near_prem": 0.0245,
+            "far_prem":  0.0445,
+            "net_debit": 0.02,
+            "qty":       1.0,
+        }
+        engine, notifier, _ = self._engine_with_notifier(executor=executor)
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            candidate = _make_candidate()
+            candidate.ev_score = 0.25
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="ok")
+            engine.scan_tick()
+
+        notifier.notify_entry.assert_called_once()
+
+    def test_notify_entry_not_called_on_executor_rejection(self):
+        """notify_entry must NOT fire when the executor rejects the order."""
+        executor = MagicMock()
+        executor.enter_spread.return_value = None  # rejected
+
+        engine, notifier, _ = self._engine_with_notifier(executor=executor)
+
+        with patch("strategy.decision.scan") as mock_scan, \
+             patch("strategy.decision.size_candidate") as mock_size:
+            candidate = _make_candidate()
+            candidate.ev_score = 0.25
+            mock_scan.return_value = [candidate]
+            mock_size.return_value = MagicMock(qty=1.0, reason="ok")
+            engine.scan_tick()
+
+        notifier.notify_entry.assert_not_called()
+
+    def test_notify_stop_called_on_stop_loss(self):
+        """notify_stop must fire when a stop-loss triggers."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.005
+        engine, notifier, _ = self._engine_with_notifier(executor=executor)
+        pos = self._open_pos()
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
+        notifier.notify_stop.assert_called_once()
+
+    def test_notify_take_profit_called_on_tp(self):
+        """notify_take_profit must fire when a take-profit triggers."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.04
+        engine, notifier, _ = self._engine_with_notifier(executor=executor)
+        pos = self._open_pos()
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("tp", 0.04, 2.0, "TP")), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
+        notifier.notify_take_profit.assert_called_once()
+
+    def test_notify_close_called_on_expiry(self):
+        """notify_close must fire when near leg expires and position is closed."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.025
+        engine, notifier, _ = self._engine_with_notifier(executor=executor)
+        pos = self._open_pos()
+        pos["expiry_near"] = _future_label(-1)  # expired
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine.monitor_tick()
+
+        notifier.notify_close.assert_called_once()
+        # notify_stop and notify_take_profit must NOT fire for an expiry close
+        notifier.notify_stop.assert_not_called()
+        notifier.notify_take_profit.assert_not_called()
+
+    def test_notify_daily_limit_called_on_halt(self):
+        """notify_daily_limit must fire when the daily loss limit is breached."""
+        engine, notifier, _ = self._engine_with_notifier()
+        engine._today_pnl = -600.0   # exceeds 500 limit
+
+        # scan_tick triggers the limit check
+        result = engine.scan_tick()
+
+        notifier.notify_daily_limit.assert_called_once()
+        assert engine.state == BotState.HALTED
+
+    def test_no_notification_on_position_held(self):
+        """When a position is held (no stop/TP), no close notifications must fire."""
+        executor = MagicMock()
+        engine, notifier, _ = self._engine_with_notifier(executor=executor)
+        pos = self._open_pos()
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.022, 1.1, "OK")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
+        notifier.notify_stop.assert_not_called()
+        notifier.notify_take_profit.assert_not_called()
+        notifier.notify_close.assert_not_called()

@@ -21,6 +21,7 @@ import asyncio
 import logging
 
 import config
+from alerts.notifier import Notifier
 from data.chain_cache import ChainCache
 from data.deribit_feed import DeribitFeed
 from monitor.loop import BotLoop, configure_logging
@@ -47,10 +48,29 @@ def _check_startup() -> None:
     print(_BANNERS.get(mode, f"*** MODE: {mode} ***"), flush=True)
 
 
+def _startup_notify(notifier: Notifier) -> None:
+    """Send 'Bot started' notification. Failures are logged but do not abort startup."""
+    try:
+        notifier.send(
+            event_type="startup",
+            subject=f"Bot started ({config.TRADING_MODE} mode)",
+            body=(
+                f"Calendar Spread Bot started in {config.TRADING_MODE.upper()} mode.\n"
+                f"Assets: {config.ASSETS}\n"
+                f"Exchange: {config.DERIBIT_REST_URL}"
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Startup notification failed (non-fatal): %s", exc)
+
+
 async def _run(portfolio_value: float, collect: bool) -> None:
     configure_logging()
     logging.getLogger("strategy.decision").setLevel(logging.DEBUG)
     logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
+
+    notifier = Notifier()
+    _startup_notify(notifier)
 
     cache = ChainCache()
 
@@ -65,6 +85,7 @@ async def _run(portfolio_value: float, collect: bool) -> None:
     loop = BotLoop(
         cache=cache,
         portfolio_value=portfolio_value,
+        notifier=notifier,
     )
 
     logger.info(
@@ -91,6 +112,13 @@ async def _run(portfolio_value: float, collect: bool) -> None:
 
     try:
         await loop_task
+    except Exception as exc:
+        logger.exception("Bot loop raised an unexpected error")
+        try:
+            notifier.notify_error("bot", exc)
+        except Exception:
+            pass
+        raise
     finally:
         await feed.stop()
         for t in tasks:

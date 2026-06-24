@@ -459,8 +459,8 @@ DAILY_LOSS_LIMIT  = 500      # USD — halt bot if exceeded (required for live m
 | **Portfolio tracker** | **1–2 days** | **Done** |
 | **Liquidity gate** | **0.5–1 day** | **Done** |
 | **Combo order support + fallback** | **1–2 days** | **Done** |
-| **1d near-leg horizon** | **0.5 day** | **Not started** |
-| **Notification wiring** | **0.5–1 day** | **Not started** |
+| **1d near-leg horizon** | **0.5 day** | **Done** |
+| **Notification wiring** | **0.5–1 day** | **Done** |
 | **test.deribit.com wiring** | **0.5 day** | **Not started** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~8–14 days** | |

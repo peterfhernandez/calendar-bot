@@ -209,27 +209,27 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 8e — 1-Day Near Legs
 
-- [ ] Add `1` to `NEAR_DAYS_OPTIONS` in `config.py`
-- [ ] Update `strategy/scanner.py` to enforce valid near/far pairs: near < far (prevents 1d/1d or 7d/7d)
-- [ ] Confirm scanner correctly pairs 1d near with 7d and 14d far legs only (not 30d+ which would be unusual)
-- [ ] Update scanner unit tests to cover 1d near-leg pairs
+- [x] Add `1` to `NEAR_DAYS_OPTIONS` in `config.py`
+- [x] Update `strategy/scanner.py` to enforce valid near/far pairs: near < far (prevents 1d/1d or 7d/7d)
+- [x] Confirm scanner correctly pairs 1d near with 7d and 14d far legs only (not 30d+ which would be unusual)
+- [x] Update scanner unit tests to cover 1d near-leg pairs (6 new tests in `TestOneDayNearLeg`)
 
 ---
 
 ## Phase 8f — Notification Wiring
 
-- [ ] Wire notifier calls into `strategy/decision.py`
-  - [ ] `notify_entry(trade)` after successful fill in `scan_tick`
-  - [ ] `notify_stop(trade, pnl)` when stop-loss triggers in `monitor_tick`
-  - [ ] `notify_take_profit(trade, pnl)` when take-profit triggers in `monitor_tick`
-  - [ ] `notify_roll(trade)` when near leg is rolled in `monitor_tick`
-  - [ ] `notify_close(trade, pnl)` when position closes at expiry in `monitor_tick`
-  - [ ] `notify_daily_limit(daily_pnl)` when daily loss limit is breached
-  - [ ] `notify_error(exc)` in exception handlers in `bot.py` and `monitor/loop.py`
-  - [ ] `notify_warning(msg)` when individual-leg fallback is used
-- [ ] Add startup self-test in `bot.py`: send "Bot started" notification on launch; log warning if it fails but do not abort
-- [ ] Verify all alert config keys present in `config.py`: `ALERT_EMAIL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
-- [ ] Add `scratch/scratch_notify_live.py` — sends a real test alert via configured SMTP and Telegram; confirms delivery end-to-end
+- [x] Wire notifier calls into `strategy/decision.py`
+  - [x] `notify_entry(trade)` after successful fill in `scan_tick`
+  - [x] `notify_stop(trade, pnl)` when stop-loss triggers in `monitor_tick`
+  - [x] `notify_take_profit(trade, pnl)` when take-profit triggers in `monitor_tick`
+  - [x] `notify_roll(trade)` when near leg is rolled in `monitor_tick`
+  - [x] `notify_close(trade, pnl)` when position closes at expiry in `monitor_tick`
+  - [x] `notify_daily_limit(daily_pnl)` when daily loss limit is breached
+  - [x] `notify_error(exc)` in exception handlers in `bot.py` and `monitor/loop.py`
+  - [x] `notify_warning(msg)` when individual-leg fallback is used (method added to Notifier; wired at call sites)
+- [x] Add startup self-test in `bot.py`: send "Bot started" notification on launch; log warning if it fails but do not abort
+- [x] Verify all alert config keys present in `config.py`: `ALERT_EMAIL`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- [x] Add `scratch/scratch_notify_live.py` — sends a real test alert via configured SMTP and Telegram; confirms delivery end-to-end
 
 ---
 
@@ -267,6 +267,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - `scratch/scratch_three_fixes.py` — demonstrates three bug fixes: (1) negative-EV trade rejection, (2) correct stale-IV monitor message, (3) daily_pnl reflecting unrealized MTM. Run with `python -m scratch.scratch_three_fixes` from the repo root.
 - `scratch/scratch_entry_gate.py` — demonstrates the liquidity gate: 7 scenarios covering per-leg spread rejection, entry premium rejection (including the live trade_id=5 scenario), and a clean candidate that passes all checks. Run with `python -m scratch.scratch_entry_gate` from the repo root.
 - `scratch/scratch_sizer_fixes.py` — demonstrates the two fixes for the 2026-06-22 halt: (1) near-zero debit guard in sizer, (2) negative spread value clamped to zero. Run with `python -m scratch.scratch_sizer_fixes` from the repo root.
+- `scratch/scratch_notify_live.py` — sends real test alerts via the configured SMTP and Telegram channels. Requires ALERT_EMAIL/SMTP_USER/SMTP_PASS and/or TELEGRAM_TOKEN/TELEGRAM_CHAT set in .env. Aborts if TRADING_MODE is "live". Run with `python -m scratch.scratch_notify_live` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
 ---

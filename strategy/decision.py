@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import config
+from alerts.notifier import Notifier
 from core.calendar_engine import check_calendar_status
 from data.chain_cache import ChainCache
 from db.state import (
@@ -191,6 +192,7 @@ class DecisionEngine:
         db_path:          Path | None = None,
         daily_loss_limit: float | None = None,
         portfolio:        PortfolioTracker | None = None,
+        notifier:         Notifier | None = None,
     ) -> None:
         self._cache           = cache
         self._portfolio_value = portfolio_value
@@ -201,6 +203,7 @@ class DecisionEngine:
             else config.DAILY_LOSS_LIMIT
         )
         self._portfolio       = portfolio
+        self._notifier        = notifier
         self._state           = BotState.IDLE
         self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
         self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
@@ -513,6 +516,11 @@ class DecisionEngine:
             trade.id, trade.asset, trade.option_type, trade.strike,
             trade.qty, trade.net_debit,
         )
+        if self._notifier:
+            self._notifier.notify_entry(
+                trade.id, trade.asset, trade.option_type,
+                trade.strike, trade.qty, trade.net_debit,
+            )
         return trade
 
     # ── Monitor logic ─────────────────────────────────────────────────────────
@@ -643,6 +651,18 @@ class DecisionEngine:
             "CLOSE trade_id=%d  pnl=%.2f  reason=%s  daily_pnl=%.2f",
             trade_id, pnl, reason, self._today_pnl,
         )
+        if self._notifier:
+            try:
+                asset  = pos.get("asset", "")
+                strike = pos.get("strike", 0.0)
+                if "Take-profit" in reason:
+                    self._notifier.notify_take_profit(trade_id, asset, strike, pnl)
+                elif "Stop-loss" in reason:
+                    self._notifier.notify_stop(trade_id, asset, strike, pnl)
+                else:
+                    self._notifier.notify_close(trade_id, asset, strike, pnl, reason)
+            except Exception as exc:
+                logger.warning("Notification failed on close: %s", exc)
         return f"trade_id={trade_id} {result} pnl={pnl:+.2f} ({reason})"
 
     def _try_roll(self, pos: dict, spot: float) -> bool:
@@ -675,6 +695,14 @@ class DecisionEngine:
                 "ROLL trade_id=%d  → new near=%s",
                 pos["trade_id"], new_candidate.near_instrument,
             )
+            if self._notifier:
+                try:
+                    self._notifier.notify_roll(
+                        pos["trade_id"], pos.get("asset", ""),
+                        pos.get("strike", 0.0), new_candidate.near_instrument,
+                    )
+                except Exception as exc:
+                    logger.warning("notify_roll failed: %s", exc)
         return success
 
     # ── Daily loss limit ──────────────────────────────────────────────────────
@@ -688,6 +716,11 @@ class DecisionEngine:
                 f"(today_pnl={self._today_pnl:.2f}, limit={-self._daily_loss_limit:.2f})"
             )
             logger.critical(msg)
+            if self._notifier:
+                try:
+                    self._notifier.notify_daily_limit(self._today_pnl)
+                except Exception as exc:
+                    logger.warning("notify_daily_limit failed: %s", exc)
             raise DailyLossLimitError(msg)
 
     # ── Helpers ───────────────────────────────────────────────────────────────

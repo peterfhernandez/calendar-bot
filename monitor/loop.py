@@ -33,6 +33,7 @@ from typing import Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
+from alerts.notifier import Notifier
 from data.chain_cache import ChainCache
 from portfolio.tracker import PortfolioTracker
 from strategy.decision import BotState, DecisionEngine
@@ -117,15 +118,18 @@ class BotLoop:
         db_path: Path | None = None,
         log_dir: str | Path = "logs",
         portfolio: PortfolioTracker | None = None,
+        notifier: Notifier | None = None,
     ) -> None:
         self._cache = cache
         self._log_dir = log_dir
+        self._notifier = notifier
         self._engine = DecisionEngine(
             cache=cache,
             portfolio_value=portfolio_value,
             executor=executor,
             db_path=db_path,
             portfolio=portfolio,
+            notifier=notifier,
         )
         self._scheduler = AsyncIOScheduler()
         self._stop_event = asyncio.Event()
@@ -239,8 +243,13 @@ class BotLoop:
             )
             if self._engine.portfolio is not None:
                 logger.info(self._engine.portfolio.portfolio_view())
-        except Exception:
+        except Exception as exc:
             logger.exception("scan_job raised an unexpected error")
+            if self._notifier:
+                try:
+                    self._notifier.notify_error("scan_job", exc)
+                except Exception:
+                    pass
 
     async def _monitor_job(self) -> None:
         """APScheduler job: run one monitor cycle."""
@@ -256,5 +265,10 @@ class BotLoop:
                 status.daily_pnl,
                 status.message,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("monitor_job raised an unexpected error")
+            if self._notifier:
+                try:
+                    self._notifier.notify_error("monitor_job", exc)
+                except Exception:
+                    pass

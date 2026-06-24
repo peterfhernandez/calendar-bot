@@ -72,6 +72,114 @@ class Notifier:
 
     # ── Public helpers ────────────────────────────────────────────────────────
 
+    # ── Decision-engine helpers ───────────────────────────────────────────────
+
+    def notify_entry(
+        self,
+        trade_id: int,
+        asset: str,
+        option_type: str,
+        strike: float,
+        qty: float,
+        net_debit: float,
+    ) -> None:
+        """Alert when a new calendar spread position is entered."""
+        instrument = f"{asset} {option_type} strike={strike:.0f}"
+        self.send(
+            event_type="entry",
+            subject=f"Position entered: {instrument}",
+            body=(
+                f"Trade #{trade_id} entered.\n"
+                f"  Asset:     {asset} {option_type}\n"
+                f"  Strike:    {strike:,.0f}\n"
+                f"  Qty:       {qty}\n"
+                f"  Net debit: ${net_debit:.4f}"
+            ),
+        )
+
+    def notify_stop(self, trade_id: int, asset: str, strike: float, pnl: float) -> None:
+        """Alert when a stop-loss triggers."""
+        instrument = f"{asset} strike={strike:.0f}"
+        self.send(
+            event_type="stop_loss",
+            subject=f"Stop-loss triggered: {instrument} (trade #{trade_id})",
+            body=(
+                f"Trade #{trade_id} hit the stop-loss threshold and was closed.\n"
+                f"  Instrument: {instrument}\n"
+                f"  Realised P&L: ${pnl:+.2f}"
+            ),
+        )
+
+    def notify_take_profit(self, trade_id: int, asset: str, strike: float, pnl: float) -> None:
+        """Alert when a take-profit triggers."""
+        instrument = f"{asset} strike={strike:.0f}"
+        self.send(
+            event_type="take_profit",
+            subject=f"Take-profit triggered: {instrument} (trade #{trade_id})",
+            body=(
+                f"Trade #{trade_id} hit the take-profit threshold and was closed.\n"
+                f"  Instrument: {instrument}\n"
+                f"  Realised P&L: ${pnl:+.2f}"
+            ),
+        )
+
+    def notify_roll(self, trade_id: int, asset: str, strike: float, new_near_instrument: str) -> None:
+        """Alert when a near leg is rolled."""
+        self.send(
+            event_type="roll",
+            subject=f"Near leg rolled: {asset} strike={strike:.0f} (trade #{trade_id})",
+            body=(
+                f"Trade #{trade_id} near leg rolled to a new expiry.\n"
+                f"  Asset:              {asset}\n"
+                f"  Strike:             {strike:,.0f}\n"
+                f"  New near instrument: {new_near_instrument}"
+            ),
+        )
+
+    def notify_close(self, trade_id: int, asset: str, strike: float, pnl: float, reason: str) -> None:
+        """Alert when a position is closed (expiry, roll-fail, or manual close)."""
+        instrument = f"{asset} strike={strike:.0f}"
+        self.send(
+            event_type="close",
+            subject=f"Position closed: {instrument} (trade #{trade_id})",
+            body=(
+                f"Trade #{trade_id} closed.\n"
+                f"  Instrument:   {instrument}\n"
+                f"  Reason:       {reason}\n"
+                f"  Realised P&L: ${pnl:+.2f}"
+            ),
+        )
+
+    def notify_daily_limit(self, daily_pnl: float) -> None:
+        """Alert when the daily loss limit is breached and the bot halts."""
+        self.send(
+            event_type="daily_limit",
+            subject="Daily loss limit breached — bot halted",
+            body=(
+                f"Cumulative daily P&L ${daily_pnl:.2f} breached the "
+                f"configured limit of -${config.DAILY_LOSS_LIMIT:.2f}.\n"
+                "All trading has been halted for the remainder of the day."
+            ),
+        )
+
+    def notify_error(self, context: str, exc: Exception) -> None:
+        """Alert on unexpected runtime errors."""
+        self.send(
+            event_type="error",
+            subject=f"Bot error: {context}",
+            body=f"An error occurred in {context}:\n\n{type(exc).__name__}: {exc}",
+        )
+
+    def notify_warning(self, msg: str) -> None:
+        """Alert for recoverable but notable events (e.g. combo fallback used)."""
+        self.send(
+            event_type="warning",
+            subject=f"Bot warning: {msg[:80]}",
+            body=msg,
+        )
+
+    # ── Legacy helpers (kept for backward compatibility) ──────────────────────
+
     def send_stop_loss(self, instrument: str, pnl: float) -> None:
         """Alert when a position hits the stop-loss threshold."""
         self.send(

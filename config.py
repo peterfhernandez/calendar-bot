@@ -94,8 +94,15 @@ DERIBIT_CLIENT_SECRET = DERIBIT_LIVE_CLIENT_SECRET if _LIVE else DERIBIT_TEST_CL
 DAILY_LOSS_LIMIT = 500    # USD — halt bot if breached; required when TRADING_MODE == "live"
 
 # Alerts
-# SMTP credentials are read from env vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
-# (defaults: smtp.gmail.com:587).  Set ALERT_EMAIL to enable email alerts.
-ALERT_EMAIL    = _os.environ.get("ALERT_EMAIL",    "")  # SMTP recipient
-TELEGRAM_TOKEN = _os.environ.get("TELEGRAM_TOKEN", "")  # bot token
-TELEGRAM_CHAT  = _os.environ.get("TELEGRAM_CHAT",  "")  # chat ID
+# All alert settings are read from env vars (set in .env, never commit).
+# Email — set ALERT_EMAIL to enable; SMTP defaults to Gmail on port 587.
+ALERT_EMAIL    = _os.environ.get("ALERT_EMAIL",    "")  # recipient address
+SMTP_HOST      = _os.environ.get("SMTP_HOST",      "smtp.gmail.com")
+SMTP_PORT      = int(_os.environ.get("SMTP_PORT",  "587"))
+SMTP_USER      = _os.environ.get("SMTP_USER",      "")
+SMTP_PASSWORD  = _os.environ.get("SMTP_PASS",      "")  # env var is SMTP_PASS; alias here
+# Telegram — set both TOKEN and CHAT to enable Telegram alerts.
+TELEGRAM_TOKEN      = _os.environ.get("TELEGRAM_TOKEN",      "")  # bot token (TELEGRAM_TOKEN in .env)
+TELEGRAM_BOT_TOKEN  = TELEGRAM_TOKEN                               # alias for compatibility
+TELEGRAM_CHAT       = _os.environ.get("TELEGRAM_CHAT",       "")  # chat ID  (TELEGRAM_CHAT in .env)
+TELEGRAM_CHAT_ID    = TELEGRAM_CHAT                                # alias for compatibility
