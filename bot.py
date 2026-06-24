@@ -48,20 +48,6 @@ def _check_startup() -> None:
     print(_BANNERS.get(mode, f"*** MODE: {mode} ***"), flush=True)
 
 
-def _startup_notify(notifier: Notifier) -> None:
-    """Send 'Bot started' notification. Failures are logged but do not abort startup."""
-    try:
-        notifier.send(
-            event_type="startup",
-            subject=f"Bot started ({config.TRADING_MODE} mode)",
-            body=(
-                f"Calendar Spread Bot started in {config.TRADING_MODE.upper()} mode.\n"
-                f"Assets: {config.ASSETS}\n"
-                f"Exchange: {config.DERIBIT_REST_URL}"
-            ),
-        )
-    except Exception as exc:
-        logger.warning("Startup notification failed (non-fatal): %s", exc)
 
 
 async def _run(portfolio_value: float, collect: bool) -> None:
@@ -70,7 +56,10 @@ async def _run(portfolio_value: float, collect: bool) -> None:
     logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
 
     notifier = Notifier()
-    _startup_notify(notifier)
+    try:
+        notifier.notify_startup(config.TRADING_MODE, config.ASSETS, config.TRADING_MODE)
+    except Exception as exc:
+        logger.warning("Startup notification failed (non-fatal): %s", exc)
 
     cache = ChainCache()
 

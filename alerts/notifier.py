@@ -178,6 +178,18 @@ class Notifier:
             body=msg,
         )
 
+    def notify_startup(self, trading_mode: str, assets: list, exchange_url: str) -> None:
+        """Alert sent on bot startup. Failures are logged but must not abort startup."""
+        self.send(
+            event_type="startup",
+            subject=f"Bot started ({trading_mode} mode)",
+            body=(
+                f"Calendar Spread Bot started in {trading_mode.upper()} mode.\n"
+                f"Assets: {assets}\n"
+                f"Exchange: {exchange_url.split("://", 1)[-1]}"
+            ),
+        )
+
     # ── Legacy helpers (kept for backward compatibility) ──────────────────────
 
     def send_stop_loss(self, instrument: str, pnl: float) -> None:
