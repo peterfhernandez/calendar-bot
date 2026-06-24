@@ -1,0 +1,391 @@
+"""
+portfolio/tracker.py
+====================
+Real-time portfolio state tracker for the calendar spread bot.
+
+Fetches account equity and available funds from the Deribit REST API,
+reconciles against the SQLite position table, and exposes available_cash
+to the sizing engine on each scan cycle.
+
+Public API
+----------
+PortfolioTracker(db_path=None, client_id=None, client_secret=None, rest_url=None)
+    Main tracker class.  Call refresh() before each scan cycle.
+
+PortfolioState
+    Dataclass snapshot returned by refresh() and portfolio_view().
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+import config
+from db.state import DB_PATH, get_connection
+
+logger = logging.getLogger(__name__)
+
+# If Deribit-reported margin and SQLite-computed margin diverge by more than
+# this fraction, a warning is logged (possible manual trade or missed fill).
+_RECONCILE_THRESHOLD = 0.10  # 10%
+
+# Currencies supported on Deribit that map 1:1 to asset names.
+# USDC/USDT trade at spot=1.0 so no price fetch is needed.
+_STABLECOIN_CURRENCIES = {"USDC", "USDT", "USD"}
+
+
+@dataclass
+class PortfolioState:
+    """Point-in-time snapshot of the portfolio."""
+    equity_usd:          float
+    available_cash:      float   # available_funds from Deribit, converted to USD
+    used_margin:         float   # SQLite: sum(net_debit * qty) for open positions
+    unrealized_pnl:      float   # floating P&L from Deribit positions, converted to USD
+    realized_pnl_today:  float   # SQLite: closed-trade P&L since midnight UTC
+    open_position_count: int
+    deribit_margin_usd:  float   # initial_margin from Deribit REST, converted to USD
+    last_refresh:        Optional[float]  # epoch seconds of last successful refresh
+
+
+class PortfolioTracker:
+    """
+    Tracks account equity, available cash, and position P&L for the bot.
+
+    On each call to refresh():
+    1. Authenticates to the Deribit REST API and fetches account summaries
+       for each currency in config.ASSETS.
+    2. Converts equity, available_funds, and initial_margin to USD using
+       the current index price for each currency.
+    3. Reads open positions from SQLite to compute used_margin and
+       realized P&L today.
+    4. Logs a WARNING if Deribit-reported margin and SQLite-computed margin
+       diverge by more than 10%.
+
+    If API credentials are not configured, refresh() falls back to DB-only
+    mode: equity_usd=0 and available_cash=0 are returned, so the engine
+    continues to use the portfolio_value it was constructed with.
+
+    Parameters
+    ----------
+    db_path
+        SQLite database path (defaults to db/calendar_bot.db).
+    client_id / client_secret
+        Deribit API credentials.  Default: from config.
+    rest_url
+        Deribit REST base URL.  Default: derived from config.DERIBIT_PAPER.
+    """
+
+    def __init__(
+        self,
+        db_path:       Path | None = None,
+        client_id:     str  | None = None,
+        client_secret: str  | None = None,
+        rest_url:      str  | None = None,
+    ) -> None:
+        self._db_path       = db_path or DB_PATH
+        self._client_id     = client_id     if client_id     is not None else config.DERIBIT_CLIENT_ID
+        self._client_secret = client_secret if client_secret is not None else config.DERIBIT_CLIENT_SECRET
+        self._rest_url      = rest_url or (
+            "https://test.deribit.com" if config.DERIBIT_PAPER else "https://www.deribit.com"
+        )
+
+        # Cached state — updated by refresh()
+        self._equity_usd:          float = 0.0
+        self._available_cash:      float = 0.0
+        self._used_margin:         float = 0.0
+        self._unrealized_pnl:      float = 0.0
+        self._realized_pnl_today:  float = 0.0
+        self._deribit_margin_usd:  float = 0.0
+        self._open_position_count: int   = 0
+        self._last_refresh:        float | None = None
+
+    # ── Public properties ─────────────────────────────────────────────────────
+
+    @property
+    def available_cash(self) -> float:
+        """Available cash for new positions in USD (from last successful refresh)."""
+        return self._available_cash
+
+    @property
+    def equity_usd(self) -> float:
+        """Total account equity in USD (from last successful refresh)."""
+        return self._equity_usd
+
+    @property
+    def used_margin(self) -> float:
+        """Sum of (net_debit × qty) for all open positions, computed from SQLite."""
+        return self._used_margin
+
+    @property
+    def unrealized_pnl(self) -> float:
+        """Unrealized (floating) P&L in USD from Deribit position data."""
+        return self._unrealized_pnl
+
+    @property
+    def realized_pnl_today(self) -> float:
+        """Realized P&L from trades closed today (UTC), from SQLite."""
+        return self._realized_pnl_today
+
+    # ── Main refresh ──────────────────────────────────────────────────────────
+
+    def refresh(self, spot_prices: dict[str, float] | None = None) -> PortfolioState:
+        """
+        Refresh portfolio state from the Deribit REST API and SQLite.
+
+        Parameters
+        ----------
+        spot_prices
+            Optional asset→USD spot price map to skip index-price API calls
+            (useful in tests and paper mode where the feed is already running).
+
+        Returns
+        -------
+        PortfolioState
+            Current portfolio snapshot.
+        """
+        # ── SQLite-derived values (always available, no network) ──────────────
+        self._used_margin         = self._calc_used_margin()
+        self._realized_pnl_today  = self._calc_realized_pnl_today()
+        self._open_position_count = self._count_open_positions()
+
+        # ── Deribit REST API ──────────────────────────────────────────────────
+        has_credentials = bool(self._client_id and self._client_secret)
+
+        if has_credentials:
+            try:
+                self._refresh_from_api(spot_prices)
+            except Exception as exc:
+                logger.warning(
+                    "Portfolio API refresh failed (%s) — equity/available_cash unchanged",
+                    exc,
+                )
+        else:
+            logger.debug("No API credentials configured — portfolio tracker in DB-only mode")
+
+        self._last_refresh = time.time()
+
+        # ── Reconciliation ────────────────────────────────────────────────────
+        if self._deribit_margin_usd > 0:
+            self._reconcile()
+
+        return PortfolioState(
+            equity_usd          = self._equity_usd,
+            available_cash      = self._available_cash,
+            used_margin         = self._used_margin,
+            unrealized_pnl      = self._unrealized_pnl,
+            realized_pnl_today  = self._realized_pnl_today,
+            open_position_count = self._open_position_count,
+            deribit_margin_usd  = self._deribit_margin_usd,
+            last_refresh        = self._last_refresh,
+        )
+
+    # ── Portfolio view ────────────────────────────────────────────────────────
+
+    def portfolio_view(self) -> str:
+        """Return a formatted multi-line snapshot suitable for logging."""
+        lines = [
+            "─" * 52,
+            "  PORTFOLIO SNAPSHOT",
+            "─" * 52,
+            f"  Equity (USD)      : ${self._equity_usd:>12,.2f}",
+            f"  Available Cash    : ${self._available_cash:>12,.2f}",
+            f"  Used Margin (DB)  : ${self._used_margin:>12,.2f}",
+            f"  Unrealized P&L    : ${self._unrealized_pnl:>+12,.2f}",
+            f"  Realized P&L Today: ${self._realized_pnl_today:>+12,.2f}",
+            f"  Open Positions    : {self._open_position_count}",
+            "─" * 52,
+        ]
+        return "\n".join(lines)
+
+    # ── Deribit REST helpers ──────────────────────────────────────────────────
+
+    def _refresh_from_api(self, spot_prices: dict[str, float] | None) -> None:
+        """Fetch account summaries and position P&L from Deribit REST."""
+        token = self._authenticate()
+
+        total_equity_usd    = 0.0
+        total_available_usd = 0.0
+        total_margin_usd    = 0.0
+        total_unrealized    = 0.0
+
+        currencies = _assets_to_currencies(config.ASSETS)
+
+        for currency in currencies:
+            try:
+                summary   = self._get_account_summary(token, currency)
+                spot      = _resolve_spot(currency, spot_prices, self._rest_url)
+                positions = self._get_positions(token, currency)
+
+                equity_usd    = summary.get("equity",          0.0) * spot
+                available_usd = summary.get("available_funds", 0.0) * spot
+                margin_usd    = summary.get("initial_margin",  0.0) * spot
+                float_pnl_usd = sum(
+                    p.get("floating_profit_loss", 0.0) * spot for p in positions
+                )
+
+                total_equity_usd    += equity_usd
+                total_available_usd += available_usd
+                total_margin_usd    += margin_usd
+                total_unrealized    += float_pnl_usd
+
+                logger.debug(
+                    "Portfolio %s: equity=%.4f spot=%.2f → $%.2f "
+                    "avail=$%.2f margin=$%.2f float_pnl=$%.2f",
+                    currency,
+                    summary.get("equity", 0.0), spot,
+                    equity_usd, available_usd, margin_usd, float_pnl_usd,
+                )
+
+            except Exception as exc:
+                logger.warning("Could not fetch %s summary: %s", currency, exc)
+
+        self._equity_usd         = total_equity_usd
+        self._available_cash     = max(0.0, total_available_usd)
+        self._deribit_margin_usd = total_margin_usd
+        self._unrealized_pnl     = total_unrealized
+
+    def _authenticate(self) -> str:
+        """Obtain a short-lived Deribit access token via client_credentials."""
+        params = urllib.parse.urlencode({
+            "grant_type":    "client_credentials",
+            "client_id":     self._client_id,
+            "client_secret": self._client_secret,
+        })
+        url  = f"{self._rest_url}/api/v2/public/auth?{params}"
+        data = _rest_get(url)
+        token: str = data["result"]["access_token"]
+        logger.debug("Deribit REST authentication successful")
+        return token
+
+    def _get_account_summary(self, token: str, currency: str) -> dict:
+        """Fetch /private/get_account_summary for one currency."""
+        params = urllib.parse.urlencode({"currency": currency})
+        url    = f"{self._rest_url}/api/v2/private/get_account_summary?{params}"
+        data   = _rest_get(url, bearer_token=token)
+        return data["result"]
+
+    def _get_positions(self, token: str, currency: str) -> list[dict]:
+        """Fetch open option positions for one currency."""
+        params = urllib.parse.urlencode({"currency": currency, "kind": "option"})
+        url    = f"{self._rest_url}/api/v2/private/get_positions?{params}"
+        data   = _rest_get(url, bearer_token=token)
+        return data.get("result", [])
+
+    # ── SQLite helpers ────────────────────────────────────────────────────────
+
+    def _calc_used_margin(self) -> float:
+        """Sum of (net_debit × qty) for all open positions in the DB."""
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(net_debit * qty), 0.0) AS total "
+                "FROM calendar_trades WHERE result = 'Open'"
+            ).fetchone()
+        return float(row["total"])
+
+    def _calc_realized_pnl_today(self) -> float:
+        """Sum of pnl for trades whose date_close is today (UTC)."""
+        today = date.today().isoformat()
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) AS total "
+                "FROM calendar_trades "
+                "WHERE date_close = ? AND pnl IS NOT NULL",
+                (today,),
+            ).fetchone()
+        return float(row["total"])
+
+    def _count_open_positions(self) -> int:
+        """Count rows with result='Open' in the DB."""
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM calendar_trades WHERE result = 'Open'"
+            ).fetchone()
+        return int(row["cnt"])
+
+    # ── Reconciliation ────────────────────────────────────────────────────────
+
+    def _reconcile(self) -> None:
+        """
+        Warn if Deribit-reported margin and SQLite-computed margin diverge.
+
+        Divergence > 10% may indicate a manual trade was placed outside the bot,
+        a fill was missed, or a position closed on-exchange but not in the DB.
+        """
+        db_margin  = self._used_margin
+        api_margin = self._deribit_margin_usd
+
+        if db_margin <= 0 and api_margin <= 0:
+            return
+
+        max_val    = max(db_margin, api_margin)
+        divergence = abs(api_margin - db_margin) / max_val
+
+        if divergence > _RECONCILE_THRESHOLD:
+            logger.warning(
+                "RECONCILE MISMATCH: Deribit margin $%.2f vs SQLite margin $%.2f "
+                "(divergence %.0f%%) — possible manual trade or missed fill",
+                api_margin, db_margin, divergence * 100,
+            )
+        else:
+            logger.debug(
+                "RECONCILE OK: Deribit $%.2f vs SQLite $%.2f (divergence %.1f%%)",
+                api_margin, db_margin, divergence * 100,
+            )
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _assets_to_currencies(assets: list[str]) -> list[str]:
+    """Deduplicate and return Deribit currency codes for the given asset list."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for a in assets:
+        c = a.upper()
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+def _resolve_spot(
+    currency: str,
+    spot_prices: dict[str, float] | None,
+    rest_url: str,
+) -> float:
+    """Return USD spot price for a Deribit currency, from cache or API."""
+    if currency in _STABLECOIN_CURRENCIES:
+        return 1.0
+    if spot_prices and currency in spot_prices:
+        return float(spot_prices[currency])
+    return _fetch_index_price(currency, rest_url)
+
+
+def _fetch_index_price(currency: str, rest_url: str) -> float:
+    """Fetch current index price for a currency via Deribit public endpoint."""
+    index_name = f"{currency.lower()}_usd"
+    params     = urllib.parse.urlencode({"index_name": index_name})
+    url        = f"{rest_url}/api/v2/public/get_index_price?{params}"
+    data       = _rest_get(url)
+    return float(data["result"]["index_price"])
+
+
+def _rest_get(url: str, bearer_token: str | None = None, timeout: int = 10) -> dict:
+    """GET a Deribit REST endpoint and return the parsed JSON response."""
+    req = urllib.request.Request(url)
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc

@@ -14,7 +14,7 @@ used that logs decisions without placing orders.
 
 Public API
 ----------
-DecisionEngine(cache, portfolio_value, executor=None, db_path=None)
+DecisionEngine(cache, portfolio_value, executor=None, db_path=None, portfolio=None)
     Main engine class. Call scan_tick() on the scan interval and
     monitor_tick() on the monitor interval.
 
@@ -45,6 +45,7 @@ from db.state import (
     load_calendar_state,
     DB_PATH,
 )
+from portfolio.tracker import PortfolioTracker
 from strategy.scanner import CalendarCandidate, scan
 from strategy.sizer import size_candidate
 
@@ -168,22 +169,28 @@ class DecisionEngine:
     cache
         Populated ChainCache providing live option chain data.
     portfolio_value
-        Current total portfolio value in USD (caller should refresh this).
+        Initial portfolio value in USD.  When a PortfolioTracker is attached
+        this is updated automatically on each scan_tick from the live account.
     executor
         Object implementing ExecutorProtocol. Defaults to DryRunExecutor.
     db_path
         Path to the SQLite database (defaults to db/calendar_bot.db).
     daily_loss_limit
         USD threshold for the daily halt (defaults to config.DAILY_LOSS_LIMIT).
+    portfolio
+        Optional PortfolioTracker.  When supplied, scan_tick() calls
+        portfolio.refresh() before sizing so that available_cash reflects
+        the live Deribit account balance.
     """
 
     def __init__(
         self,
-        cache:           ChainCache,
-        portfolio_value: float,
-        executor:        ExecutorProtocol | None = None,
-        db_path:         Path | None = None,
+        cache:            ChainCache,
+        portfolio_value:  float,
+        executor:         ExecutorProtocol | None = None,
+        db_path:          Path | None = None,
         daily_loss_limit: float | None = None,
+        portfolio:        PortfolioTracker | None = None,
     ) -> None:
         self._cache           = cache
         self._portfolio_value = portfolio_value
@@ -193,6 +200,7 @@ class DecisionEngine:
             daily_loss_limit if daily_loss_limit is not None
             else config.DAILY_LOSS_LIMIT
         )
+        self._portfolio       = portfolio
         self._state           = BotState.IDLE
         self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
         self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
@@ -211,6 +219,11 @@ class DecisionEngine:
     @portfolio_value.setter
     def portfolio_value(self, value: float) -> None:
         self._portfolio_value = value
+
+    @property
+    def portfolio(self) -> PortfolioTracker | None:
+        """The attached PortfolioTracker, or None if not configured."""
+        return self._portfolio
 
     # ── Public tick methods ───────────────────────────────────────────────────
 
@@ -234,6 +247,26 @@ class DecisionEngine:
             self._check_daily_loss_limit()
         except DailyLossLimitError as exc:
             return self._status(str(exc))
+
+        # ── Portfolio refresh (before sizing) ─────────────────────────────────
+        if self._portfolio is not None:
+            try:
+                state = self._portfolio.refresh()
+                if state.available_cash > 0:
+                    self._portfolio_value = state.available_cash
+                    logger.debug(
+                        "Portfolio refreshed: available_cash=$%.2f equity=$%.2f",
+                        state.available_cash, state.equity_usd,
+                    )
+                if state.available_cash == 0 and self._portfolio._client_id:
+                    # Credentials set but cash is zero — log and skip entry
+                    logger.info(
+                        "SCAN skipped: available_cash=0 (portfolio refresh returned zero funds)"
+                    )
+                    self._state = BotState.IDLE
+                    return self._status("Scan skipped: insufficient available cash.")
+            except Exception as exc:
+                logger.warning("Portfolio refresh error in scan_tick: %s — continuing with cached value", exc)
 
         open_positions = self._load_all_open_positions()
 

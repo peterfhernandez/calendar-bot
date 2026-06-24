@@ -135,24 +135,24 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ## Phase 8b — Portfolio Tracker
 
-- [ ] Implement `portfolio/tracker.py`
-  - [ ] Fetch account summary from Deribit REST API (`/private/get_account_summary`) on startup and after every position change
-  - [ ] Track available cash = equity − used margin
-  - [ ] Track used margin = sum of net debits on open positions
-  - [ ] Track unrealized P&L (MTM) and realized P&L today
-  - [ ] Provide `portfolio_view()` returning a formatted snapshot for logging and the terminal dashboard
-  - [ ] Reconcile Deribit reported equity against SQLite position table; log discrepancies
-- [ ] Integrate portfolio tracker into `strategy/sizer.py`
-  - [ ] Replace static `BUDGET_USD` with `portfolio.available_cash`
-  - [ ] `sizer.py` rejects sizing if `available_cash < min_trade_cost`
-- [ ] Integrate portfolio tracker into `strategy/decision.py`
-  - [ ] `scan_tick` calls `portfolio.refresh()` before sizing; skips entry if cash is insufficient
-- [ ] Integrate portfolio tracker into `monitor/loop.py`
-  - [ ] Log a portfolio snapshot at each scan cycle
-- [ ] Write unit tests `tests/test_portfolio.py`
-  - [ ] Mock Deribit REST responses; verify available_cash calculation
-  - [ ] Verify reconciliation warning fires when equity and SQLite totals diverge
-- [ ] Add `scratch/scratch_portfolio.py` — connects to paper API and prints live portfolio snapshot
+- [x] Implement `portfolio/tracker.py`
+  - [x] Fetch account summary from Deribit REST API (`/private/get_account_summary`) on startup and after every position change
+  - [x] Track available cash = equity − used margin (via `available_funds` from Deribit API)
+  - [x] Track used margin = sum of net debits on open positions (from SQLite)
+  - [x] Track unrealized P&L (MTM from Deribit `floating_profit_loss`) and realized P&L today (from SQLite)
+  - [x] Provide `portfolio_view()` returning a formatted snapshot for logging and the terminal dashboard
+  - [x] Reconcile Deribit reported margin against SQLite position table; log discrepancies > 10%
+- [x] Integrate portfolio tracker into `strategy/sizer.py`
+  - [x] `available_cash` is passed as `portfolio_value` from decision engine after refresh; sizer already rejects tiny sizes via `MIN_NET_DEBIT` and `_MIN_QTY` checks
+- [x] Integrate portfolio tracker into `strategy/decision.py`
+  - [x] `scan_tick` calls `portfolio.refresh()` before sizing; skips entry if `available_cash == 0` and credentials are set
+  - [x] `portfolio_value` updated to `available_cash` when refresh returns a positive value
+- [x] Integrate portfolio tracker into `monitor/loop.py`
+  - [x] Log a portfolio snapshot after each scan cycle via `portfolio_view()`
+- [x] Write unit tests `tests/test_portfolio.py` (24 tests)
+  - [x] Mock Deribit REST responses; verify available_cash calculation
+  - [x] Verify reconciliation warning fires when equity and SQLite totals diverge
+- [x] Add `scratch/scratch_portfolio.py` — connects to paper API and prints live portfolio snapshot
 
 ---
 

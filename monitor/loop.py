@@ -34,6 +34,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 from data.chain_cache import ChainCache
+from portfolio.tracker import PortfolioTracker
 from strategy.decision import BotState, DecisionEngine
 
 logger = logging.getLogger(__name__)
@@ -95,13 +96,17 @@ class BotLoop:
     cache
         Populated ChainCache (caller must start the feed before calling run()).
     portfolio_value
-        Initial portfolio value in USD.  Update via the portfolio_value property.
+        Initial portfolio value in USD.  When a PortfolioTracker is supplied
+        this is updated on every scan cycle from the live account balance.
     executor
         ExecutorProtocol implementation.  Defaults to DryRunExecutor.
     db_path
         SQLite database path (defaults to db/calendar_bot.db).
     log_dir
         Directory for the rotating log file.
+    portfolio
+        Optional PortfolioTracker.  When supplied, a portfolio snapshot is
+        logged after every scan cycle.
     """
 
     def __init__(
@@ -111,6 +116,7 @@ class BotLoop:
         executor: Any | None = None,
         db_path: Path | None = None,
         log_dir: str | Path = "logs",
+        portfolio: PortfolioTracker | None = None,
     ) -> None:
         self._cache = cache
         self._log_dir = log_dir
@@ -119,6 +125,7 @@ class BotLoop:
             portfolio_value=portfolio_value,
             executor=executor,
             db_path=db_path,
+            portfolio=portfolio,
         )
         self._scheduler = AsyncIOScheduler()
         self._stop_event = asyncio.Event()
@@ -230,6 +237,8 @@ class BotLoop:
                 status.daily_pnl,
                 status.message,
             )
+            if self._engine.portfolio is not None:
+                logger.info(self._engine.portfolio.portfolio_view())
         except Exception:
             logger.exception("scan_job raised an unexpected error")
 
