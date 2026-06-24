@@ -400,3 +400,89 @@ class TestSizerSafetyGuards:
         c = _dummy_candidate(net_debit=100.0)
         result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
         assert result.qty == pytest.approx(2.0)  # unchanged
+
+
+# ── 1-day near-leg pairing ─────────────────────────────────────────────────────
+
+class TestOneDayNearLeg:
+    """
+    Scanner with NEAR_DAYS_OPTIONS=[1,7,14]:
+    - 1d near legs must pair with 7d and 14d far legs only.
+    - 1d/30d+ pairs must be excluded (MAX_FAR_DAYS_FOR_1D_NEAR=14).
+    - 7d and 14d near legs are unaffected and can pair with all far legs.
+    """
+
+    def _snaps_1d_near(self, far_days: int) -> list[TickerSnapshot]:
+        """Return a 1d near / N-day far pair with good liquidity and IV contango."""
+        return [
+            _make_snap("BTC", 1,        100_000, "C", mark_iv=0.95, bid=4000.0, ask=4200.0, open_interest=300),
+            _make_snap("BTC", far_days, 100_000, "C", mark_iv=0.75, bid=8000.0, ask=8400.0, open_interest=300),
+        ]
+
+    def _scan_1d(self, snaps: list[TickerSnapshot], monkeypatch, far_days: int) -> list:
+        import config as cfg
+        monkeypatch.setattr(cfg, "NEAR_DAYS_OPTIONS", [1])
+        monkeypatch.setattr(cfg, "FAR_DAYS_OPTIONS",  [far_days])
+        monkeypatch.setattr(cfg, "MAX_FAR_DAYS_FOR_1D_NEAR", 14)
+        cache = _make_cache(snaps)
+        return scan(
+            cache, assets=["BTC"],
+            near_days_options=[1], far_days_options=[far_days],
+            min_oi_near=100, min_oi_far=100,
+            min_iv_contango=0.02, min_pop=0.01,
+        )
+
+    def test_1d_near_7d_far_accepted(self, monkeypatch):
+        """1d/7d is a valid pair and should produce a candidate."""
+        snaps = self._snaps_1d_near(7)
+        results = self._scan_1d(snaps, monkeypatch, far_days=7)
+        assert len(results) >= 1
+
+    def test_1d_near_14d_far_accepted(self, monkeypatch):
+        """1d/14d is a valid pair and should produce a candidate."""
+        snaps = self._snaps_1d_near(14)
+        results = self._scan_1d(snaps, monkeypatch, far_days=14)
+        assert len(results) >= 1
+
+    def test_1d_near_30d_far_rejected(self, monkeypatch):
+        """1d/30d exceeds MAX_FAR_DAYS_FOR_1D_NEAR=14 and must be excluded."""
+        snaps = self._snaps_1d_near(30)
+        results = self._scan_1d(snaps, monkeypatch, far_days=30)
+        assert len(results) == 0
+
+    def test_1d_near_60d_far_rejected(self, monkeypatch):
+        """1d/60d must also be excluded."""
+        snaps = self._snaps_1d_near(60)
+        results = self._scan_1d(snaps, monkeypatch, far_days=60)
+        assert len(results) == 0
+
+    def test_7d_near_30d_far_unaffected(self, monkeypatch):
+        """7d/30d pairing must not be restricted by MAX_FAR_DAYS_FOR_1D_NEAR."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_FAR_DAYS_FOR_1D_NEAR", 14)
+        snaps = [
+            _make_snap("BTC", 7,  100_000, "C", mark_iv=0.90, bid=4800.0, ask=5200.0, open_interest=600),
+            _make_snap("BTC", 30, 100_000, "C", mark_iv=0.75, bid=8200.0, ask=8800.0, open_interest=600),
+        ]
+        cache = _make_cache(snaps)
+        results = scan(
+            cache, assets=["BTC"],
+            near_days_options=[7], far_days_options=[30],
+            min_oi_near=100, min_oi_far=100,
+            min_iv_contango=0.02, min_pop=0.01,
+        )
+        assert len(results) >= 1
+
+    def test_max_far_days_zero_disables_restriction(self, monkeypatch):
+        """Setting MAX_FAR_DAYS_FOR_1D_NEAR=0 disables the limit — 1d/30d is then allowed."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_FAR_DAYS_FOR_1D_NEAR", 0)
+        snaps = self._snaps_1d_near(30)
+        cache = _make_cache(snaps)
+        results = scan(
+            cache, assets=["BTC"],
+            near_days_options=[1], far_days_options=[30],
+            min_oi_near=100, min_oi_far=100,
+            min_iv_contango=0.02, min_pop=0.01,
+        )
+        assert len(results) >= 1

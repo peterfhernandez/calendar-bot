@@ -353,6 +353,11 @@ def scan(
                 for far_target in far_days_options:
                     if far_target <= near_dte:
                         continue
+                    # 1d near legs are capped at a short far horizon —
+                    # wider spreads are unusual and typically illiquid.
+                    _max_far = getattr(config, "MAX_FAR_DAYS_FOR_1D_NEAR", 14)
+                    if near_target == 1 and _max_far > 0 and far_target > _max_far:
+                        continue
                     far_matches = [
                         (dte, snap) for dte, snap in entries
                         if abs(dte - far_target) <= far_day_tolerance and dte > near_dte

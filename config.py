@@ -20,8 +20,12 @@ ASSETS = ["BTC", "ETH", "SOL"]
 #ASSETS = ["ETH", "SOL"]
 
 # Calendar horizons (days to expiry)
-NEAR_DAYS_OPTIONS = [7, 14]
-FAR_DAYS_OPTIONS  = [30, 45, 60]
+NEAR_DAYS_OPTIONS = [1, 7, 14]
+FAR_DAYS_OPTIONS  = [7, 14, 30, 45, 60]
+
+# 1-day near legs are only valid with short far legs — a 1d/30d+ spread is
+# unusual and almost always illiquid.  Set to 0 to disable the restriction.
+MAX_FAR_DAYS_FOR_1D_NEAR = 14
 
 # Entry filters
 MIN_IV_CONTANGO = 0.02   # front IV must exceed back IV by at least 2%
