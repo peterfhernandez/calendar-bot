@@ -249,6 +249,19 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
+## Phase 8h — Separate Data-Collector Asset List
+
+- [x] Add `COLLECTOR_ASSETS` to `config.py` as an explicit variable independent of `ASSETS`
+  - [x] `ASSETS` controls what the **bot** scans, enters, and manages positions for (default: `["BTC", "ETH"]`)
+  - [x] `COLLECTOR_ASSETS` controls what the **data collector** gathers snapshots for (default: `["BTC", "ETH", "SOL"]`)
+  - [x] `COLLECTOR_ASSETS` can be a superset of `ASSETS` so data is collected for assets not yet traded
+- [x] Update `backtest/data_collector.py` to read `config.COLLECTOR_ASSETS` directly (remove `getattr` fallback)
+- [x] Update `collect.py` module docstring and `--assets` help text to reference `COLLECTOR_ASSETS`
+- [x] Update `README.md` key parameters table to document both `ASSETS` and `COLLECTOR_ASSETS`
+- [x] Update `BOT_PLAN.md` configuration block to include `COLLECTOR_ASSETS`
+
+---
+
 ## Phase 9 — Paper Trading Validation
 
 - [ ] Run bot in paper mode (`DERIBIT_PAPER = True`) for minimum 4 weeks

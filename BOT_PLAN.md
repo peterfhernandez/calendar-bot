@@ -384,8 +384,13 @@ CLOSE → log result → notify → IDLE
 ## Configuration Parameters (config.py)
 
 ```python
-# Assets to trade
+# Assets the bot will trade (scanner, decision engine, execution)
 ASSETS = ["BTC", "ETH"]
+
+# Assets the data collector will gather option-chain snapshots for.
+# Can be a superset of ASSETS — useful for collecting data on assets
+# (e.g. SOL) that you want to analyse or backtest without trading them yet.
+COLLECTOR_ASSETS = ["BTC", "ETH", "SOL"]
 
 # Calendar horizons — near/far day pairs to scan
 # Near legs: 1d, 7d, 14d  |  Far legs: 7d, 14d, 30d, 45d, 60d

@@ -49,7 +49,7 @@ DB_PATH = Path(__file__).parent / "historic_data" / "options.duckdb"
 SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
 
 COLLECTOR_INTERVAL_SEC: int = getattr(config, "COLLECTOR_INTERVAL_SEC", 300)
-COLLECTOR_ASSETS: list[str] = getattr(config, "COLLECTOR_ASSETS", config.ASSETS)
+COLLECTOR_ASSETS: list[str] = config.COLLECTOR_ASSETS
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
