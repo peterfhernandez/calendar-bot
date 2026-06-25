@@ -37,6 +37,29 @@ MIN_EV          = 0.05   # minimum expected value as a fraction of net_debit.
                          # e.g. a candidate with net_debit=0.02 BTC and ev_score=0.25
                          # has an expected profit of 25% of the debit (0.005 BTC per contract).
 
+# Per-asset threshold overrides.
+# Any key present here takes precedence over the corresponding global default
+# for that specific asset.  SOL options are significantly thinner than BTC/ETH:
+# lower open interest, wider bid/ask spreads, and a less stable IV term
+# structure.  These overrides let SOL participate without loosening the global
+# filters that protect BTC/ETH entries.
+ASSET_OVERRIDES: dict = {
+    "SOL": {
+        "MIN_OI_NEAR":        10,    # global: 100
+        "MIN_OI_FAR":         10,    # global: 100
+        "MAX_LEG_SPREAD_PCT": 0.20,  # global: 0.05
+        "MAX_ENTRY_PREMIUM":  0.20,  # global: 0.10
+        "MIN_IV_CONTANGO":    0.01,  # global: 0.02
+    }
+}
+
+
+def asset_config(asset: str, key: str):
+    """Return the per-asset override for *key*, or the module-level global default."""
+    override = ASSET_OVERRIDES.get(asset.upper(), {}).get(key)
+    return override if override is not None else globals()[key]
+
+
 # Liquidity gate (applied just before order submission)
 MIN_LEG_BID_SIZE       = 1      # minimum bid-size (contracts) per leg — requires bid_size in TickerSnapshot
 MIN_LEG_ASK_SIZE       = 1      # minimum ask-size (contracts) per leg — requires ask_size in TickerSnapshot

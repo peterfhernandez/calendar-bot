@@ -186,7 +186,7 @@ class Notifier:
             body=(
                 f"Calendar Spread Bot started in {trading_mode.upper()} mode.\n"
                 f"Assets: {assets}\n"
-                f"Exchange: {exchange_url.split("://", 1)[-1]}"
+                f"Exchange: {exchange_url.split('://', 1)[-1]}"
             ),
         )
 

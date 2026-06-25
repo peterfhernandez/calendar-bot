@@ -319,14 +319,21 @@ def scan(
     assets            = [a.upper() for a in (assets            or config.ASSETS)]
     near_days_options = near_days_options or config.NEAR_DAYS_OPTIONS
     far_days_options  = far_days_options  or config.FAR_DAYS_OPTIONS
-    min_oi_near       = min_oi_near       if min_oi_near       is not None else config.MIN_OI_NEAR
-    min_oi_far        = min_oi_far        if min_oi_far        is not None else config.MIN_OI_FAR
-    min_iv_contango   = min_iv_contango   if min_iv_contango   is not None else config.MIN_IV_CONTANGO
-    min_pop           = min_pop           if min_pop           is not None else config.MIN_POP
+    # Preserve explicit call args (None means "use per-asset config inside the loop").
+    _explicit_min_oi_near     = min_oi_near
+    _explicit_min_oi_far      = min_oi_far
+    _explicit_min_iv_contango = min_iv_contango
+    _explicit_min_pop         = min_pop
 
     candidates: list[CalendarCandidate] = []
 
     for asset in assets:
+        # Resolve effective thresholds: explicit call arg > asset override > global default.
+        eff_min_oi_near     = _explicit_min_oi_near     if _explicit_min_oi_near     is not None else config.asset_config(asset, "MIN_OI_NEAR")
+        eff_min_oi_far      = _explicit_min_oi_far      if _explicit_min_oi_far      is not None else config.asset_config(asset, "MIN_OI_FAR")
+        eff_min_iv_contango = _explicit_min_iv_contango if _explicit_min_iv_contango is not None else config.asset_config(asset, "MIN_IV_CONTANGO")
+        eff_min_pop         = _explicit_min_pop         if _explicit_min_pop         is not None else config.asset_config(asset, "MIN_POP")
+
         spot = cache.get_spot(asset)
         if spot is None or spot <= 0:
             logger.debug("No spot price for %s — skipping", asset)
@@ -371,8 +378,8 @@ def scan(
                         near_dte, near_snap,
                         far_dte,  far_snap,
                         spot,
-                        min_oi_near, min_oi_far,
-                        min_iv_contango, min_pop,
+                        eff_min_oi_near, eff_min_oi_far,
+                        eff_min_iv_contango, eff_min_pop,
                     )
                     if result is not None:
                         candidates.append(result)

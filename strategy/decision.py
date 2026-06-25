@@ -417,32 +417,36 @@ class DecisionEngine:
 
         Returns a rejection reason string, or None if the candidate passes.
         """
+        # Resolve per-asset thresholds (SOL uses wider limits than BTC/ETH).
+        max_leg_spread_pct = config.asset_config(candidate.asset, "MAX_LEG_SPREAD_PCT")
+        max_entry_premium  = config.asset_config(candidate.asset, "MAX_ENTRY_PREMIUM")
+
         near_mid = (candidate.near_bid + candidate.near_ask) / 2 if (candidate.near_bid > 0 and candidate.near_ask > 0) else 0.0
         far_mid  = (candidate.far_bid  + candidate.far_ask)  / 2 if (candidate.far_bid  > 0 and candidate.far_ask  > 0) else 0.0
 
         if near_mid > 0:
             near_spread_pct = (candidate.near_ask - candidate.near_bid) / near_mid
-            if near_spread_pct > config.MAX_LEG_SPREAD_PCT:
+            if near_spread_pct > max_leg_spread_pct:
                 return (
                     f"near-leg spread {near_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
-                    f"{config.MAX_LEG_SPREAD_PCT:.1%}"
+                    f"{max_leg_spread_pct:.1%}"
                 )
 
         if far_mid > 0:
             far_spread_pct = (candidate.far_ask - candidate.far_bid) / far_mid
-            if far_spread_pct > config.MAX_LEG_SPREAD_PCT:
+            if far_spread_pct > max_leg_spread_pct:
                 return (
                     f"far-leg spread {far_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
-                    f"{config.MAX_LEG_SPREAD_PCT:.1%}"
+                    f"{max_leg_spread_pct:.1%}"
                 )
 
         spread_mid = far_mid - near_mid
         if spread_mid > 0:
             premium = (candidate.net_debit - spread_mid) / spread_mid
-            if premium > config.MAX_ENTRY_PREMIUM:
+            if premium > max_entry_premium:
                 return (
                     f"entry premium {premium:.1%} > MAX_ENTRY_PREMIUM "
-                    f"{config.MAX_ENTRY_PREMIUM:.1%} "
+                    f"{max_entry_premium:.1%} "
                     f"(debit={candidate.net_debit:.4f}, spread_mid={spread_mid:.4f})"
                 )
 

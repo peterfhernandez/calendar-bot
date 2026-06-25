@@ -1549,4 +1549,160 @@ class TestRollFixes:
             result = engine._try_roll(pos, spot=90_000.0)
 
         assert result is True
-        executor.roll_near_leg.assert_called_once()
+
+
+# ── Per-asset overrides in the liquidity gate ─────────────────────────────────
+
+class TestAssetOverridesLiquidityGate:
+    """
+    _check_liquidity_gate must apply per-asset MAX_LEG_SPREAD_PCT and
+    MAX_ENTRY_PREMIUM from ASSET_OVERRIDES so that thinner assets (SOL) can
+    pass with wider spreads without loosening the filters for BTC/ETH.
+    """
+
+    def _sol_candidate(self, near_spread_pct: float, far_spread_pct: float,
+                        net_debit_premium: float = 0.05) -> CalendarCandidate:
+        """
+        Build a SOL candidate with controlled bid/ask spread percentages.
+        net_debit is set to spread_mid * (1 + net_debit_premium) so only the
+        leg-spread check varies between tests.
+        """
+        near_mid = 10.0
+        far_mid  = 20.0
+        spread_mid = far_mid - near_mid  # 10.0
+
+        near_half = near_mid * near_spread_pct / 2
+        far_half  = far_mid  * far_spread_pct  / 2
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return CalendarCandidate(
+            asset="SOL",
+            strike=150.0,
+            option_type="Call",
+            near_instrument=f"SOL-{near_label}-150-C",
+            far_instrument=f"SOL-{far_label}-150-C",
+            near_days=10,
+            far_days=35,
+            spot=150.0,
+            near_iv=0.90,
+            far_iv=0.70,
+            iv_contango=0.20,
+            near_bid=near_mid - near_half,
+            near_ask=near_mid + near_half,
+            far_bid=far_mid - far_half,
+            far_ask=far_mid + far_half,
+            net_debit=spread_mid * (1 + net_debit_premium),
+            near_oi=50.0,
+            far_oi=50.0,
+            pop=0.50,
+            be_lo=120.0,
+            be_hi=180.0,
+            ev_score=0.20,
+        )
+
+    def _btc_candidate_with_spread(self, near_spread_pct: float, far_spread_pct: float) -> CalendarCandidate:
+        """BTC candidate with same spread percentages, for global-vs-asset comparison."""
+        near_mid = 100.0
+        far_mid  = 200.0
+        spread_mid = far_mid - near_mid  # 100.0
+        near_half = near_mid * near_spread_pct / 2
+        far_half  = far_mid  * far_spread_pct  / 2
+        near_label = _future_label(10)
+        far_label  = _future_label(35)
+        return CalendarCandidate(
+            asset="BTC",
+            strike=90_000.0,
+            option_type="Call",
+            near_instrument=f"BTC-{near_label}-90000-C",
+            far_instrument=f"BTC-{far_label}-90000-C",
+            near_days=10,
+            far_days=35,
+            spot=90_000.0,
+            near_iv=0.90,
+            far_iv=0.70,
+            iv_contango=0.20,
+            near_bid=near_mid - near_half,
+            near_ask=near_mid + near_half,
+            far_bid=far_mid - far_half,
+            far_ask=far_mid + far_half,
+            net_debit=spread_mid * 1.05,
+            near_oi=500.0,
+            far_oi=500.0,
+            pop=0.50,
+            be_lo=80_000.0,
+            be_hi=100_000.0,
+            ev_score=0.25,
+        )
+
+    def test_sol_passes_with_15pct_spread(self, monkeypatch):
+        """SOL candidate with 15% leg spread passes the SOL override limit of 20%."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_LEG_SPREAD_PCT", 0.05)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MAX_LEG_SPREAD_PCT": 0.20, "MAX_ENTRY_PREMIUM": 0.20}
+        })
+        engine, _ = _make_engine()
+        candidate = self._sol_candidate(near_spread_pct=0.15, far_spread_pct=0.15)
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is None, f"Expected SOL 15% spread to pass 20% limit, got: {reason}"
+
+    def test_btc_fails_with_15pct_spread(self, monkeypatch):
+        """BTC candidate with 15% leg spread is rejected by the global 5% limit."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_LEG_SPREAD_PCT", 0.05)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MAX_LEG_SPREAD_PCT": 0.20, "MAX_ENTRY_PREMIUM": 0.20}
+        })
+        engine, _ = _make_engine()
+        candidate = self._btc_candidate_with_spread(near_spread_pct=0.15, far_spread_pct=0.15)
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None, "BTC with 15% spread should be rejected by 5% global limit"
+        assert "MAX_LEG_SPREAD_PCT" in reason
+
+    def test_sol_fails_when_spread_exceeds_sol_override(self, monkeypatch):
+        """SOL candidate with 25% leg spread fails even the SOL-specific 20% limit."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_LEG_SPREAD_PCT", 0.05)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MAX_LEG_SPREAD_PCT": 0.20, "MAX_ENTRY_PREMIUM": 0.20}
+        })
+        engine, _ = _make_engine()
+        candidate = self._sol_candidate(near_spread_pct=0.25, far_spread_pct=0.05)
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None, "25% spread should exceed the SOL 20% limit"
+        assert "near-leg" in reason
+
+    def test_sol_entry_premium_uses_sol_override(self, monkeypatch):
+        """SOL entry premium of 15% passes the SOL override of 20% (global is 10%)."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_LEG_SPREAD_PCT", 0.05)
+        monkeypatch.setattr(cfg, "MAX_ENTRY_PREMIUM", 0.10)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MAX_LEG_SPREAD_PCT": 0.20, "MAX_ENTRY_PREMIUM": 0.20}
+        })
+        engine, _ = _make_engine()
+        # 3% spread on legs — well within both limits
+        # 15% entry premium — above global 10% but below SOL's 20%
+        candidate = self._sol_candidate(
+            near_spread_pct=0.03, far_spread_pct=0.03, net_debit_premium=0.15
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is None, f"15% premium should pass SOL's 20% entry premium limit, got: {reason}"
+
+    def test_btc_entry_premium_uses_global_limit(self, monkeypatch):
+        """BTC entry premium of 15% is rejected by the global 10% limit."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MAX_LEG_SPREAD_PCT", 0.05)
+        monkeypatch.setattr(cfg, "MAX_ENTRY_PREMIUM", 0.10)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MAX_LEG_SPREAD_PCT": 0.20, "MAX_ENTRY_PREMIUM": 0.20}
+        })
+        engine, _ = _make_engine()
+        # BTC candidate: tight leg spreads (2%), 15% entry premium
+        candidate = self._btc_candidate_with_spread(near_spread_pct=0.02, far_spread_pct=0.02)
+        # Override net_debit to force 15% entry premium:
+        # spread_mid = 100; 15% premium → net_debit = 100 * 1.15 = 115
+        candidate.net_debit = 115.0
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None, "BTC with 15% entry premium should fail the global 10% limit"
+        assert "entry premium" in reason

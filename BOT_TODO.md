@@ -233,6 +233,22 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
+## Phase 8g — Per-Asset Threshold Overrides
+
+- [x] Add `ASSET_OVERRIDES` dict to `config.py` with SOL-specific relaxed thresholds
+  - [x] `MIN_OI_NEAR: 10`, `MIN_OI_FAR: 10` (global: 100) — SOL has lower open interest
+  - [x] `MAX_LEG_SPREAD_PCT: 0.20` (global: 0.05) — SOL market makers quote wider spreads
+  - [x] `MAX_ENTRY_PREMIUM: 0.20` (global: 0.10) — wider legs naturally push entry cost above mid
+  - [x] `MIN_IV_CONTANGO: 0.01` (global: 0.02) — SOL IV term structure is less stable
+- [x] Add `asset_config(asset, key)` helper to `config.py`: priority = explicit call arg > `ASSET_OVERRIDES` > global default
+- [x] Update `strategy/scanner.py` — resolve OI, contango, and pop thresholds per-asset inside the scan loop
+- [x] Update `strategy/decision.py` `_check_liquidity_gate()` — use `asset_config()` for `MAX_LEG_SPREAD_PCT` and `MAX_ENTRY_PREMIUM`
+- [x] Add `TestAssetOverrides` (5 tests) to `tests/test_scanner.py`
+- [x] Add `TestAssetOverridesLiquidityGate` (5 tests) to `tests/test_decision.py`
+- [x] Add `scratch/scratch_asset_overrides.py` — shows effective thresholds per asset and demonstrates SOL passing filters that BTC/ETH fail
+
+---
+
 ## Phase 9 — Paper Trading Validation
 
 - [ ] Run bot in paper mode (`DERIBIT_PAPER = True`) for minimum 4 weeks
@@ -268,6 +284,7 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 - `scratch/scratch_entry_gate.py` — demonstrates the liquidity gate: 7 scenarios covering per-leg spread rejection, entry premium rejection (including the live trade_id=5 scenario), and a clean candidate that passes all checks. Run with `python -m scratch.scratch_entry_gate` from the repo root.
 - `scratch/scratch_sizer_fixes.py` — demonstrates the two fixes for the 2026-06-22 halt: (1) near-zero debit guard in sizer, (2) negative spread value clamped to zero. Run with `python -m scratch.scratch_sizer_fixes` from the repo root.
 - `scratch/scratch_notify_live.py` — sends real test alerts via the configured SMTP and Telegram channels. Requires ALERT_EMAIL/SMTP_USER/SMTP_PASS and/or TELEGRAM_TOKEN/TELEGRAM_CHAT set in .env. Aborts if TRADING_MODE is "live". Run with `python -m scratch.scratch_notify_live` from the repo root.
+- `scratch/scratch_asset_overrides.py` — demonstrates per-asset threshold overrides: prints effective thresholds for BTC, ETH, and SOL side by side, then shows SOL candidates passing OI, spread, and entry-premium filters that BTC/ETH fail. Run with `python -m scratch.scratch_asset_overrides` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
 ---
