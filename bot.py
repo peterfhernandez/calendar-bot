@@ -57,7 +57,7 @@ async def _run(portfolio_value: float, collect: bool) -> None:
 
     notifier = Notifier()
     try:
-        notifier.notify_startup(config.TRADING_MODE, config.ASSETS, config.TRADING_MODE)
+        notifier.notify_startup(config.TRADING_MODE, config.ASSETS, config.DERIBIT_REST_URL)
     except Exception as exc:
         logger.warning("Startup notification failed (non-fatal): %s", exc)
 
