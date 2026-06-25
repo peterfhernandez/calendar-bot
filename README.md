@@ -30,7 +30,8 @@ This bot automates the full lifecycle:
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| Assets | BTC, ETH | Underlyings to trade |
+| `ASSETS` | BTC, ETH | Underlyings the **bot** scans, enters, and manages positions for |
+| `COLLECTOR_ASSETS` | BTC, ETH, SOL | Underlyings the **data collector** gathers option-chain snapshots for — can be a superset of `ASSETS` |
 | Near leg | 1–14 days | Short option expiry (1d, 7d, 14d) |
 | Far leg | 7–60 days | Long option expiry (7d, 14d, 30d, 45d, 60d) |
 | Min IV contango | 2% | Front IV must exceed back IV by at least this |

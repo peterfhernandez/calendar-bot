@@ -15,9 +15,13 @@ def _load_env(path: str = ".env") -> None:
 
 _load_env()
 
-# Assets to trade
-ASSETS = ["BTC", "ETH", "SOL"]
-#ASSETS = ["ETH", "SOL"]
+# Assets the bot will trade (scanner, decision engine, execution)
+ASSETS = ["BTC", "ETH"]
+
+# Assets the data collector will gather option-chain snapshots for.
+# Can be a superset of ASSETS — useful for collecting data on assets
+# (e.g. SOL) that you want to analyse or backtest without trading them yet.
+COLLECTOR_ASSETS = ["BTC", "ETH", "SOL"]
 
 # Calendar horizons (days to expiry)
 NEAR_DAYS_OPTIONS = [1, 7, 14]

@@ -38,6 +38,8 @@ Notes
 - The script reads ``DERIBIT_PAPER`` from ``config.py``; market data is
   identical on paper (test.deribit.com) and live (www.deribit.com) endpoints,
   so the flag only controls which hostname is used.
+- ``COLLECTOR_ASSETS`` in ``config.py`` sets which assets are collected by
+  default (independent of ``ASSETS``, which controls what the bot trades).
 - SIGINT / SIGTERM trigger a clean shutdown after the current collection
   cycle finishes.
 - A daily-row-count summary is logged every hour for easy health monitoring.
@@ -221,7 +223,7 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         metavar="ASSET",
         default=None,
-        help=f"Assets to collect (default: {COLLECTOR_ASSETS}).",
+        help=f"Assets to collect (default: config.COLLECTOR_ASSETS = {COLLECTOR_ASSETS}).",
     )
     p.add_argument(
         "--interval",
