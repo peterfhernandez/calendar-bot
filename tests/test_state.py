@@ -7,6 +7,7 @@ from db.state import (
     init_db,
     create_calendar_trade,
     close_calendar_trade,
+    list_assets_with_open_positions,
     load_calendar_state,
     get_calendar_stats,
     update_near_leg,
@@ -276,3 +277,28 @@ class TestUpdateNearLeg:
     def test_raises_on_unknown_trade_id(self, db):
         with pytest.raises(ValueError, match="not found"):
             update_near_leg(9999, "BTC-14JUN26-100000-C", "14JUN26", db_path=db)
+
+
+class TestListAssetsWithOpenPositions:
+    def test_empty_when_no_trades(self, db):
+        assert list_assets_with_open_positions(db_path=db) == []
+
+    def test_returns_asset_with_open_trade(self, db):
+        _open_trade(db, asset="BTC")
+        assert list_assets_with_open_positions(db_path=db) == ["BTC"]
+
+    def test_excludes_closed_trades(self, db):
+        trade = _open_trade(db, asset="BTC")
+        close_calendar_trade(trade.id, date_close=date(2026, 6, 10), spot_close=100000.0,
+                             pnl=50.0, result="win", close_fees=1.0, db_path=db)
+        assert list_assets_with_open_positions(db_path=db) == []
+
+    def test_multiple_assets_sorted(self, db):
+        _open_trade(db, asset="ETH")
+        _open_trade(db, asset="BTC")
+        assert list_assets_with_open_positions(db_path=db) == ["BTC", "ETH"]
+
+    def test_deduplicates_same_asset(self, db):
+        _open_trade(db, asset="BTC", strike=100_000.0)
+        _open_trade(db, asset="BTC", strike=105_000.0)
+        assert list_assets_with_open_positions(db_path=db) == ["BTC"]

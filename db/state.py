@@ -190,6 +190,17 @@ def close_calendar_trade(
     return _row_to_trade(row)
 
 
+def list_assets_with_open_positions(db_path: Path = DB_PATH) -> list[str]:
+    """Return distinct asset names that have at least one open position in the DB."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT DISTINCT asset FROM calendar_trades WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY asset",
+            _OPEN_STATUSES,
+        ).fetchall()
+    return [row["asset"] for row in rows]
+
+
 def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
     """
     Reconstruct trading state for an asset from trade history.

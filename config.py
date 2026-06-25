@@ -16,7 +16,7 @@ def _load_env(path: str = ".env") -> None:
 _load_env()
 
 # Assets the bot will trade (scanner, decision engine, execution)
-ASSETS = ["BTC", "ETH"]
+ASSETS = ["ETH", "SOL"]
 
 # Assets the data collector will gather option-chain snapshots for.
 # Can be a superset of ASSETS — useful for collecting data on assets

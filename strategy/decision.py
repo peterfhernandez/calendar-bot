@@ -43,6 +43,7 @@ from db.state import (
     close_calendar_trade,
     create_calendar_trade,
     get_calendar_stats,
+    list_assets_with_open_positions,
     load_calendar_state,
     update_near_leg,
     DB_PATH,
@@ -770,9 +771,18 @@ class DecisionEngine:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _load_all_open_positions(self) -> list[dict]:
-        """Return all open positions across all configured assets."""
+        """Return all open positions across all assets — configured or legacy.
+
+        Iterates the union of config.ASSETS and any asset currently holding
+        an open position in the DB, so positions entered when an asset was
+        configured (e.g. BTC) continue to be monitored even after it is
+        removed from ASSETS.
+        """
+        assets = set(config.ASSETS) | set(
+            list_assets_with_open_positions(db_path=self._db_path)
+        )
         positions: list[dict] = []
-        for asset in config.ASSETS:
+        for asset in sorted(assets):
             state = load_calendar_state(asset, db_path=self._db_path)
             positions.extend(state["open_positions"])
         return positions
