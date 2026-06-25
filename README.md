@@ -52,6 +52,7 @@ Key architectural components:
 
 - **Portfolio tracker** (`portfolio/tracker.py`) — fetches live account equity from Deribit, tracks available cash and used margin, and feeds real deployable capital into the sizing engine. Replaces the static `BUDGET_USD` config parameter.
 - **Liquidity gate** (in `strategy/decision.py`) — two-stage filter: coarse OI check in the scanner, then a fine bid/ask size and spread check just before order submission. Both legs must pass or the trade is skipped.
+- **Per-asset threshold overrides** (`ASSET_OVERRIDES` in `config.py`) — each asset can have its own OI, spread, entry-premium, and IV-contango thresholds. SOL options are thinner than BTC/ETH and use relaxed defaults; BTC and ETH use the tighter global values. Add any asset to `ASSET_OVERRIDES` to tune its filters independently.
 - **Combo orders** (in `execution/executor.py`) — both legs submitted atomically via Deribit's combo order API, eliminating leg risk. Falls back to sequential individual legs only if the combo times out and both legs have sufficient liquidity; the fallback cancels the near leg immediately if the far leg fails.
 - **Notifications** (`alerts/notifier.py`, wired into `strategy/decision.py`) — every decision point (entry, stop, TP, roll, close, daily limit, error) fires an email and/or Telegram alert with deduplication.
 

@@ -486,3 +486,114 @@ class TestOneDayNearLeg:
             min_iv_contango=0.02, min_pop=0.01,
         )
         assert len(results) >= 1
+
+
+# ── Per-asset threshold overrides ─────────────────────────────────────────────
+
+class TestAssetOverrides:
+    """
+    Scanner must use ASSET_OVERRIDES thresholds for the matching asset when no
+    explicit call-arg override is provided.  Priority: explicit arg > asset
+    override > global default.
+    """
+
+    def _sol_snaps(self, near_oi: float = 20.0, far_oi: float = 20.0,
+                   near_iv: float = 0.82, far_iv: float = 0.806) -> list[TickerSnapshot]:
+        """SOL option chain — low OI and small IV contango typical of thinner books."""
+        return [
+            _make_snap("SOL", 7,  150, "C", mark_iv=near_iv, bid=1.0, ask=1.2,
+                       open_interest=near_oi, spot=150.0),
+            _make_snap("SOL", 30, 150, "C", mark_iv=far_iv,  bid=2.0, ask=2.4,
+                       open_interest=far_oi,  spot=150.0),
+        ]
+
+    def test_sol_passes_lower_oi_threshold(self, monkeypatch):
+        """SOL with OI=20 passes when ASSET_OVERRIDES sets MIN_OI=10 (global is 100)."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_OI_NEAR", 100)
+        monkeypatch.setattr(cfg, "MIN_OI_FAR",  100)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MIN_OI_NEAR": 10, "MIN_OI_FAR": 10}
+        })
+        cache = _make_cache(self._sol_snaps(near_oi=20, far_oi=20), spot=150.0)
+        results = scan(
+            cache, assets=["SOL"],
+            near_days_options=[7], far_days_options=[30],
+            # no explicit min_oi — defers to ASSET_OVERRIDES
+            min_iv_contango=0.01, min_pop=0.01,
+        )
+        assert len(results) >= 1, "SOL with OI=20 should pass the SOL-specific OI threshold"
+
+    def test_btc_unaffected_by_sol_override(self, monkeypatch):
+        """BTC with OI=20 still fails the global OI=100 even when a SOL override exists."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_OI_NEAR", 100)
+        monkeypatch.setattr(cfg, "MIN_OI_FAR",  100)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MIN_OI_NEAR": 10, "MIN_OI_FAR": 10}
+        })
+        snaps = [
+            _make_snap("BTC", 7,  100_000, "C", mark_iv=0.90, bid=4800, ask=5200, open_interest=20),
+            _make_snap("BTC", 30, 100_000, "C", mark_iv=0.75, bid=8200, ask=8800, open_interest=20),
+        ]
+        cache = _make_cache(snaps)
+        results = scan(
+            cache, assets=["BTC"],
+            near_days_options=[7], far_days_options=[30],
+            min_iv_contango=0.02, min_pop=0.01,
+        )
+        assert len(results) == 0, "BTC with OI=20 should still be rejected by the global threshold"
+
+    def test_explicit_arg_wins_over_asset_override(self, monkeypatch):
+        """An explicit min_oi_near call arg overrides ASSET_OVERRIDES for SOL."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MIN_OI_NEAR": 10, "MIN_OI_FAR": 10}
+        })
+        cache = _make_cache(self._sol_snaps(near_oi=20, far_oi=20), spot=150.0)
+        results = scan(
+            cache, assets=["SOL"],
+            near_days_options=[7], far_days_options=[30],
+            min_oi_near=100,   # explicit 100 overrides the SOL override of 10
+            min_oi_far=100,
+            min_iv_contango=0.01, min_pop=0.01,
+        )
+        assert len(results) == 0, "Explicit arg=100 should win over ASSET_OVERRIDES min_oi=10"
+
+    def test_sol_passes_lower_iv_contango_threshold(self, monkeypatch):
+        """SOL with 1.4% IV contango passes SOL threshold of 1% (global is 2%)."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_IV_CONTANGO", 0.02)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MIN_OI_NEAR": 10, "MIN_OI_FAR": 10, "MIN_IV_CONTANGO": 0.01}
+        })
+        # near_iv=0.820, far_iv=0.806 → contango=0.014 (1.4%) — above 1% but below 2%
+        cache = _make_cache(
+            self._sol_snaps(near_oi=20, far_oi=20, near_iv=0.820, far_iv=0.806),
+            spot=150.0,
+        )
+        results = scan(
+            cache, assets=["SOL"],
+            near_days_options=[7], far_days_options=[30],
+            min_pop=0.01,
+        )
+        assert len(results) >= 1, "1.4% contango should pass SOL's 1% IV contango threshold"
+
+    def test_btc_still_blocked_by_global_iv_contango(self, monkeypatch):
+        """BTC with 1.4% contango is still rejected by the global 2% threshold."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_IV_CONTANGO", 0.02)
+        monkeypatch.setattr(cfg, "ASSET_OVERRIDES", {
+            "SOL": {"MIN_IV_CONTANGO": 0.01}
+        })
+        snaps = [
+            _make_snap("BTC", 7,  100_000, "C", mark_iv=0.820, bid=4800, ask=5200, open_interest=600),
+            _make_snap("BTC", 30, 100_000, "C", mark_iv=0.806, bid=8200, ask=8800, open_interest=600),
+        ]
+        cache = _make_cache(snaps)
+        results = scan(
+            cache, assets=["BTC"],
+            near_days_options=[7], far_days_options=[30],
+            min_pop=0.01,
+        )
+        assert len(results) == 0, "BTC with 1.4% contango should still fail the global 2% threshold"
