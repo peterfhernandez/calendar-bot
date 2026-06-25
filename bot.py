@@ -24,6 +24,7 @@ import config
 from alerts.notifier import Notifier
 from data.chain_cache import ChainCache
 from data.deribit_feed import DeribitFeed
+from db.state import list_assets_with_open_positions
 from monitor.loop import BotLoop, configure_logging
 
 logger = logging.getLogger("bot")
@@ -63,8 +64,15 @@ async def _run(portfolio_value: float, collect: bool) -> None:
 
     cache = ChainCache()
 
+    # Include any asset with open positions so the feed subscribes to its
+    # tickers even if it has since been removed from config.ASSETS.
+    open_assets = list_assets_with_open_positions()
+    feed_assets = sorted(set(config.ASSETS) | set(open_assets))
+    if extra := sorted(set(open_assets) - set(config.ASSETS)):
+        logger.info("Feed expanded to cover assets with open positions: %s", extra)
+
     feed = DeribitFeed(
-        assets=config.ASSETS,
+        assets=feed_assets,
         paper=config.DERIBIT_PAPER,
         client_id=config.DERIBIT_CLIENT_ID,
         client_secret=config.DERIBIT_CLIENT_SECRET,
@@ -78,9 +86,10 @@ async def _run(portfolio_value: float, collect: bool) -> None:
     )
 
     logger.info(
-        "Starting calendar bot  mode=%s  assets=%s  portfolio=%.2f  collect=%s",
+        "Starting calendar bot  mode=%s  trade_assets=%s  feed_assets=%s  portfolio=%.2f  collect=%s",
         config.TRADING_MODE,
         config.ASSETS,
+        feed_assets,
         portfolio_value,
         collect,
     )

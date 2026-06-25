@@ -302,6 +302,17 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
+## Phase 8i — Feed Asset Expansion for Open Positions
+
+- [x] Update `bot.py` to expand the feed subscription beyond `config.ASSETS`
+  - [x] On startup, call `list_assets_with_open_positions()` from `db/state.py`
+  - [x] Pass the union of `config.ASSETS` and open-position assets to `DeribitFeed`
+  - [x] Log any "extra" assets added so the operator can see the expansion
+  - [x] Entry path (scanner) remains restricted to `config.ASSETS` only — no new trades entered for expanded assets
+  - [x] Fix: bot was emitting "No spot for BTC — skipping monitor" for open BTC trades when BTC was not in `ASSETS`
+
+---
+
 ## Bug Fixes
 
 - [x] **Negative-EV entry filter** — added `MIN_EV = 0.0` to `config.py`; `strategy/decision.py` now rejects any candidate with `ev_score < MIN_EV` before calling the sizer or executor. Tests: `TestNegativeEvFilter` in `tests/test_decision.py`.
