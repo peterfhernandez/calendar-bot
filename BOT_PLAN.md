@@ -230,6 +230,7 @@ Fees on Deribit are material relative to calendar spread premiums and must be ac
 #### Integration points
 
 **`core/fees.py`** — Central fee calculation module. Functions:
+
 - `leg_fee(asset, spot, qty, is_maker, option_price)` — per-leg fee in USD; applies rate, min floor, and 12.5% cap
 - `entry_fees(asset, spot, qty, near_price, far_price, via_combo)` — total entry cost; applies combo cheap-leg discount
 - `exit_fees(asset, spot, qty, near_price, far_price)` — total exit cost for closing both legs
@@ -238,6 +239,7 @@ Fees on Deribit are material relative to calendar spread premiums and must be ac
 - `round_trip_fees(asset, spot, qty, near_price, far_price, via_combo)` — entry + exit combined; used in EV
 
 **`config.py`** — New fee constants:
+
 ```python
 OPTIONS_FEE_PCT           = 0.0003   # 0.03% — taker/maker rate per leg (BTC, ETH)
 OPTIONS_MIN_FEE_BTC       = 0.0003   # minimum fee in BTC per contract
@@ -254,6 +256,7 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # 100% taker discount on cheaper combo leg
 **`strategy/sizer.py`** — True max-loss = `net_debit × qty + entry_fees + exit_fees`. Sizing enforces this against `available_cash × MAX_LOSS_PCT`, not just the raw debit.
 
 **`strategy/decision.py`** — Three fee-aware changes:
+
 1. Entry gate: reject if `net_debit × qty + entry_fees > available_cash × MAX_LOSS_PCT`
 2. Roll gate: compute `roll_fees`; only roll if estimated theta gain exceeds roll cost; close instead if uneconomic
 3. P&L reporting: log fee-inclusive net P&L at every stop, TP, and expiry close

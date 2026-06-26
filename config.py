@@ -91,6 +91,7 @@ TAKE_PROFIT_PCT = 1.50  # close if spread value > 150% of debit paid
 # Scheduler
 SCAN_INTERVAL_SEC    = 300  # 5 minutes
 MONITOR_INTERVAL_SEC = 60   # 1 minute
+CHAIN_CACHE_TTL_SEC  = 30   # seconds before a cached ticker snapshot is considered stale
 
 # Trading mode:
 #   "paper" → test.deribit.com data, dry-run execution (no orders sent)

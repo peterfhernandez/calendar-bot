@@ -64,7 +64,7 @@ async def _run(portfolio_value: float, collect: bool) -> None:
     except Exception as exc:
         logger.warning("Startup notification failed (non-fatal): %s", exc)
 
-    cache = ChainCache()
+    cache = ChainCache(ttl=config.CHAIN_CACHE_TTL_SEC)
 
     # Include any asset with open positions so the feed subscribes to its
     # tickers even if it has since been removed from config.ASSETS.
