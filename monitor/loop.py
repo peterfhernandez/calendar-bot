@@ -235,10 +235,12 @@ class BotLoop:
         try:
             status = self._engine.scan_tick()
             logger.info(
-                "scan_job complete  state=%s  open=%d  daily_pnl=%.2f  msg=%s",
+                "scan_job complete  state=%s  open=%d  daily_pnl=%.2f  "
+                "fees_paid_today=%.2f  msg=%s",
                 status.state.value,
                 status.open_positions,
                 status.daily_pnl,
+                self._engine.fees_paid_today,
                 status.message,
             )
             if self._engine.portfolio is not None:
@@ -259,10 +261,12 @@ class BotLoop:
         try:
             status = self._engine.monitor_tick()
             logger.info(
-                "monitor_job complete  state=%s  open=%d  daily_pnl=%.2f  msg=%s",
+                "monitor_job complete  state=%s  open=%d  daily_pnl=%.2f  "
+                "fees_paid_today=%.2f  msg=%s",
                 status.state.value,
                 status.open_positions,
                 status.daily_pnl,
+                self._engine.fees_paid_today,
                 status.message,
             )
         except Exception as exc:

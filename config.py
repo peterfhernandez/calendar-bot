@@ -120,6 +120,18 @@ DERIBIT_CLIENT_SECRET = DERIBIT_LIVE_CLIENT_SECRET if _LIVE else DERIBIT_TEST_CL
 
 DAILY_LOSS_LIMIT = 500    # USD — halt bot if breached; required when TRADING_MODE == "live"
 
+# Fee model (Deribit options schedule)
+# Verify against: support.deribit.com/hc/en-us/articles/25944746248989
+OPTIONS_FEE_PCT           = 0.0003   # 0.03% of underlying per leg per trade (BTC and ETH taker+maker; SOL taker)
+OPTIONS_MIN_FEE_BTC       = 0.0003   # minimum fee in BTC per contract
+OPTIONS_MIN_FEE_ETH       = 0.0003   # minimum fee in ETH per contract
+OPTIONS_MIN_FEE_SOL       = 0.0003   # minimum fee in SOL per contract (taker only; maker = 0%)
+SOL_MAKER_FEE_PCT         = 0.0      # SOL options maker fee is zero
+OPTIONS_DELIVERY_FEE_PCT  = 0.00015  # 0.015% of underlying at expiry for monthly+ options
+OPTIONS_DELIVERY_FEE_CAP  = 0.125    # delivery fee capped at 12.5% of option market value
+COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # 100% taker discount on the cheaper leg of a combo order
+# No delivery fee for daily (1d) or weekly (7d) near legs — only monthly and longer
+
 # Drain mode — set to True to stop entering new trades and disable near-leg
 # rolling.  Existing positions are monitored normally; stop-loss and
 # take-profit triggers fire as usual.  Near legs approaching expiry are closed

@@ -854,3 +854,58 @@ class TestFallbackCancelsNearOnFarFailure:
                         order_manager=mgr, portfolio_value=50_000.0,
                     )
                 )
+
+
+# ── Fee model integration ──────────────────────────────────────────────────────
+
+class TestPaperFeeSimulation:
+    """
+    In paper mode the executor must return a 'fees_paid' field in the fill dict
+    so that callers can track cumulative fee costs without network calls.
+    """
+
+    def test_paper_fill_includes_fees_paid(self):
+        """Paper mode fill dict must contain fees_paid > 0 for a BTC candidate."""
+        candidate = _make_candidate(spot=100_000.0)
+        with patch.object(config, "TRADING_MODE", "paper"):
+            exc = CalendarExecutor(client_id="", client_secret="",
+                                   portfolio_value=50_000.0)
+            result = exc.enter_spread(candidate)
+
+        assert result is not None
+        assert "fees_paid" in result, "Paper fill must include fees_paid"
+        assert result["fees_paid"] > 0.0, "fees_paid must be positive for BTC at $100k"
+
+    def test_paper_fees_match_fees_module(self):
+        """fees_paid in the paper fill must equal entry_fees() from core/fees.py."""
+        from core.fees import entry_fees
+        candidate = _make_candidate(spot=100_000.0)
+
+        with patch.object(config, "TRADING_MODE", "paper"):
+            exc = CalendarExecutor(client_id="", client_secret="",
+                                   portfolio_value=50_000.0)
+            result = exc.enter_spread(candidate)
+
+        assert result is not None
+        expected_fees = entry_fees(
+            candidate.asset, candidate.spot, result["qty"],
+            near_price=candidate.near_bid, far_price=candidate.far_ask,
+            via_combo=True,
+        )
+        assert result["fees_paid"] == pytest.approx(expected_fees, rel=1e-6)
+
+    def test_paper_fees_sol_candidate(self):
+        """fees_paid for a SOL candidate uses the taker fee rate."""
+        from core.fees import entry_fees
+        sol_candidate = _make_candidate(asset="SOL", spot=150.0, near_bid=5.0,
+                                        near_ask=6.0, far_bid=10.0, far_ask=12.0)
+        with patch.object(config, "TRADING_MODE", "paper"):
+            exc = CalendarExecutor(client_id="", client_secret="",
+                                   portfolio_value=50_000.0)
+            result = exc.enter_spread(sol_candidate)
+
+        assert result is not None
+        expected = entry_fees("SOL", 150.0, result["qty"],
+                              near_price=sol_candidate.near_bid,
+                              far_price=sol_candidate.far_ask, via_combo=True)
+        assert result["fees_paid"] == pytest.approx(expected, rel=1e-6)

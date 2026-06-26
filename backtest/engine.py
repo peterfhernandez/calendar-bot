@@ -152,6 +152,7 @@ class BacktestResult:
     total_pnl:     float = 0.0
     max_drawdown:  float = 0.0
     sharpe:        float = 0.0
+    total_fees:    float = 0.0   # sum of open_fees + close_fees across all trades
 
     def print_summary(self) -> None:
         """Print a formatted one-line summary to stdout."""
@@ -160,10 +161,11 @@ class BacktestResult:
         mdd = f"{self.max_drawdown:8.2f}"
         sh  = f"{self.sharpe:+6.2f}" if not math.isnan(self.sharpe) else "   N/A"
         tp  = f"{self.total_pnl:+8.2f}"
+        tf  = f"{self.total_fees:8.2f}"
         n   = self.total_trades
         print(
             f"  {self.regime_name:<22}  trades={n:>3}  win={wr}  "
-            f"avg_pnl={ap}  total={tp}  mdd={mdd}  sharpe={sh}"
+            f"avg_pnl={ap}  total={tp}  fees={tf}  mdd={mdd}  sharpe={sh}"
         )
 
 
@@ -276,6 +278,10 @@ class BacktestEngine:
         n            = len(pnls)
         total_pnl    = sum(pnls) if pnls else 0.0
         wins         = sum(1 for p in pnls if p > 0)
+        total_fees   = sum(
+            (t.get("open_fees") or 0.0) + (t.get("close_fees") or 0.0)
+            for t in trades
+        )
 
         return BacktestResult(
             regime_name  = regime_name,
@@ -287,6 +293,7 @@ class BacktestEngine:
             total_pnl    = total_pnl,
             max_drawdown = max_drawdown,
             sharpe       = sharpe,
+            total_fees   = total_fees,
         )
 
 

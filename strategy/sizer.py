@@ -19,6 +19,7 @@ import math
 from dataclasses import dataclass
 
 import config
+from core.fees import round_trip_fees
 from strategy.scanner import CalendarCandidate
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,9 @@ _STRIKE_CORRELATION_PCT = 0.05   # ±5% of strike
 @dataclass
 class SizeResult:
     """Output from size_candidate."""
-    qty:    float   # approved quantity (0.0 = blocked)
-    reason: str     # human-readable explanation
+    qty:            float   # approved quantity (0.0 = blocked)
+    reason:         str     # human-readable explanation
+    estimated_fees: float = 0.0  # estimated round-trip fees in USD (entry + exit)
 
 
 def size_candidate(
@@ -136,7 +138,24 @@ def size_candidate(
             ),
         )
 
-    raw_qty = max_loss_usd / candidate.net_debit
+    # ── Fee-aware sizing ──────────────────────────────────────────────────────
+    # True max-loss per trade = net_debit × qty + round_trip_fees(qty).
+    # Since fees scale linearly with qty: fee_per_unit = round_trip_fees(1 contract).
+    # Solve: (net_debit + fee_per_unit) × qty ≤ max_loss_usd
+    try:
+        fee_per_unit = round_trip_fees(
+            candidate.asset,
+            candidate.spot,
+            qty=1.0,
+            near_price=candidate.near_bid,
+            far_price=candidate.far_ask,
+            via_combo=True,
+        )
+    except Exception:
+        fee_per_unit = 0.0
+
+    effective_cost_per_unit = candidate.net_debit + fee_per_unit
+    raw_qty = max_loss_usd / effective_cost_per_unit if effective_cost_per_unit > 0 else 0.0
 
     # Round down to one decimal place (Deribit minimum increment is 0.1 for options)
     qty = max(0.0, math.floor(raw_qty * 10) / 10)
@@ -156,14 +175,18 @@ def size_candidate(
             ),
         )
 
+    estimated_fees = fee_per_unit * qty
     logger.debug(
         "Sized %s %s strike=%.0f: qty=%.1f  "
-        "(max_loss_usd=%.2f, net_debit=%.2f, risk_in_use=%.2f, risk_cap=%.2f)",
+        "(max_loss_usd=%.2f, net_debit=%.2f, fee_per_unit=%.2f, est_fees=%.2f, "
+        "risk_in_use=%.2f, risk_cap=%.2f)",
         candidate.asset, candidate.option_type, candidate.strike,
-        qty, max_loss_usd, candidate.net_debit, risk_in_use, max_total_risk_usd,
+        qty, max_loss_usd, candidate.net_debit, fee_per_unit, estimated_fees,
+        risk_in_use, max_total_risk_usd,
     )
     return SizeResult(
         qty=qty,
-        reason=f"Approved: qty={qty:.1f} at net_debit={candidate.net_debit:.2f}",
+        reason=f"Approved: qty={qty:.1f} at net_debit={candidate.net_debit:.2f} est_fees={estimated_fees:.2f}",
+        estimated_fees=estimated_fees,
     )
 
