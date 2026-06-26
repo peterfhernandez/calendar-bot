@@ -438,9 +438,15 @@ async def _async_enter_spread(
 
     # ── Paper mode: dry-run — no API calls ───────────────────────────────────
     if config.TRADING_MODE == "paper":
+        from core.fees import entry_fees as _entry_fees
+        paper_fees = _entry_fees(
+            candidate.asset, candidate.spot, amount,
+            near_price=candidate.near_bid, far_price=candidate.far_ask,
+            via_combo=True,
+        )
         logger.info(
-            "[PAPER] Simulated fill: near=%.4f  far=%.4f  qty=%.4f",
-            candidate.near_bid, candidate.far_ask, amount,
+            "[PAPER] Simulated fill: near=%.4f  far=%.4f  qty=%.4f  fees=%.2f",
+            candidate.near_bid, candidate.far_ask, amount, paper_fees,
         )
         return {
             "near_prem":       candidate.near_bid,
@@ -454,6 +460,7 @@ async def _async_enter_spread(
             "near_fill_price": near_limit,
             "far_fill_price":  far_limit,
             "via_combo":       False,
+            "fees_paid":       paper_fees,
         }
 
     # ── Live / test: try combo order first ────────────────────────────────────

@@ -54,6 +54,8 @@ class PortfolioState:
     open_position_count: int
     deribit_margin_usd:  float   # initial_margin from Deribit REST, converted to USD
     last_refresh:        Optional[float]  # epoch seconds of last successful refresh
+    fees_paid_today:     float = 0.0   # sum of open_fees + close_fees for trades today
+    fees_paid_total:     float = 0.0   # sum of all open_fees + close_fees across all trades
 
 
 class PortfolioTracker:
@@ -105,6 +107,8 @@ class PortfolioTracker:
         self._deribit_margin_usd:  float = 0.0
         self._open_position_count: int   = 0
         self._last_refresh:        float | None = None
+        self._fees_paid_today:     float = 0.0
+        self._fees_paid_total:     float = 0.0
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -154,6 +158,8 @@ class PortfolioTracker:
         self._used_margin         = self._calc_used_margin()
         self._realized_pnl_today  = self._calc_realized_pnl_today()
         self._open_position_count = self._count_open_positions()
+        self._fees_paid_today     = self._calc_fees_paid_today()
+        self._fees_paid_total     = self._calc_fees_paid_total()
 
         # ── Deribit REST API ──────────────────────────────────────────────────
         has_credentials = bool(self._client_id and self._client_secret)
@@ -184,6 +190,8 @@ class PortfolioTracker:
             open_position_count = self._open_position_count,
             deribit_margin_usd  = self._deribit_margin_usd,
             last_refresh        = self._last_refresh,
+            fees_paid_today     = self._fees_paid_today,
+            fees_paid_total     = self._fees_paid_total,
         )
 
     # ── Portfolio view ────────────────────────────────────────────────────────
@@ -199,6 +207,8 @@ class PortfolioTracker:
             f"  Used Margin (DB)  : ${self._used_margin:>12,.2f}",
             f"  Unrealized P&L    : ${self._unrealized_pnl:>+12,.2f}",
             f"  Realized P&L Today: ${self._realized_pnl_today:>+12,.2f}",
+            f"  Fees Paid Today   : ${self._fees_paid_today:>12,.2f}",
+            f"  Fees Paid Total   : ${self._fees_paid_total:>12,.2f}",
             f"  Open Positions    : {self._open_position_count}",
             "─" * 52,
         ]
@@ -308,6 +318,29 @@ class PortfolioTracker:
                 "SELECT COUNT(*) AS cnt FROM calendar_trades WHERE result = 'Open'"
             ).fetchone()
         return int(row["cnt"])
+
+    def _calc_fees_paid_today(self) -> float:
+        """Sum of open_fees + close_fees for trades opened or closed today (UTC)."""
+        today = date.today().isoformat()
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(open_fees + close_fees), 0.0) AS total
+                FROM calendar_trades
+                WHERE date_open = ? OR date_close = ?
+                """,
+                (today, today),
+            ).fetchone()
+        return float(row["total"])
+
+    def _calc_fees_paid_total(self) -> float:
+        """Sum of open_fees + close_fees across all trades."""
+        with get_connection(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(open_fees + close_fees), 0.0) AS total "
+                "FROM calendar_trades"
+            ).fetchone()
+        return float(row["total"])
 
     # ── Reconciliation ────────────────────────────────────────────────────────
 

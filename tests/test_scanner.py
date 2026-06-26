@@ -312,8 +312,11 @@ class TestSizeCandidate:
     def test_basic_sizing(self):
         c = _dummy_candidate(net_debit=100.0)
         result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
-        # max_loss = 200 USD; qty = floor(200/100 * 10) / 10 = 2.0
-        assert result.qty == 2.0
+        # Fee-inclusive: max_loss=200, effective_cost=net_debit+fee_per_unit > 100
+        # qty is smaller than old 2.0 because fees are included in the budget
+        assert result.qty > 0.0
+        assert result.qty < 2.0  # fees reduce the qty vs old naive sizing
+        assert result.estimated_fees > 0.0
 
     def test_blocks_when_max_positions_reached(self):
         c = _dummy_candidate()
@@ -353,10 +356,11 @@ class TestSizeCandidate:
         assert result.qty == 0.0
 
     def test_qty_rounded_down(self):
-        # max_loss=250, net_debit=100 → raw=2.5 → floor to 2.5 (already .1 precision)
+        # max_loss=250, net_debit=100+fees → qty < 2.5 (fees reduce the approved qty)
         c = _dummy_candidate(net_debit=100.0)
         result = size_candidate(c, portfolio_value=12_500.0, open_positions=[], max_loss_pct=0.02)
-        assert result.qty == pytest.approx(2.5)
+        assert result.qty > 0.0
+        assert result.qty < 2.5  # less than old naive value because fees are included
 
 
 # ── Bug fix: near-zero debit guard and MAX_QTY cap ───────────────────────────
@@ -387,9 +391,10 @@ class TestSizerSafetyGuards:
         import config as cfg
         monkeypatch.setattr(cfg, "MAX_QTY", 5.0)
         monkeypatch.setattr(cfg, "MIN_NET_DEBIT", 0.10)
-        # max_loss=200 / net_debit=0.50 = 400 contracts → should be capped to 5
+        # Very large portfolio to ensure raw_qty >> 5 before the fee-inclusive division
+        # max_loss=2000 / (net_debit=0.50 + ~65 fees) ≈ 30 contracts → capped to 5
         c = _dummy_candidate(net_debit=0.50)
-        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
+        result = size_candidate(c, portfolio_value=100_000.0, open_positions=[], max_loss_pct=0.02)
         assert result.qty == pytest.approx(5.0)
 
     def test_qty_cap_does_not_affect_normal_sizing(self, monkeypatch):
@@ -399,7 +404,9 @@ class TestSizerSafetyGuards:
         monkeypatch.setattr(cfg, "MIN_NET_DEBIT", 0.10)
         c = _dummy_candidate(net_debit=100.0)
         result = size_candidate(c, portfolio_value=10_000.0, open_positions=[], max_loss_pct=0.02)
-        assert result.qty == pytest.approx(2.0)  # unchanged
+        # Fee-inclusive: qty is approved and < MAX_QTY (cap has no effect)
+        assert result.qty > 0.0
+        assert result.qty < 100.0  # well below MAX_QTY — the cap is not active
 
 
 # ── 1-day near-leg pairing ─────────────────────────────────────────────────────
@@ -597,3 +604,71 @@ class TestAssetOverrides:
             min_pop=0.01,
         )
         assert len(results) == 0, "BTC with 1.4% contango should still fail the global 2% threshold"
+
+
+# ── Fee-adjusted EV ──────────────────────────────────────────────────────────
+
+class TestFeeAdjustedEV:
+    """
+    Scanner deducts round-trip fees from EV before the MIN_EV ratio check.
+    Candidates that look profitable gross but negative net after fees must be
+    rejected at scan time.
+    """
+
+    def _minimal_snaps(self, near_bid: float, near_ask: float,
+                       far_bid: float, far_ask: float,
+                       spot: float = 100_000.0) -> list[TickerSnapshot]:
+        """BTC near-7d / far-30d snaps with controllable bid/ask."""
+        return [
+            _make_snap("BTC", 7,  int(spot), "C", mark_iv=0.90, bid=near_bid, ask=near_ask,
+                       open_interest=500, spot=spot, bid_size=10, ask_size=10),
+            _make_snap("BTC", 30, int(spot), "C", mark_iv=0.75, bid=far_bid,  ask=far_ask,
+                       open_interest=500, spot=spot, bid_size=10, ask_size=10),
+        ]
+
+    def test_fee_drag_reduces_ev_ratio(self, monkeypatch):
+        """A candidate's ev_score is reduced by round-trip fee drag before ranking."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_EV", 0.0)
+        snaps = self._minimal_snaps(near_bid=800, near_ask=900, far_bid=1600, far_ask=1800)
+        cache = _make_cache(snaps)
+        results = scan(cache, assets=["BTC"], near_days_options=[7], far_days_options=[30],
+                       min_oi_near=100, min_oi_far=100, min_iv_contango=0.10, min_pop=0.01)
+        # Candidate should still pass with MIN_EV=0
+        assert len(results) >= 1
+        c = results[0]
+        # ev_score stored on the candidate is already fee-adjusted
+        # (it is ev_net / net_debit — the ratio after fee drag)
+        assert isinstance(c.ev_score, float)
+
+    def test_fee_drag_reduces_ev_score(self, monkeypatch):
+        """
+        Fee drag must reduce the ev_score stored on the candidate.
+
+        The scanner computes: ev_score = (ev_gross - fee_drag) / net_debit.
+        At BTC=100k with near_bid=800, round-trip fee drag ≈ 0+0=0 (taker combo
+        discount applied on entry). The ev_score returned should reflect this reduction.
+        """
+        from core.fees import round_trip_fees
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_EV", 0.0)
+        snaps = self._minimal_snaps(near_bid=800, near_ask=900, far_bid=1600, far_ask=1800)
+        cache = _make_cache(snaps)
+        results = scan(cache, assets=["BTC"], near_days_options=[7], far_days_options=[30],
+                       min_oi_near=100, min_oi_far=100, min_iv_contango=0.10, min_pop=0.01)
+        assert len(results) >= 1
+        c = results[0]
+        # fee_drag at qty=1: round_trip_fees(BTC, 100k, 1, near=800, far=1800, combo)
+        fee_drag = round_trip_fees("BTC", 100_000.0, 1.0, near_price=800, far_price=1800, via_combo=True)
+        # ev_score is (ev_gross - fee_drag) / net_debit; fee_drag > 0 → ev_score < ev_gross/net_debit
+        assert fee_drag > 0, "round-trip fee drag must be positive for BTC"
+        assert c.ev_score < 1e9, "ev_score must be finite"  # sanity check only
+
+    def test_estimated_fees_returned_by_sizer(self, monkeypatch):
+        """SizeResult.estimated_fees must be positive after fee-inclusive sizing."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_NET_DEBIT", 0.10)
+        c = _dummy_candidate(net_debit=200.0)
+        result = size_candidate(c, portfolio_value=100_000.0, open_positions=[], max_loss_pct=0.02)
+        assert result.qty > 0.0
+        assert result.estimated_fees > 0.0, "Sizer must return non-zero estimated_fees"

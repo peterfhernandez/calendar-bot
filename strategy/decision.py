@@ -37,6 +37,7 @@ from typing import Protocol, runtime_checkable
 import config
 from alerts.notifier import Notifier
 from core.calendar_engine import check_calendar_status
+from core.fees import entry_fees, exit_fees, roll_fees as compute_roll_fees
 from data.chain_cache import ChainCache
 from db.state import (
     CalendarTrade,
@@ -209,6 +210,7 @@ class DecisionEngine:
         self._state           = BotState.IDLE
         self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
         self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
+        self._fees_paid_today: float = 0.0  # cumulative fees paid today (entry + exit + roll)
         self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
         self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
 
@@ -230,6 +232,11 @@ class DecisionEngine:
     def portfolio(self) -> PortfolioTracker | None:
         """The attached PortfolioTracker, or None if not configured."""
         return self._portfolio
+
+    @property
+    def fees_paid_today(self) -> float:
+        """Cumulative fees paid today in USD (entry + exit + roll)."""
+        return self._fees_paid_today
 
     # ── Public tick methods ───────────────────────────────────────────────────
 
@@ -507,6 +514,21 @@ class DecisionEngine:
         expiry_near = _instrument_expiry_label(candidate.near_instrument)
         expiry_far  = _instrument_expiry_label(candidate.far_instrument)
 
+        # Compute entry fees (use fill prices if available, else candidate prices).
+        via_combo = fill.get("via_combo", False)
+        try:
+            open_fees_usd = entry_fees(
+                candidate.asset,
+                candidate.spot,
+                fill["qty"],
+                near_price=fill.get("near_prem", candidate.near_bid),
+                far_price=fill.get("far_prem",  candidate.far_ask),
+                via_combo=via_combo,
+            )
+        except Exception:
+            open_fees_usd = 0.0
+        self._fees_paid_today += open_fees_usd
+
         trade = create_calendar_trade(
             asset=candidate.asset,
             date_open=date.today(),
@@ -524,12 +546,13 @@ class DecisionEngine:
             broker=config.TRADING_MODE,
             near_instrument=candidate.near_instrument,
             far_instrument=candidate.far_instrument,
+            open_fees=open_fees_usd,
             db_path=self._db_path,
         )
         logger.info(
-            "ENTER filled: trade_id=%d  %s %s strike=%.0f  qty=%.1f  debit=%.4f",
+            "ENTER filled: trade_id=%d  %s %s strike=%.0f  qty=%.1f  debit=%.4f  fees=%.2f",
             trade.id, trade.asset, trade.option_type, trade.strike,
-            trade.qty, trade.net_debit,
+            trade.qty, trade.net_debit, open_fees_usd,
         )
         if self._notifier:
             self._notifier.notify_entry(
@@ -650,6 +673,7 @@ class DecisionEngine:
         trade_id = pos["trade_id"]
         net_debit = pos.get("net_debit", 0.0)
         qty = pos.get("qty", 1.0)
+        asset = pos.get("asset", "BTC")
 
         close_credit = self._executor.close_spread(pos)
         if close_credit is None:
@@ -658,11 +682,24 @@ class DecisionEngine:
 
         if spread_value is not None:
             # spread_value is already qty-weighted; net_debit is per-unit
-            pnl = spread_value - net_debit * qty
+            gross_pnl = spread_value - net_debit * qty
         else:
-            pnl = close_credit - net_debit * qty
+            gross_pnl = close_credit - net_debit * qty
+
+        # Compute exit fees for fee-inclusive net P&L logging.
+        try:
+            near_price = pos.get("near_prem", 0.0) or 0.0
+            far_price  = pos.get("far_prem",  0.0) or 0.0
+            close_fees_usd = exit_fees(asset, spot, qty, near_price, far_price)
+        except Exception:
+            close_fees_usd = 0.0
+        self._fees_paid_today += close_fees_usd
+
+        open_fees_usd = pos.get("open_fees", 0.0) or 0.0
+        net_pnl = gross_pnl - close_fees_usd  # open_fees already deducted at entry
+
+        pnl = gross_pnl  # P&L stored in DB is gross (pre-close-fees); fees tracked separately
         result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
-        # Override label to reflect close reason when it's explicit
         if "Take-profit" in reason:
             result = "Win (Auto TP)"
         elif "Stop-loss" in reason:
@@ -675,12 +712,16 @@ class DecisionEngine:
             pnl=pnl,
             result=result,
             notes=reason,
+            close_fees=close_fees_usd,
             db_path=self._db_path,
         )
         self._today_pnl += pnl
         logger.info(
-            "CLOSE trade_id=%d  pnl=%.2f  reason=%s  daily_pnl=%.2f",
-            trade_id, pnl, reason, self._today_pnl,
+            "CLOSE trade_id=%d  gross_pnl=%.2f  close_fees=%.2f  net_pnl=%.2f  "
+            "open_fees=%.2f  total_fees=%.2f  reason=%s  daily_pnl=%.2f",
+            trade_id, gross_pnl, close_fees_usd, net_pnl,
+            open_fees_usd, open_fees_usd + close_fees_usd,
+            reason, self._today_pnl,
         )
         if self._notifier:
             try:
@@ -729,15 +770,56 @@ class DecisionEngine:
             )
             return False
 
+        # Roll fee gate: only roll if the expected theta gain exceeds the roll cost.
+        # Theta gain ≈ premium collected on the new near leg (new_near_bid × qty).
+        # If the roll fees eat up most or all of the gain, close instead.
+        qty_pos = pos.get("qty", 1.0)
+        try:
+            near_price_now = pos.get("near_prem", new_candidate.near_bid) or new_candidate.near_bid
+            roll_cost = compute_roll_fees(
+                pos.get("asset", new_candidate.asset),
+                spot,
+                qty_pos,
+                near_price=near_price_now,
+                new_near_price=new_candidate.near_bid,
+            )
+            theta_gain = new_candidate.near_bid * qty_pos
+            if theta_gain <= roll_cost:
+                logger.info(
+                    "Roll: fee gate blocked — theta_gain=%.4f <= roll_cost=%.4f  "
+                    "(trade_id=%d) — closing instead",
+                    theta_gain, roll_cost, pos.get("trade_id"),
+                )
+                return False
+            logger.debug(
+                "Roll: fee gate passed — theta_gain=%.4f  roll_cost=%.4f",
+                theta_gain, roll_cost,
+            )
+        except Exception as exc:
+            logger.debug("Roll fee gate skipped (error: %s)", exc)
+
         success = self._executor.roll_near_leg(pos, new_candidate)
         if success:
             trade_id        = pos["trade_id"]
             new_near_instr  = new_candidate.near_instrument
             new_expiry_near = _instrument_expiry_label(new_near_instr)
 
+            # Track roll fees
+            try:
+                roll_fee_usd = compute_roll_fees(
+                    pos.get("asset", new_candidate.asset),
+                    spot,
+                    qty_pos,
+                    near_price=pos.get("near_prem", new_candidate.near_bid) or new_candidate.near_bid,
+                    new_near_price=new_candidate.near_bid,
+                )
+                self._fees_paid_today += roll_fee_usd
+            except Exception:
+                roll_fee_usd = 0.0
+
             logger.info(
-                "ROLL trade_id=%d  → new near=%s",
-                trade_id, new_near_instr,
+                "ROLL trade_id=%d  → new near=%s  roll_fees=%.2f",
+                trade_id, new_near_instr, roll_fee_usd,
             )
 
             # Fix 1: persist the new near leg to the DB so _days_left reads fresh data.

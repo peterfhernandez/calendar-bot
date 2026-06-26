@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import config
 from config import RISK_FREE_RATE
 from core.calendar_engine import find_breakevens, pnl_at_near_expiry
+from core.fees import round_trip_fees
 from data.chain_cache import ChainCache
 from data.deribit_feed import TickerSnapshot
 
@@ -249,7 +250,25 @@ def _eval_candidate(
         return None
 
     ev = _ev_score(spot, strike, near_dte, far_dte, near_iv, net_debit, opt_type, pop)
-    ev_ratio = ev / net_debit if net_debit > 0 else 0.0
+
+    # Deduct round-trip fee drag before computing the EV ratio.
+    # Candidates that are profitable before fees but negative after are rejected
+    # at scan time rather than wasting sizer and executor calls.
+    try:
+        fee_drag = round_trip_fees(
+            asset, spot, qty=1.0,
+            near_price=near_bid, far_price=far_ask,
+            via_combo=True,
+        )
+    except Exception:
+        fee_drag = 0.0
+
+    ev_net = ev - fee_drag
+    logger.debug(
+        "%s %s strike=%.0f  ev_gross=%.4f  fee_drag=%.4f  ev_net=%.4f",
+        asset, opt_type, strike, ev, fee_drag, ev_net,
+    )
+    ev_ratio = ev_net / net_debit if net_debit > 0 else 0.0
 
     return CalendarCandidate(
         asset=asset,
