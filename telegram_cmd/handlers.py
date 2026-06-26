@@ -14,9 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from telegram import Update
-from telegram.ext import CallbackContext
-
 import config
 from db.state import (
     get_open_trades,
@@ -26,6 +23,8 @@ from db.state import (
 )
 
 if TYPE_CHECKING:
+    from telegram import Update
+    from telegram.ext import CallbackContext
     from data.chain_cache import ChainCache
     from strategy.decision import DecisionEngine
 

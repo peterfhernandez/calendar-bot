@@ -9,6 +9,9 @@ the data collector.
 
 Security: every incoming update is validated against config.TELEGRAM_CHAT.
 Messages from any other chat ID are silently dropped — no reply is sent.
+
+Telegram imports are lazy (inside methods) so the bot starts normally
+even when python-telegram-bot is not installed and TELEGRAM_TOKEN is unset.
 """
 
 from __future__ import annotations
@@ -16,9 +19,7 @@ from __future__ import annotations
 import functools
 import logging
 from pathlib import Path
-
-from telegram import Update
-from telegram.ext import Application, CommandHandler, CallbackContext
+from typing import TYPE_CHECKING
 
 import config
 from data.chain_cache import ChainCache
@@ -26,13 +27,17 @@ from db.state import DB_PATH
 from strategy.decision import DecisionEngine
 from telegram_cmd import handlers
 
+if TYPE_CHECKING:
+    from telegram import Update
+    from telegram.ext import Application, CallbackContext
+
 logger = logging.getLogger(__name__)
 
 
 def _require_authorized_chat(handler_fn):
     """Decorator: silently drop updates from chats other than TELEGRAM_CHAT."""
     @functools.wraps(handler_fn)
-    async def wrapper(update: Update, context: CallbackContext, **kwargs):
+    async def wrapper(update, context, **kwargs):
         if not config.TELEGRAM_CHAT:
             return
         try:
@@ -77,6 +82,8 @@ class TelegramCommandListener:
         self._app: Application | None = None
 
     def _build_app(self) -> Application:
+        from telegram.ext import Application, CommandHandler
+
         app = Application.builder().token(config.TELEGRAM_TOKEN).build()
 
         engine  = self._engine
@@ -85,35 +92,35 @@ class TelegramCommandListener:
 
         # Wrap each handler to inject dependencies and enforce chat security.
         @_require_authorized_chat
-        async def cmd_positions(update: Update, context: CallbackContext):
+        async def cmd_positions(update, context):
             await handlers.handle_positions(update, context, cache, db_path)
 
         @_require_authorized_chat
-        async def cmd_closed_today(update: Update, context: CallbackContext):
+        async def cmd_closed_today(update, context):
             await handlers.handle_closed_today(update, context, db_path)
 
         @_require_authorized_chat
-        async def cmd_new_today(update: Update, context: CallbackContext):
+        async def cmd_new_today(update, context):
             await handlers.handle_new_today(update, context, db_path)
 
         @_require_authorized_chat
-        async def cmd_status(update: Update, context: CallbackContext):
+        async def cmd_status(update, context):
             await handlers.handle_status(update, context, engine)
 
         @_require_authorized_chat
-        async def cmd_portfolio(update: Update, context: CallbackContext):
+        async def cmd_portfolio(update, context):
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         @_require_authorized_chat
-        async def cmd_stop_bot(update: Update, context: CallbackContext):
+        async def cmd_stop_bot(update, context):
             await handlers.handle_stop_bot(update, context, engine)
 
         @_require_authorized_chat
-        async def cmd_start_bot(update: Update, context: CallbackContext):
+        async def cmd_start_bot(update, context):
             await handlers.handle_start_bot(update, context, engine)
 
         @_require_authorized_chat
-        async def cmd_start_drain(update: Update, context: CallbackContext):
+        async def cmd_start_drain(update, context):
             await handlers.handle_start_drain(update, context, engine)
 
         app.add_handler(CommandHandler("positions",    cmd_positions))
