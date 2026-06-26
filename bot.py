@@ -27,7 +27,6 @@ from data.chain_cache import ChainCache
 from data.deribit_feed import DeribitFeed
 from db.state import list_assets_with_open_positions
 from monitor.loop import BotLoop, configure_logging
-from telegram_cmd.listener import TelegramCommandListener
 
 logger = logging.getLogger("bot")
 
@@ -100,8 +99,9 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
         collect,
     )
 
-    listener: TelegramCommandListener | None = None
+    listener = None
     if config.TELEGRAM_TOKEN:
+        from telegram_cmd.listener import TelegramCommandListener
         listener = TelegramCommandListener(
             engine=loop.engine,
             cache=cache,
