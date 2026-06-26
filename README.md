@@ -106,11 +106,14 @@ The bot accepts incoming commands from the same Telegram chat it uses for outgoi
 | `/new_today` | Count of positions opened since midnight UTC and their instrument names |
 | `/status` | Trading mode, drain mode on/off, bot paused/running, uptime, open position count, daily PnL |
 | `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, near and far IV, near and far OI |
+| `/help` | Lists every available command with a one-line description |
 | `/stop_bot` | Pauses scan and monitor ticks; the feed and listener remain alive; positions are not closed |
 | `/start_bot` | Resumes normal scanning and monitoring |
 | `/start_drain` | Activates drain mode at runtime — no new entries or rolls; existing positions close at stop/TP/expiry |
 
 `/stop_bot` and `/start_bot` pause and resume the decision engine without restarting the process, so the listener stays connected throughout.
+
+Typing `/` in the Telegram chat will show a suggestion menu listing all commands — this is populated automatically when the bot starts via Telegram's `setMyCommands` API, with no manual BotFather setup required.
 
 The bot can also be started in drain mode from the command line with `python bot.py --drain`, which is equivalent to setting the `DRAIN_MODE` env var.
 

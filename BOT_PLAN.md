@@ -191,7 +191,7 @@ The `alerts/notifier.py` module is implemented but not wired into the live execu
 - Add a `scratch/scratch_notify_live.py` that sends a test alert via the real SMTP/Telegram config
 - Add a startup self-test in `bot.py` that sends a "Bot started" notification; if it fails, log a warning but do not abort
 
-### 13. Telegram Command Listener *(new — light effort)*
+### 13. Telegram Command Listener *(new — light effort)* [Phases 9a + 9b]
 
 The bot already sends outgoing Telegram notifications via `alerts/notifier.py`. This phase adds incoming command handling so the operator can query and control the bot from their phone via the same Telegram chat.
 
@@ -224,7 +224,13 @@ Rather than killing and restarting the OS process (which would take the listener
 | `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, IV (near and far legs), OI (near and far legs) |
 | `/stop_bot` | Pauses scan/monitor ticks; confirms to chat; feed and listener remain alive |
 | `/start_bot` | Resumes scan/monitor ticks; confirms to chat |
+| `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, near and far IV, near and far OI |
+| `/help` | Lists every available command with a one-line description |
 | `/start_drain` | Sets `DRAIN_MODE = True` at runtime; confirms; no new entries or rolls from this point |
+
+**Telegram command menu (`setMyCommands`)**
+
+When a user types `/` in the chat, Telegram shows a suggestion list only if the bot has registered its commands via the `setMyCommands` Bot API method. This registration is stored on Telegram's servers and persists across bot restarts. `listener.py` calls `await app.bot.set_my_commands(COMMAND_REGISTRY)` once during `start()`, pushing the full command list to Telegram automatically — no manual BotFather setup required. The `COMMAND_REGISTRY` is the single source of truth used by both `set_my_commands` and the `/help` handler, so the menu and the help text are always in sync.
 
 **New file:** `telegram_cmd/` package
 
@@ -615,6 +621,7 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the 
 | **Notification wiring** | **0.5–1 day** | **Done** |
 | **test.deribit.com wiring** | **0.5 day** | **Done** |
 | **Trading fee integration** | **1–2 days** | **Done** |
-| **Telegram command listener** | **0.5–1 day** | **Done** |
+| **Telegram command listener (9a)** | **0.5–1 day** | **Not started** |
+| **Telegram command menu + /help (9b)** | **0.5 day** | **Not started** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~4–6 days** | |

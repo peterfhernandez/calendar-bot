@@ -330,7 +330,7 @@ Deribit charges **0.03% of the underlying index price** per leg per trade (min 0
 
 ---
 
-## Phase 9 — Telegram Command Listener
+## Phase 9a — Telegram Command Listener
 
 Adds incoming command handling so the operator can query and control the bot from their phone via the same Telegram chat already used for outgoing notifications.
 
@@ -385,6 +385,34 @@ Adds incoming command handling so the operator can query and control the bot fro
   - [x] Starts `TelegramCommandListener` with a real token; prints each received command and its reply
   - [x] Aborts if `TRADING_MODE == "live"`
   - [x] Run with `python -m scratch.scratch_telegram_cmd` from the repo root
+
+---
+
+## Phase 9b — Telegram Command Menu and /help
+
+Telegram can display a suggestion menu (the list of commands that pops up when you type `/` in the chat) and a `/help` command that prints all available commands with descriptions. Both are driven by the same command registry so the menu and the help text are always in sync.
+
+### How the Telegram command menu works
+
+When a user types `/` in a chat with a bot, Telegram shows a suggestion list only if the bot has registered its commands via the `setMyCommands` Bot API method. This registration is stored on Telegram's servers and persists across bot restarts. `python-telegram-bot` exposes this as `await application.bot.set_my_commands(commands)`.
+
+The best approach is to call `set_my_commands()` once at startup inside `listener.py` so the menu is always in sync with whatever commands are registered — no manual BotFather steps required (though BotFather's `/setcommands` would also work as a one-time manual alternative).
+
+### Changes to `telegram_cmd/listener.py`
+
+- [ ] Define a module-level `COMMAND_REGISTRY` list of `(command, description)` tuples covering all implemented commands
+- [ ] In `TelegramCommandListener.start()`, call `await self._app.bot.set_my_commands(COMMAND_REGISTRY)` after initialising the application — this pushes the command list to Telegram's servers so the `/` menu is populated
+- [ ] Register `/help` handler alongside the other command handlers
+
+### Changes to `telegram_cmd/handlers.py`
+
+- [ ] `handle_help(update, context)` — iterates `COMMAND_REGISTRY` and replies with a formatted list: `/<command> — <description>` on each line
+
+### Tests
+
+- [ ] Add to `tests/test_telegram_cmd.py`
+  - [ ] Verify `handle_help` reply contains every command in `COMMAND_REGISTRY`
+  - [ ] Verify `set_my_commands` is called during `start()` with the full registry (mock the bot)
 
 ---
 
