@@ -400,19 +400,19 @@ The best approach is to call `set_my_commands()` once at startup inside `listene
 
 ### Changes to `telegram_cmd/listener.py`
 
-- [ ] Define a module-level `COMMAND_REGISTRY` list of `(command, description)` tuples covering all implemented commands
-- [ ] In `TelegramCommandListener.start()`, call `await self._app.bot.set_my_commands(COMMAND_REGISTRY)` after initialising the application — this pushes the command list to Telegram's servers so the `/` menu is populated
-- [ ] Register `/help` handler alongside the other command handlers
+- [x] Define a module-level `COMMAND_REGISTRY` list of `(command, description)` tuples covering all implemented commands
+- [x] In `TelegramCommandListener.start()`, call `await self._app.bot.set_my_commands(COMMAND_REGISTRY)` after initialising the application — this pushes the command list to Telegram's servers so the `/` menu is populated
+- [x] Register `/help` handler alongside the other command handlers
 
 ### Changes to `telegram_cmd/handlers.py`
 
-- [ ] `handle_help(update, context)` — iterates `COMMAND_REGISTRY` and replies with a formatted list: `/<command> — <description>` on each line
+- [x] `handle_help(update, context)` — iterates `COMMAND_REGISTRY` and replies with a formatted list: `/<command> — <description>` on each line
 
 ### Tests
 
-- [ ] Add to `tests/test_telegram_cmd.py`
-  - [ ] Verify `handle_help` reply contains every command in `COMMAND_REGISTRY`
-  - [ ] Verify `set_my_commands` is called during `start()` with the full registry (mock the bot)
+- [x] Add to `tests/test_telegram_cmd.py`
+  - [x] Verify `handle_help` reply contains every command in `COMMAND_REGISTRY`
+  - [x] Verify `set_my_commands` is called during `start()` with the full registry (mock the bot)
 
 ---
 
