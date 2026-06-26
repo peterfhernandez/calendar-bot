@@ -621,8 +621,15 @@ class DecisionEngine:
         status, sv, pct, msg = check_calendar_status(
             spot, iv, near_days_left, far_days_left, pos, market_sv=market_sv
         )
-        logger.info("trade_id=%d  %s%s", trade_id, msg,
-                    "" if market_sv is not None else "  [B-S fallback]")
+        logger.info(
+            "trade_id=%d  %s  [%s %s %s→%s]%s",
+            trade_id, msg,
+            pos.get("asset", "?"),
+            int(pos.get("strike", 0)),
+            pos.get("expiry_near", "?"),
+            pos.get("expiry_far", "?"),
+            "" if market_sv is not None else "  [B-S fallback]",
+        )
 
         if status == "stop":
             return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv), 0.0
