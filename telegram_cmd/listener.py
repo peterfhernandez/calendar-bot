@@ -33,6 +33,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for commands — drives both set_my_commands() and /help.
+COMMAND_REGISTRY: list[tuple[str, str]] = [
+    ("positions",    "Open trades: instrument pair, entry cost, current spread value, unrealized PnL"),
+    ("closed_today", "Trades closed since midnight UTC and their total realized PnL"),
+    ("new_today",    "Positions opened since midnight UTC and their instrument names"),
+    ("status",       "Trading mode, drain mode, paused state, uptime, open count, daily PnL"),
+    ("portfolio",    "Open trades with asset, strike, expiries, debit, fees, EV, IV, OI"),
+    ("stop_bot",     "Pause scanning and monitoring (feed and listener remain alive)"),
+    ("start_bot",    "Resume scanning and monitoring after a pause"),
+    ("start_drain",  "Activate drain mode — no new entries or rolls; positions close at stop/TP/expiry"),
+    ("help",         "List all available commands with descriptions"),
+]
+
 
 def _require_authorized_chat(handler_fn):
     """Decorator: silently drop updates from chats other than TELEGRAM_CHAT."""
@@ -123,6 +136,10 @@ class TelegramCommandListener:
         async def cmd_start_drain(update, context):
             await handlers.handle_start_drain(update, context, engine)
 
+        @_require_authorized_chat
+        async def cmd_help(update, context):
+            await handlers.handle_help(update, context)
+
         app.add_handler(CommandHandler("positions",    cmd_positions))
         app.add_handler(CommandHandler("closed_today", cmd_closed_today))
         app.add_handler(CommandHandler("new_today",    cmd_new_today))
@@ -131,6 +148,7 @@ class TelegramCommandListener:
         app.add_handler(CommandHandler("stop_bot",     cmd_stop_bot))
         app.add_handler(CommandHandler("start_bot",    cmd_start_bot))
         app.add_handler(CommandHandler("start_drain",  cmd_start_drain))
+        app.add_handler(CommandHandler("help",         cmd_help))
 
         return app
 
@@ -145,6 +163,16 @@ class TelegramCommandListener:
 
         await self._app.initialize()
         await self._app.start()
+
+        # Register the command menu with Telegram so typing "/" shows suggestions.
+        try:
+            from telegram import BotCommand
+            commands = [BotCommand(cmd, desc) for cmd, desc in COMMAND_REGISTRY]
+            await self._app.bot.set_my_commands(commands)
+            logger.info("Telegram command menu registered (%d commands).", len(commands))
+        except Exception as exc:
+            logger.warning("Failed to register Telegram command menu: %s", exc)
+
         await self._app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram command listener active.")
 

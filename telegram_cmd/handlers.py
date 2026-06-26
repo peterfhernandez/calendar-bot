@@ -196,6 +196,16 @@ async def handle_start_bot(
     )
 
 
+async def handle_help(
+    update: Update,
+    context: CallbackContext,
+) -> None:
+    """List all available commands with descriptions."""
+    from telegram_cmd.listener import COMMAND_REGISTRY
+    lines = [f"/{cmd} — {desc}" for cmd, desc in COMMAND_REGISTRY]
+    await update.message.reply_text("\n".join(lines))
+
+
 async def handle_start_drain(
     update: Update,
     context: CallbackContext,

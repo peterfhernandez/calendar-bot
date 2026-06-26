@@ -444,3 +444,97 @@ class TestStartDrain:
 
         assert not engine.paused
         assert config.DRAIN_MODE is True
+
+
+# ── /help handler and COMMAND_REGISTRY ───────────────────────────────────────
+
+class TestHandleHelp:
+    @pytest.mark.asyncio
+    async def test_help_lists_all_commands(self):
+        """/help reply contains every command in COMMAND_REGISTRY."""
+        from telegram_cmd.listener import COMMAND_REGISTRY
+
+        update  = _make_update()
+        context = _make_context()
+
+        await handlers.handle_help(update, context)
+
+        text = update.message.reply_text.call_args[0][0]
+        for cmd, _desc in COMMAND_REGISTRY:
+            assert f"/{cmd}" in text, f"/{cmd} missing from /help reply"
+
+    @pytest.mark.asyncio
+    async def test_help_includes_descriptions(self):
+        """/help reply includes descriptions for each command."""
+        from telegram_cmd.listener import COMMAND_REGISTRY
+
+        update  = _make_update()
+        context = _make_context()
+
+        await handlers.handle_help(update, context)
+
+        text = update.message.reply_text.call_args[0][0]
+        for _cmd, desc in COMMAND_REGISTRY:
+            # At least a portion of each description should appear
+            assert desc[:20] in text, f"Description '{desc[:20]}...' missing from /help"
+
+
+class TestSetMyCommands:
+    def test_command_registry_covers_all_handlers(self):
+        """COMMAND_REGISTRY contains an entry for every registered command including /help."""
+        from telegram_cmd.listener import COMMAND_REGISTRY
+
+        command_names = {cmd for cmd, _ in COMMAND_REGISTRY}
+        expected = {
+            "positions", "closed_today", "new_today", "status",
+            "portfolio", "stop_bot", "start_bot", "start_drain", "help",
+        }
+        assert expected == command_names
+
+    def test_command_registry_has_non_empty_descriptions(self):
+        """Every entry in COMMAND_REGISTRY has a non-empty description."""
+        from telegram_cmd.listener import COMMAND_REGISTRY
+
+        for cmd, desc in COMMAND_REGISTRY:
+            assert desc.strip(), f"/{cmd} has an empty description"
+
+    @pytest.mark.asyncio
+    async def test_set_my_commands_called_on_start(self):
+        """set_my_commands is called during start() with the full COMMAND_REGISTRY."""
+        from telegram_cmd.listener import COMMAND_REGISTRY, TelegramCommandListener
+
+        engine   = _make_engine()
+        cache    = _make_cache()
+        listener = TelegramCommandListener(engine, cache)
+
+        mock_bot = AsyncMock()
+        mock_updater = MagicMock()
+        mock_updater.running = False
+        mock_updater.start_polling = AsyncMock()
+        mock_updater.idle = AsyncMock()
+
+        mock_app = MagicMock()
+        mock_app.bot = mock_bot
+        mock_app.updater = mock_updater
+        mock_app.initialize = AsyncMock()
+        mock_app.start = AsyncMock()
+        mock_app.stop = AsyncMock()
+        mock_app.shutdown = AsyncMock()
+        mock_app.add_handler = MagicMock()
+
+        # Stub out BotCommand so the cryptography C extension is never loaded.
+        mock_bot_command_cls = MagicMock(side_effect=lambda cmd, desc: MagicMock(command=cmd))
+        mock_telegram_module = MagicMock()
+        mock_telegram_module.BotCommand = mock_bot_command_cls
+
+        with patch("config.TELEGRAM_TOKEN", "fake-token"), \
+             patch.object(listener, "_build_app", return_value=mock_app), \
+             patch.dict("sys.modules", {"telegram": mock_telegram_module}):
+            await listener.start()
+
+        mock_bot.set_my_commands.assert_called_once()
+        called_commands = mock_bot.set_my_commands.call_args[0][0]
+        assert len(called_commands) == len(COMMAND_REGISTRY)
+        called_names = {c.command for c in called_commands}
+        registry_names = {cmd for cmd, _ in COMMAND_REGISTRY}
+        assert called_names == registry_names
