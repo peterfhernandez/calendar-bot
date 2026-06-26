@@ -12,6 +12,7 @@ Usage
     python bot.py                        # uses TRADING_MODE from config.py (default: paper)
     python bot.py --portfolio 50000
     python bot.py --collect              # also run the data collector alongside the bot
+    python bot.py --drain                # start in drain mode (no new entries or rolls)
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from data.chain_cache import ChainCache
 from data.deribit_feed import DeribitFeed
 from db.state import list_assets_with_open_positions
 from monitor.loop import BotLoop, configure_logging
+from telegram_cmd.listener import TelegramCommandListener
 
 logger = logging.getLogger("bot")
 
@@ -53,7 +55,9 @@ def _check_startup() -> None:
 
 
 
-async def _run(portfolio_value: float, collect: bool) -> None:
+async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
+    if drain:
+        config.DRAIN_MODE = True
     configure_logging()
     logging.getLogger("strategy.decision").setLevel(logging.DEBUG)
     logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
@@ -96,9 +100,22 @@ async def _run(portfolio_value: float, collect: bool) -> None:
         collect,
     )
 
+    listener: TelegramCommandListener | None = None
+    if config.TELEGRAM_TOKEN:
+        listener = TelegramCommandListener(
+            engine=loop.engine,
+            cache=cache,
+            db_path=loop.engine._db_path,
+        )
+    else:
+        logger.info("TELEGRAM_TOKEN not set — Telegram command listener disabled.")
+
     tasks: list[asyncio.Task] = []
     tasks.append(asyncio.create_task(feed.start(), name="feed"))
     tasks.append(asyncio.create_task(loop.run(),  name="loop"))
+
+    if listener is not None:
+        tasks.append(asyncio.create_task(listener.start(), name="telegram_cmd"))
 
     if collect:
         from backtest.data_collector import run_loop as collector_loop
@@ -120,6 +137,8 @@ async def _run(portfolio_value: float, collect: bool) -> None:
             pass
         raise
     finally:
+        if listener is not None:
+            await listener.stop()
         await feed.stop()
         for t in tasks:
             if not t.done():
@@ -148,9 +167,15 @@ def main() -> None:
         default=False,
         help="Also run the data collector to build historical data (default: off)",
     )
+    parser.add_argument(
+        "--drain",
+        action="store_true",
+        default=False,
+        help="Start in drain mode: no new entries or rolls; existing positions close normally",
+    )
     args = parser.parse_args()
 
-    asyncio.run(_run(portfolio_value=args.portfolio, collect=args.collect))
+    asyncio.run(_run(portfolio_value=args.portfolio, collect=args.collect, drain=args.drain))
 
 
 if __name__ == "__main__":

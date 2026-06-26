@@ -1,7 +1,7 @@
 """SQLite state persistence for calendar spread trades."""
 import sqlite3
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -285,6 +285,41 @@ def update_near_leg(
             "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
         ).fetchone()
     return _row_to_trade(row)
+
+
+def get_open_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return all currently open calendar trades as CalendarTrade objects."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM calendar_trades WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY date_open",
+            _OPEN_STATUSES,
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_trades_opened_today(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return trades opened since midnight UTC today."""
+    init_db(db_path)
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM calendar_trades WHERE date_open >= ? ORDER BY date_open",
+            (today_str,),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_trades_closed_today(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return trades closed since midnight UTC today (any non-open result)."""
+    init_db(db_path)
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM calendar_trades WHERE date_close >= ? AND result NOT IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY date_close",
+            (today_str, *_OPEN_STATUSES),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
 
 
 def get_calendar_stats(asset: Optional[str] = None, db_path: Path = DB_PATH) -> dict:

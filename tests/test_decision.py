@@ -1973,3 +1973,58 @@ class TestFeeIntegration:
 
         # fees_paid_today should have increased (BTC spot=90k → fees ≈ $54)
         assert engine.fees_paid_today >= initial_fees
+
+
+# ── Pause / resume ────────────────────────────────────────────────────────────
+
+class TestPauseResume:
+    def test_pause_blocks_scan(self, monkeypatch):
+        """scan_tick returns immediately without scanning when paused."""
+        engine, _ = _make_engine()
+        engine.pause()
+
+        with patch("strategy.decision.scan") as mock_scan:
+            status = engine.scan_tick()
+
+        mock_scan.assert_not_called()
+        assert "paused" in status.message.lower()
+
+    def test_pause_blocks_monitor(self, monkeypatch):
+        """monitor_tick returns immediately without evaluating positions when paused."""
+        engine, _ = _make_engine()
+        engine.pause()
+
+        with patch.object(engine, "_load_all_open_positions") as mock_load:
+            status = engine.monitor_tick()
+
+        mock_load.assert_not_called()
+        assert "paused" in status.message.lower()
+
+    def test_resume_enables_scan(self, monkeypatch):
+        """scan_tick runs normally after resume() is called."""
+        monkeypatch.setattr("config.DRAIN_MODE", False)
+        engine, _ = _make_engine()
+        engine.pause()
+        engine.resume()
+
+        assert not engine.paused
+
+        with patch("strategy.decision.scan", return_value=[]) as mock_scan:
+            status = engine.scan_tick()
+
+        mock_scan.assert_called_once()
+        assert "paused" not in status.message.lower()
+
+    def test_resume_enables_monitor(self, monkeypatch):
+        """monitor_tick runs normally after resume() clears the paused flag."""
+        engine, _ = _make_engine()
+        engine.pause()
+        engine.resume()
+
+        assert not engine.paused
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[]) as mock_load:
+            status = engine.monitor_tick()
+
+        mock_load.assert_called_once()
+        assert "paused" not in status.message.lower()

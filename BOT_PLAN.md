@@ -615,6 +615,6 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the 
 | **Notification wiring** | **0.5–1 day** | **Done** |
 | **test.deribit.com wiring** | **0.5 day** | **Done** |
 | **Trading fee integration** | **1–2 days** | **Done** |
-| **Telegram command listener** | **0.5–1 day** | **Not started** |
+| **Telegram command listener** | **0.5–1 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~4–6 days** | |

@@ -336,55 +336,55 @@ Adds incoming command handling so the operator can query and control the bot fro
 
 ### `bot.py` — CLI and startup
 
-- [ ] Add `--drain` argparse flag to `bot.py`
-  - [ ] When present, sets `config.DRAIN_MODE = True` before the event loop starts
-  - [ ] Provides a command-line alternative to setting the `DRAIN_MODE` env var (e.g. `python bot.py --drain`)
-- [ ] Import and instantiate `TelegramCommandListener` in `bot.py`
-  - [ ] Skip silently if `config.TELEGRAM_TOKEN` is not set
-  - [ ] Add `asyncio.create_task(listener.start(), name="telegram_cmd")` to the tasks list
-  - [ ] Call `await listener.stop()` in the `finally:` block before cancelling remaining tasks
+- [x] Add `--drain` argparse flag to `bot.py`
+  - [x] When present, sets `config.DRAIN_MODE = True` before the event loop starts
+  - [x] Provides a command-line alternative to setting the `DRAIN_MODE` env var (e.g. `python bot.py --drain`)
+- [x] Import and instantiate `TelegramCommandListener` in `bot.py`
+  - [x] Skip silently if `config.TELEGRAM_TOKEN` is not set
+  - [x] Add `asyncio.create_task(listener.start(), name="telegram_cmd")` to the tasks list
+  - [x] Call `await listener.stop()` in the `finally:` block before cancelling remaining tasks
 
 ### `strategy/decision.py` — pause/resume
 
-- [ ] Add `paused: bool` flag to `DecisionEngine.__init__` (default `False`)
-- [ ] Add `pause()` method — sets the flag; logs a warning that scanning and monitoring are paused
-- [ ] Add `resume()` method — clears the flag; logs info that normal operation has resumed
-- [ ] `scan_tick()` — return immediately (no-op) when `paused` is `True`
-- [ ] `monitor_tick()` — return immediately (no-op) when `paused` is `True`
-- [ ] Add `TestPauseResume` (4 tests) to `tests/test_decision.py`: pause blocks scan; pause blocks monitor; resume re-enables scan; resume re-enables monitor
+- [x] Add `paused: bool` flag to `DecisionEngine.__init__` (default `False`)
+- [x] Add `pause()` method — sets the flag; logs a warning that scanning and monitoring are paused
+- [x] Add `resume()` method — clears the flag; logs info that normal operation has resumed
+- [x] `scan_tick()` — return immediately (no-op) when `paused` is `True`
+- [x] `monitor_tick()` — return immediately (no-op) when `paused` is `True`
+- [x] Add `TestPauseResume` (4 tests) to `tests/test_decision.py`: pause blocks scan; pause blocks monitor; resume re-enables scan; resume re-enables monitor
 
 ### `telegram_cmd/` package
 
-- [ ] Create `telegram_cmd/__init__.py`
-- [ ] Create `telegram_cmd/listener.py` — `TelegramCommandListener`
-  - [ ] Accepts `engine: DecisionEngine`, `cache: ChainCache`, and `db` reference in constructor
-  - [ ] Builds a `python-telegram-bot` Application using `config.TELEGRAM_TOKEN`
-  - [ ] Security middleware: drop (no reply) any update whose `effective_chat.id` does not match `int(config.TELEGRAM_CHAT)`
-  - [ ] Registers all command handlers from `handlers.py`
-  - [ ] `async def start()` — initialises application and starts long-polling loop
-  - [ ] `async def stop()` — cleanly shuts down the polling loop
-- [ ] Create `telegram_cmd/handlers.py`
-  - [ ] `handle_positions(update, context)` — query `db/state.py` for open trades; fetch current bid/ask mid from cache for each leg; compute unrealized PnL = `(far_mid − near_mid) × qty − net_debit × qty`; format one line per trade; fall back to DB entry value with a note if the cache is stale or the instrument is missing
-  - [ ] `handle_closed_today(update, context)` — query DB for trades with `closed_at >= midnight UTC`; reply "N trades closed today. Total realized PnL: $X.XX"
-  - [ ] `handle_new_today(update, context)` — query DB for trades with `opened_at >= midnight UTC`; reply "N new positions opened today: \<instrument pairs\>"
-  - [ ] `handle_status(update, context)` — reply with: trading mode, drain mode on/off, bot paused/running, uptime since process start, open position count, daily PnL
-  - [ ] `handle_portfolio(update, context)` — query DB for open trades; fetch live IV and OI for both legs from the chain cache; reply with one line per trade showing: asset, strike, near expiry date, far expiry date, net debit paid, fees paid, EV score at entry, near IV, far IV, near OI, far OI; note "(cache stale)" next to any leg whose IV or OI cannot be retrieved
-  - [ ] `handle_stop_bot(update, context)` — call `engine.pause()`; reply "Bot paused — monitoring stopped. Use /start_bot to resume."
-  - [ ] `handle_start_bot(update, context)` — call `engine.resume()`; reply "Bot resumed — scanning and monitoring restarted."
-  - [ ] `handle_start_drain(update, context)` — set `config.DRAIN_MODE = True`; call `engine.resume()` if paused; reply "Drain mode activated — no new entries or rolls; existing positions will close at stop/TP/expiry."
+- [x] Create `telegram_cmd/__init__.py`
+- [x] Create `telegram_cmd/listener.py` — `TelegramCommandListener`
+  - [x] Accepts `engine: DecisionEngine`, `cache: ChainCache`, and `db` reference in constructor
+  - [x] Builds a `python-telegram-bot` Application using `config.TELEGRAM_TOKEN`
+  - [x] Security middleware: drop (no reply) any update whose `effective_chat.id` does not match `int(config.TELEGRAM_CHAT)`
+  - [x] Registers all command handlers from `handlers.py`
+  - [x] `async def start()` — initialises application and starts long-polling loop
+  - [x] `async def stop()` — cleanly shuts down the polling loop
+- [x] Create `telegram_cmd/handlers.py`
+  - [x] `handle_positions(update, context)` — query `db/state.py` for open trades; fetch current bid/ask mid from cache for each leg; compute unrealized PnL = `(far_mid − near_mid) × qty − net_debit × qty`; format one line per trade; fall back to DB entry value with a note if the cache is stale or the instrument is missing
+  - [x] `handle_closed_today(update, context)` — query DB for trades with `closed_at >= midnight UTC`; reply "N trades closed today. Total realized PnL: $X.XX"
+  - [x] `handle_new_today(update, context)` — query DB for trades with `opened_at >= midnight UTC`; reply "N new positions opened today: \<instrument pairs\>"
+  - [x] `handle_status(update, context)` — reply with: trading mode, drain mode on/off, bot paused/running, uptime since process start, open position count, daily PnL
+  - [x] `handle_portfolio(update, context)` — query DB for open trades; fetch live IV and OI for both legs from the chain cache; reply with one line per trade showing: asset, strike, near expiry date, far expiry date, net debit paid, fees paid, EV score at entry, near IV, far IV, near OI, far OI; note "(cache stale)" next to any leg whose IV or OI cannot be retrieved
+  - [x] `handle_stop_bot(update, context)` — call `engine.pause()`; reply "Bot paused — monitoring stopped. Use /start_bot to resume."
+  - [x] `handle_start_bot(update, context)` — call `engine.resume()`; reply "Bot resumed — scanning and monitoring restarted."
+  - [x] `handle_start_drain(update, context)` — set `config.DRAIN_MODE = True`; call `engine.resume()` if paused; reply "Drain mode activated — no new entries or rolls; existing positions will close at stop/TP/expiry."
 
 ### Tests and scratch
 
-- [ ] Create `tests/test_telegram_cmd.py`
-  - [ ] Mock `db.state` to return known trade sets; verify `/positions`, `/closed_today`, `/new_today`, `/portfolio` format replies correctly
-  - [ ] Verify `/status` reply includes mode, drain, paused state, and position count
-  - [ ] Verify unknown chat ID produces no reply (security check)
-  - [ ] Verify `/stop_bot` calls `engine.pause()` and `/start_bot` calls `engine.resume()`
-  - [ ] Verify `/start_drain` sets `config.DRAIN_MODE = True`
-- [ ] Create `scratch/scratch_telegram_cmd.py`
-  - [ ] Starts `TelegramCommandListener` with a real token; prints each received command and its reply
-  - [ ] Aborts if `TRADING_MODE == "live"`
-  - [ ] Run with `python -m scratch.scratch_telegram_cmd` from the repo root
+- [x] Create `tests/test_telegram_cmd.py`
+  - [x] Mock `db.state` to return known trade sets; verify `/positions`, `/closed_today`, `/new_today`, `/portfolio` format replies correctly
+  - [x] Verify `/status` reply includes mode, drain, paused state, and position count
+  - [x] Verify unknown chat ID produces no reply (security check)
+  - [x] Verify `/stop_bot` calls `engine.pause()` and `/start_bot` calls `engine.resume()`
+  - [x] Verify `/start_drain` sets `config.DRAIN_MODE = True`
+- [x] Create `scratch/scratch_telegram_cmd.py`
+  - [x] Starts `TelegramCommandListener` with a real token; prints each received command and its reply
+  - [x] Aborts if `TRADING_MODE == "live"`
+  - [x] Run with `python -m scratch.scratch_telegram_cmd` from the repo root
 
 ---
 
