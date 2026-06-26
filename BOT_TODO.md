@@ -330,7 +330,67 @@ Deribit charges **0.03% of the underlying index price** per leg per trade (min 0
 
 ---
 
-## Phase 9 — Paper Trading Validation
+## Phase 9 — Telegram Command Listener
+
+Adds incoming command handling so the operator can query and control the bot from their phone via the same Telegram chat already used for outgoing notifications.
+
+### `bot.py` — CLI and startup
+
+- [ ] Add `--drain` argparse flag to `bot.py`
+  - [ ] When present, sets `config.DRAIN_MODE = True` before the event loop starts
+  - [ ] Provides a command-line alternative to setting the `DRAIN_MODE` env var (e.g. `python bot.py --drain`)
+- [ ] Import and instantiate `TelegramCommandListener` in `bot.py`
+  - [ ] Skip silently if `config.TELEGRAM_TOKEN` is not set
+  - [ ] Add `asyncio.create_task(listener.start(), name="telegram_cmd")` to the tasks list
+  - [ ] Call `await listener.stop()` in the `finally:` block before cancelling remaining tasks
+
+### `strategy/decision.py` — pause/resume
+
+- [ ] Add `paused: bool` flag to `DecisionEngine.__init__` (default `False`)
+- [ ] Add `pause()` method — sets the flag; logs a warning that scanning and monitoring are paused
+- [ ] Add `resume()` method — clears the flag; logs info that normal operation has resumed
+- [ ] `scan_tick()` — return immediately (no-op) when `paused` is `True`
+- [ ] `monitor_tick()` — return immediately (no-op) when `paused` is `True`
+- [ ] Add `TestPauseResume` (4 tests) to `tests/test_decision.py`: pause blocks scan; pause blocks monitor; resume re-enables scan; resume re-enables monitor
+
+### `telegram_cmd/` package
+
+- [ ] Create `telegram_cmd/__init__.py`
+- [ ] Create `telegram_cmd/listener.py` — `TelegramCommandListener`
+  - [ ] Accepts `engine: DecisionEngine`, `cache: ChainCache`, and `db` reference in constructor
+  - [ ] Builds a `python-telegram-bot` Application using `config.TELEGRAM_TOKEN`
+  - [ ] Security middleware: drop (no reply) any update whose `effective_chat.id` does not match `int(config.TELEGRAM_CHAT)`
+  - [ ] Registers all command handlers from `handlers.py`
+  - [ ] `async def start()` — initialises application and starts long-polling loop
+  - [ ] `async def stop()` — cleanly shuts down the polling loop
+- [ ] Create `telegram_cmd/handlers.py`
+  - [ ] `handle_positions(update, context)` — query `db/state.py` for open trades; fetch current bid/ask mid from cache for each leg; compute unrealized PnL = `(far_mid − near_mid) × qty − net_debit × qty`; format one line per trade; fall back to DB entry value with a note if the cache is stale or the instrument is missing
+  - [ ] `handle_closed_today(update, context)` — query DB for trades with `closed_at >= midnight UTC`; reply "N trades closed today. Total realized PnL: $X.XX"
+  - [ ] `handle_new_today(update, context)` — query DB for trades with `opened_at >= midnight UTC`; reply "N new positions opened today: \<instrument pairs\>"
+  - [ ] `handle_status(update, context)` — reply with: trading mode, drain mode on/off, bot paused/running, uptime since process start, open position count, daily PnL
+  - [ ] `handle_portfolio(update, context)` — query DB for open trades; fetch live IV and OI for both legs from the chain cache; reply with one line per trade showing: asset, strike, near expiry date, far expiry date, net debit paid, fees paid, EV score at entry, near IV, far IV, near OI, far OI; note "(cache stale)" next to any leg whose IV or OI cannot be retrieved
+  - [ ] `handle_stop_bot(update, context)` — call `engine.pause()`; reply "Bot paused — monitoring stopped. Use /start_bot to resume."
+  - [ ] `handle_start_bot(update, context)` — call `engine.resume()`; reply "Bot resumed — scanning and monitoring restarted."
+  - [ ] `handle_start_drain(update, context)` — set `config.DRAIN_MODE = True`; call `engine.resume()` if paused; reply "Drain mode activated — no new entries or rolls; existing positions will close at stop/TP/expiry."
+
+### Tests and scratch
+
+- [ ] Create `tests/test_telegram_cmd.py`
+  - [ ] Mock `db.state` to return known trade sets; verify `/positions`, `/closed_today`, `/new_today`, `/portfolio` format replies correctly
+  - [ ] Verify `/status` reply includes mode, drain, paused state, and position count
+  - [ ] Verify unknown chat ID produces no reply (security check)
+  - [ ] Verify `/stop_bot` calls `engine.pause()` and `/start_bot` calls `engine.resume()`
+  - [ ] Verify `/start_drain` sets `config.DRAIN_MODE = True`
+- [ ] Create `scratch/scratch_telegram_cmd.py`
+  - [ ] Starts `TelegramCommandListener` with a real token; prints each received command and its reply
+  - [ ] Aborts if `TRADING_MODE == "live"`
+  - [ ] Run with `python -m scratch.scratch_telegram_cmd` from the repo root
+
+---
+
+## Validation Phases
+
+### Validation Phase 1 — Paper Trading Validation
 
 - [ ] Run bot in paper mode (`DERIBIT_PAPER = True`) for minimum 4 weeks
 - [ ] Verify scanner selects setups that profit at expiry
@@ -341,7 +401,7 @@ Deribit charges **0.03% of the underlying index price** per leg per trade (min 0
 
 ---
 
-## Phase 10 — Live Deployment
+### Validation Phase 2 — Live Deployment
 
 - [ ] Switch `DERIBIT_PAPER = False` in config
 - [ ] Set up API key in `.env` (never commit)
@@ -367,6 +427,7 @@ Deribit charges **0.03% of the underlying index price** per leg per trade (min 0
 - `scratch/scratch_notify_live.py` — sends real test alerts via the configured SMTP and Telegram channels. Requires ALERT_EMAIL/SMTP_USER/SMTP_PASS and/or TELEGRAM_TOKEN/TELEGRAM_CHAT set in .env. Aborts if TRADING_MODE is "live". Run with `python -m scratch.scratch_notify_live` from the repo root.
 - `scratch/scratch_asset_overrides.py` — demonstrates per-asset threshold overrides: prints effective thresholds for BTC, ETH, and SOL side by side, then shows SOL candidates passing OI, spread, and entry-premium filters that BTC/ETH fail. Run with `python -m scratch.scratch_asset_overrides` from the repo root.
 - `scratch/scratch_fees.py` — demonstrates the Deribit fee model: entry fees with/without combo discount for BTC/ETH/SOL, delivery fees (daily/weekly exempt, monthly charged), roll fee vs theta gain break-even, and early-close gross vs net P&L. Aborts if TRADING_MODE is "live". Run with `python -m scratch.scratch_fees` from the repo root.
+- `scratch/scratch_telegram_cmd.py` — starts `TelegramCommandListener` with a real token and prints each received command and its reply. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_telegram_cmd` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
 ---

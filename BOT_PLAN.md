@@ -191,6 +191,50 @@ The `alerts/notifier.py` module is implemented but not wired into the live execu
 - Add a `scratch/scratch_notify_live.py` that sends a test alert via the real SMTP/Telegram config
 - Add a startup self-test in `bot.py` that sends a "Bot started" notification; if it fails, log a warning but do not abort
 
+### 13. Telegram Command Listener *(new — light effort)*
+
+The bot already sends outgoing Telegram notifications via `alerts/notifier.py`. This phase adds incoming command handling so the operator can query and control the bot from their phone via the same Telegram chat.
+
+**Architecture**
+
+`TelegramCommandListener` runs as a fourth asyncio task in `bot.py` alongside the feed, loop, and (optionally) the data collector. It long-polls the Telegram Bot API using `python-telegram-bot` v21 (already in `requirements.txt`). When the bot shuts down, the listener task is cancelled in the existing `finally:` block.
+
+Security: every incoming update checks `update.effective_chat.id == int(config.TELEGRAM_CHAT)`. Messages from any other chat ID are silently dropped — no reply is sent.
+
+**`/stop_bot` and `/start_bot` — pause/resume without process restart**
+
+Rather than killing and restarting the OS process (which would take the listener down with it), these commands add a `paused` flag to `DecisionEngine`:
+
+- `/stop_bot` — sets the flag; `scan_tick()` and `monitor_tick()` return immediately without acting; the feed, portfolio tracker, and listener all remain alive
+- `/start_bot` — clears the flag; normal scanning and monitoring resumes
+- The listener is never affected by the pause state
+
+**`--drain` CLI flag**
+
+`bot.py` gains a `--drain` argparse flag that sets `config.DRAIN_MODE = True` before the event loop starts — a command-line alternative to setting the env var. The `/start_drain` Telegram command achieves the same effect at runtime on a running process.
+
+**Commands**
+
+| Command | Response |
+| --- | --- |
+| `/positions` | One line per open trade: instrument pair, entry cost, current spread value, unrealized PnL in USD and % |
+| `/closed_today` | Count of trades closed since midnight UTC and their total realized PnL |
+| `/new_today` | Count of positions opened since midnight UTC and their instrument names |
+| `/status` | Trading mode, drain mode, paused state, uptime, open position count, daily PnL |
+| `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, IV (near and far legs), OI (near and far legs) |
+| `/stop_bot` | Pauses scan/monitor ticks; confirms to chat; feed and listener remain alive |
+| `/start_bot` | Resumes scan/monitor ticks; confirms to chat |
+| `/start_drain` | Sets `DRAIN_MODE = True` at runtime; confirms; no new entries or rolls from this point |
+
+**New file:** `telegram_cmd/` package
+
+**Changes to existing files:**
+
+| File | Change |
+| --- | --- |
+| `bot.py` | Add `--drain` flag; instantiate and start `TelegramCommandListener`; stop it in `finally:` |
+| `strategy/decision.py` | Add `pause()` / `resume()` methods and `paused` flag; `scan_tick()` and `monitor_tick()` return immediately when paused |
+
 ### 12. Trading Fee Integration *(new — medium effort)*
 
 Fees on Deribit are material relative to calendar spread premiums and must be accounted for at every stage of the trade lifecycle — not just at entry.
@@ -357,14 +401,19 @@ calendar-bot/
 │   └── engine.py           # replay engine
 ├── alerts/
 │   ├── __init__.py
-│   └── notifier.py         # email / Telegram notifications
+│   └── notifier.py         # email / Telegram notifications (outgoing)
+├── telegram_cmd/
+│   ├── __init__.py
+│   ├── listener.py         # TelegramCommandListener — long-poll loop, start/stop
+│   └── handlers.py         # per-command handler functions
 ├── tests/
 │   ├── test_pricing.py
 │   ├── test_scanner.py
 │   ├── test_decision.py
 │   ├── test_executor.py
 │   ├── test_backtest.py
-│   └── test_portfolio.py   # new
+│   ├── test_portfolio.py   # new
+│   └── test_telegram_cmd.py # new
 ├── scratch/
 │   ├── scratch_scan.py
 │   ├── scratch_decision.py
@@ -374,7 +423,8 @@ calendar-bot/
 │   ├── scratch_three_fixes.py
 │   ├── scratch_two_fixes.py
 │   ├── scratch_notify_live.py  # new — sends real test alert
-│   └── scratch_portfolio.py    # new — prints live portfolio snapshot
+│   ├── scratch_portfolio.py    # new — prints live portfolio snapshot
+│   └── scratch_telegram_cmd.py # new — starts listener, fires test commands
 ├── config.py               # all tuneable parameters (thresholds, assets, sizing)
 ├── bot.py                  # entry point / scheduler
 ├── requirements.txt
@@ -408,6 +458,7 @@ calendar-bot/
 | Runaway losses in volatile market | Hard daily loss limit; halt + alert if breached |
 | Cash over-commitment | Portfolio tracker enforces `available_cash` check before every entry |
 | Silent notification failures | Startup self-test notification; warning logged but bot continues |
+| Unauthorized bot control via Telegram | Every incoming update is checked against `config.TELEGRAM_CHAT`; messages from any other chat ID are silently dropped; `TELEGRAM_TOKEN` must be kept secret |
 | Wrong environment | Startup banner clearly states PAPER / TEST / LIVE; bot refuses to start in live mode without DAILY_LOSS_LIMIT; scratch scripts abort if TRADING_MODE == "live" |
 | Fee drag erodes profitability | All EV scores deducted for round-trip fees before entry; sizer includes fees in max-loss; paper mode simulates fees identically to live |
 | Roll loop accumulating fees | Roll gate checks that theta gain exceeds `roll_fees` before proceeding; uneconomic rolls close the position instead |
@@ -563,6 +614,7 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the 
 | **1d near-leg horizon** | **0.5 day** | **Done** |
 | **Notification wiring** | **0.5–1 day** | **Done** |
 | **test.deribit.com wiring** | **0.5 day** | **Done** |
-| **Trading fee integration** | **1–2 days** | **Not started** |
+| **Trading fee integration** | **1–2 days** | **Done** |
+| **Telegram command listener** | **0.5–1 day** | **Not started** |
 | Testing + paper trading validation | 3–5 days | Not started |
-| **Total remaining** | **~8–14 days** | |
+| **Total remaining** | **~4–6 days** | |

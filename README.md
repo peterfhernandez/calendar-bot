@@ -95,6 +95,27 @@ On startup the bot prints a prominent banner identifying the active mode. It ref
 
 ---
 
+## Telegram commands
+
+The bot accepts incoming commands from the same Telegram chat it uses for outgoing notifications. Every message is validated against `TELEGRAM_CHAT` — messages from any other chat ID are silently dropped.
+
+| Command | What it returns |
+| --- | --- |
+| `/positions` | One line per open trade: instrument pair, entry cost, current spread value, unrealized PnL in USD and % |
+| `/closed_today` | Count of trades closed since midnight UTC and their total realized PnL |
+| `/new_today` | Count of positions opened since midnight UTC and their instrument names |
+| `/status` | Trading mode, drain mode on/off, bot paused/running, uptime, open position count, daily PnL |
+| `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, near and far IV, near and far OI |
+| `/stop_bot` | Pauses scan and monitor ticks; the feed and listener remain alive; positions are not closed |
+| `/start_bot` | Resumes normal scanning and monitoring |
+| `/start_drain` | Activates drain mode at runtime — no new entries or rolls; existing positions close at stop/TP/expiry |
+
+`/stop_bot` and `/start_bot` pause and resume the decision engine without restarting the process, so the listener stays connected throughout.
+
+The bot can also be started in drain mode from the command line with `python bot.py --drain`, which is equivalent to setting the `DRAIN_MODE` env var.
+
+---
+
 ## Requirements
 
 - Python 3.11+
