@@ -120,6 +120,13 @@ DERIBIT_CLIENT_SECRET = DERIBIT_LIVE_CLIENT_SECRET if _LIVE else DERIBIT_TEST_CL
 
 DAILY_LOSS_LIMIT = 500    # USD — halt bot if breached; required when TRADING_MODE == "live"
 
+# Drain mode — set to True to stop entering new trades and disable near-leg
+# rolling.  Existing positions are monitored normally; stop-loss and
+# take-profit triggers fire as usual.  Near legs approaching expiry are closed
+# outright rather than rolled.  Use this to wind down all open positions
+# without starting new ones.
+DRAIN_MODE = _os.environ.get("DRAIN_MODE", "").lower() in ("1", "true", "yes")
+
 # Alerts
 # All alert settings are read from env vars (set in .env, never commit).
 # Email — set ALERT_EMAIL to enable; SMTP defaults to Gmail on port 587.

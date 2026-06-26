@@ -47,6 +47,8 @@ def _check_startup() -> None:
             "TRADING_MODE='live' requires DAILY_LOSS_LIMIT to be set to a positive value in config.py."
         )
     print(_BANNERS.get(mode, f"*** MODE: {mode} ***"), flush=True)
+    if config.DRAIN_MODE:
+        print("*** DRAIN MODE — no new entries, no rolls; existing positions close at stop/TP/expiry ***", flush=True)
 
 
 

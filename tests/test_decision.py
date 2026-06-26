@@ -1706,3 +1706,120 @@ class TestAssetOverridesLiquidityGate:
         reason = engine._check_liquidity_gate(candidate)
         assert reason is not None, "BTC with 15% entry premium should fail the global 10% limit"
         assert "entry premium" in reason
+
+
+# ── Drain mode ────────────────────────────────────────────────────────────────
+
+class TestDrainMode:
+    """DRAIN_MODE=True: no new entries, no rolls; stop/TP/expiry still close positions."""
+
+    def _open_pos(self, near_days: int = 10, far_days: int = 35) -> dict:
+        near_label = _future_label(near_days)
+        far_label  = _future_label(far_days)
+        return {
+            "trade_id":        1,
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          90_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "near_days":       near_days,
+            "far_days":        far_days,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       90_000.0,
+            "near_instrument": f"BTC-{near_label}-90000-C",
+            "far_instrument":  f"BTC-{far_label}-90000-C",
+        }
+
+    def test_scan_tick_skipped_in_drain_mode(self, monkeypatch):
+        """scan_tick returns without entering a trade when DRAIN_MODE is True."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRAIN_MODE", True)
+
+        executor = MagicMock()
+        executor.enter_spread.return_value = {"near_prem": 0.02, "far_prem": 0.04, "net_debit": 0.02, "qty": 1.0}
+
+        with patch("strategy.decision.scan", return_value=[_make_candidate()]):
+            engine, _ = _make_engine(executor=executor)
+            status = engine.scan_tick()
+
+        executor.enter_spread.assert_not_called()
+        assert "Drain mode" in status.message
+
+    def test_scan_tick_normal_when_drain_false(self, monkeypatch):
+        """scan_tick enters a trade when DRAIN_MODE is False (baseline)."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRAIN_MODE", False)
+        monkeypatch.setattr(cfg, "MIN_EV", 0.0)
+        monkeypatch.setattr(cfg, "MIN_NET_DEBIT", 0.0)  # allow small debit in test
+
+        executor = MagicMock()
+        executor.enter_spread.return_value = {"near_prem": 0.02, "far_prem": 0.04, "net_debit": 0.02, "qty": 1.0}
+
+        with patch("strategy.decision.scan", return_value=[_make_candidate()]):
+            engine, _ = _make_engine(executor=executor)
+            engine.scan_tick()
+
+        executor.enter_spread.assert_called_once()
+
+    def test_near_expiry_closes_not_rolls_in_drain_mode(self, monkeypatch):
+        """When near leg is within roll-trigger days, drain mode closes rather than rolls."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRAIN_MODE", True)
+
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.025
+
+        cache = _make_cache(near_days=1, far_days=30)
+        engine, db_path = _make_engine(cache=cache, executor=executor)
+
+        pos = self._open_pos(near_days=1, far_days=30)
+
+        with patch("strategy.decision.check_calendar_status", return_value=("hold", 0.022, 1.1, "OK")), \
+             patch("strategy.decision.close_calendar_trade") as mock_close:
+            action, _ = engine._monitor_position(pos)
+
+        executor.roll_near_leg.assert_not_called()
+        executor.close_spread.assert_called_once()
+        assert "Drain mode" in action
+
+    def test_stop_loss_still_fires_in_drain_mode(self, monkeypatch):
+        """Stop-loss trigger works normally even when DRAIN_MODE is True."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRAIN_MODE", True)
+
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.008
+
+        cache = _make_cache(near_days=10, far_days=35)
+        engine, _ = _make_engine(cache=cache, executor=executor)
+
+        pos = self._open_pos(near_days=10, far_days=35)
+
+        with patch("strategy.decision.check_calendar_status", return_value=("stop", 0.008, 0.4, "Stop")), \
+             patch("strategy.decision.close_calendar_trade"):
+            action, _ = engine._monitor_position(pos)
+
+        executor.close_spread.assert_called_once()
+        assert "Stop-loss" in action
+
+    def test_take_profit_still_fires_in_drain_mode(self, monkeypatch):
+        """Take-profit trigger works normally even when DRAIN_MODE is True."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "DRAIN_MODE", True)
+
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.034
+
+        cache = _make_cache(near_days=10, far_days=35)
+        engine, _ = _make_engine(cache=cache, executor=executor)
+
+        pos = self._open_pos(near_days=10, far_days=35)
+
+        with patch("strategy.decision.check_calendar_status", return_value=("tp", 0.034, 1.7, "TP")), \
+             patch("strategy.decision.close_calendar_trade"):
+            action, _ = engine._monitor_position(pos)
+
+        executor.close_spread.assert_called_once()
+        assert "Take-profit" in action

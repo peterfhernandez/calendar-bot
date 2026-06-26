@@ -313,6 +313,16 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
+## Phase 8j — Drain Mode
+
+- [x] Add `DRAIN_MODE` boolean to `config.py` (reads `DRAIN_MODE` env var; default `False`)
+- [x] `strategy/decision.py` — `scan_tick()` returns immediately without scanning or entering when `DRAIN_MODE` is `True`
+- [x] `strategy/decision.py` — `_monitor_position()` closes positions outright rather than rolling when `DRAIN_MODE` is `True` and the near leg is within the roll-trigger window
+- [x] `bot.py` — prints a drain mode banner alongside the trading mode banner
+- [x] Add `TestDrainMode` (5 tests) to `tests/test_decision.py`
+
+---
+
 ## Bug Fixes
 
 - [x] **Negative-EV entry filter** — added `MIN_EV = 0.0` to `config.py`; `strategy/decision.py` now rejects any candidate with `ev_score < MIN_EV` before calling the sizer or executor. Tests: `TestNegativeEvFilter` in `tests/test_decision.py`.

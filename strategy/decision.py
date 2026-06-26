@@ -276,6 +276,12 @@ class DecisionEngine:
 
         open_positions = self._load_all_open_positions()
 
+        # ── Drain mode: skip entry entirely ──────────────────────────────────
+        if config.DRAIN_MODE:
+            self._state = BotState.IDLE if not open_positions else BotState.MONITOR
+            logger.info("DRAIN MODE — scan_tick skipped (no new entries). Open: %d", len(open_positions))
+            return self._status("Drain mode: no new entries.", open_positions)
+
         # ── SCAN ──────────────────────────────────────────────────────────────
         self._state = BotState.SCAN
         logger.info("SCAN tick started. Open positions: %d", len(open_positions))
@@ -601,8 +607,15 @@ class DecisionEngine:
         if status == "tp":
             return self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv), 0.0
 
-        # Roll trigger: near leg approaching expiry and no exit signal yet
+        # Roll trigger: near leg approaching expiry and no exit signal yet.
+        # In drain mode, skip rolling and close instead.
         if near_days_left <= _ROLL_TRIGGER_DAYS:
+            if config.DRAIN_MODE:
+                logger.info(
+                    "DRAIN MODE — trade_id=%d near leg expires in %d day(s), closing instead of rolling",
+                    trade_id, near_days_left,
+                )
+                return self._close_position(pos, spot, "Drain mode — closing instead of rolling"), 0.0
             rolled = self._try_roll(pos, spot)
             if rolled:
                 return f"trade_id={trade_id} rolled near leg", 0.0
