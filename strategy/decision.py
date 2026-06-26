@@ -213,6 +213,8 @@ class DecisionEngine:
         self._fees_paid_today: float = 0.0  # cumulative fees paid today (entry + exit + roll)
         self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
         self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
+        self._paused: bool = False
+        self._start_time: datetime = datetime.now(timezone.utc)
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -238,6 +240,26 @@ class DecisionEngine:
         """Cumulative fees paid today in USD (entry + exit + roll)."""
         return self._fees_paid_today
 
+    @property
+    def paused(self) -> bool:
+        """True when scan and monitor ticks are suspended via pause()."""
+        return self._paused
+
+    @property
+    def start_time(self) -> datetime:
+        """UTC datetime when this engine instance was created."""
+        return self._start_time
+
+    def pause(self) -> None:
+        """Suspend scan_tick and monitor_tick. Feed and portfolio tracker remain active."""
+        self._paused = True
+        logger.warning("DecisionEngine paused — scanning and monitoring suspended.")
+
+    def resume(self) -> None:
+        """Resume scan_tick and monitor_tick after a pause."""
+        self._paused = False
+        logger.info("DecisionEngine resumed — normal scanning and monitoring restarted.")
+
     # ── Public tick methods ───────────────────────────────────────────────────
 
     def scan_tick(self) -> EngineStatus:
@@ -253,6 +275,9 @@ class DecisionEngine:
         EngineStatus
             Current engine snapshot after the tick.
         """
+        if self._paused:
+            return self._status("Bot is paused — use /start_bot to resume.")
+
         if self._state is BotState.HALTED:
             return self._status("Bot is halted — daily loss limit breached.")
 
@@ -364,6 +389,9 @@ class DecisionEngine:
         EngineStatus
             Current engine snapshot after the tick.
         """
+        if self._paused:
+            return self._status("Bot is paused — use /start_bot to resume.")
+
         if self._state is BotState.HALTED:
             return self._status("Bot is halted — daily loss limit breached.")
 
