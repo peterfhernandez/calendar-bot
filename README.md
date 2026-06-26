@@ -42,6 +42,9 @@ This bot automates the full lifecycle:
 | Min leg bid/ask size | 1 contract | Liquidity gate — both legs must have real size |
 | Max leg spread | 5% of mid | Liquidity gate — wide-spread legs are rejected |
 | Max entry premium | 10% over spread mid | Liquidity gate — prevents entering deeply underwater due to bid/ask friction |
+| Options fee | 0.03% of underlying/leg | Deribit taker and maker rate (BTC & ETH); SOL maker fee is 0% |
+| Combo leg discount | 100% on cheaper leg | Taker combo orders pay fee on the expensive leg only |
+| Delivery fee | 0.015% of underlying | Charged at expiry for monthly+ options ITM; daily/weekly options are exempt |
 
 ---
 
@@ -56,6 +59,7 @@ Key architectural components:
 - **Per-asset threshold overrides** (`ASSET_OVERRIDES` in `config.py`) — each asset can have its own OI, spread, entry-premium, and IV-contango thresholds. SOL options are thinner than BTC/ETH and use relaxed defaults; BTC and ETH use the tighter global values. Add any asset to `ASSET_OVERRIDES` to tune its filters independently.
 - **Combo orders** (in `execution/executor.py`) — both legs submitted atomically via Deribit's combo order API, eliminating leg risk. Falls back to sequential individual legs only if the combo times out and both legs have sufficient liquidity; the fallback cancels the near leg immediately if the far leg fails.
 - **Notifications** (`alerts/notifier.py`, wired into `strategy/decision.py`) — every decision point (entry, stop, TP, roll, close, daily limit, error) fires an email and/or Telegram alert with deduplication.
+- **Fee model** (`core/fees.py`, wired into scanner, sizer, decision engine, executor, and backtest) — Deribit charges 0.03% of the underlying per leg per trade (minimum 0.0003 BTC/ETH/SOL per contract, capped at 12.5% of option value). Combo orders receive a 100% taker discount on the cheaper leg. Delivery fees of 0.015% apply at expiry for monthly and longer options (daily and weekly near legs are exempt). Fees are deducted from EV scores before entry, included in max-loss sizing, evaluated before each roll (rolls that cost more than the expected theta gain are skipped), and applied in paper mode so paper P&L reflects real economics.
 
 See [BOT_PLAN.md](BOT_PLAN.md) for the full design and [BOT_TODO.md](BOT_TODO.md) for progress.
 

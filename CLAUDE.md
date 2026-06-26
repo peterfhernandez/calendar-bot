@@ -1,8 +1,11 @@
+# Directions for Claude
+
 @README.md
 @BOT_PLAN.md
 @BOT_TODO.md
 
 ## Purpose of project
+
 This repo is a python project for aun automated bot that trades calendar options on crypto curreny with Deribit.
 
 ## Instructions
@@ -28,3 +31,9 @@ Make sure the Readme.md file is up to date as well.
 ### Update progress in BOT_TODO.md
 
 Each time you complete a task from BOT_TODO, make sure to update progress.
+
+### Commiting changes
+
+- do not commit changes to git unless explicitly asked
+- when asked to commit, the comment must not contain your name, the name of any model, or any reference to AI
+- when asked to commit and you have been working on a separate branch, asking if that branch should be merged into the main branch

@@ -262,6 +262,78 @@ Files have already been copied over from optionsStrat. Files need to be adapted.
 
 ---
 
+## Phase 8k — Trading Fee Integration
+
+Deribit charges **0.03% of the underlying index price** per leg per trade (min 0.0003 BTC/ETH/SOL per contract). Combo/spread orders receive a 100% taker discount on the cheaper leg. Delivery fees apply at expiry for non-daily/non-weekly options (0.015% of underlying, capped at 12.5% of option value). SOL maker fees are 0%. Fees must be modelled accurately in all three trading modes (paper, test, live).
+
+- [ ] Add fee constants to `config.py`
+  - [ ] `OPTIONS_FEE_PCT = 0.0003` — taker/maker rate per leg (BTC and ETH options)
+  - [ ] `OPTIONS_MIN_FEE_BTC = 0.0003` — minimum fee in BTC per contract
+  - [ ] `OPTIONS_MIN_FEE_ETH = 0.0003` — minimum fee in ETH per contract
+  - [ ] `OPTIONS_MIN_FEE_SOL = 0.0003` — minimum fee in SOL per contract (taker); maker = 0
+  - [ ] `SOL_MAKER_FEE_PCT = 0.0` — SOL options maker fee is zero
+  - [ ] `OPTIONS_DELIVERY_FEE_PCT = 0.00015` — delivery fee for monthly/quarterly options at expiry
+  - [ ] `OPTIONS_DELIVERY_FEE_CAP = 0.125` — delivery fee capped at 12.5% of option market value
+  - [ ] `COMBO_CHEAP_LEG_DISCOUNT = 1.0` — 100% taker fee discount on cheaper leg of a combo order
+  - [ ] No delivery fee for daily options (1d near) or weekly options (7d near)
+
+- [ ] Update `core/fees.py` with actual Deribit fee schedule
+  - [ ] `leg_fee(asset, spot, qty, is_maker, option_price)` — returns fee in USD; applies per-leg rate, minimum fee floor, and 12.5% cap
+  - [ ] `entry_fees(asset, spot, qty, near_price, far_price, via_combo)` — total entry cost; applies combo cheap-leg discount when `via_combo=True`
+  - [ ] `exit_fees(asset, spot, qty, near_price, far_price)` — total exit cost for closing both legs
+  - [ ] `roll_fees(asset, spot, qty, near_price, new_near_price)` — fee to close old near + open new near leg
+  - [ ] `delivery_fee(asset, spot, qty, option_price, expiry_days)` — 0 for daily/weekly, 0.015% otherwise (capped)
+  - [ ] `round_trip_fees(asset, spot, qty, near_price, far_price, via_combo)` — entry + exit fees combined; used in EV calculation
+
+- [ ] Update `strategy/scanner.py` to deduct round-trip fees from EV score
+  - [ ] Compute `fee_drag = round_trip_fees(asset, spot, qty=1, near_price, far_price, via_combo=True)` per candidate
+  - [ ] Adjust `ev_score -= fee_drag` before comparing to `MIN_EV`
+  - [ ] Log fee drag alongside EV score when a candidate is ranked or rejected
+
+- [ ] Update `strategy/sizer.py` to include fees in max-loss calculation
+  - [ ] True cost per trade = `net_debit × qty + entry_fees + exit_fees`
+  - [ ] Size so that true cost ≤ `available_cash × MAX_LOSS_PCT`
+  - [ ] Expose `estimated_fees` on the return value so decision.py can log it
+
+- [ ] Update `strategy/decision.py` for fee-aware gating and P&L
+  - [ ] Entry gate: reject if `net_debit × qty + entry_fees > available_cash × MAX_LOSS_PCT`
+  - [ ] Roll decision: compute `roll_fees`; only proceed with roll if `expected_theta_gain > roll_fees`; skip and close instead if fees make rolling uneconomic
+  - [ ] Stop/TP close: compute exit fees and log fee-inclusive net P&L (`gross_pnl - exit_fees - entry_fees_paid`)
+  - [ ] Expiry close: apply delivery fee when near leg expires ITM and is not a daily/weekly option
+
+- [ ] Update `execution/executor.py` paper dry-run path to simulate fees
+  - [ ] On every simulated fill (entry, roll, close), deduct the appropriate fee from the fill record
+  - [ ] Return `fees_paid` alongside the fill result so callers can track cumulative costs
+  - [ ] Ensure paper mode fee simulation uses the same `fees.py` functions as test/live — paper P&L must reflect real economics
+
+- [ ] Update `monitor/loop.py` to report accumulated fees
+  - [ ] Add `fees_paid_today` to the per-cycle log line alongside `unrealized_pnl` and `daily_pnl`
+
+- [ ] Update `portfolio/tracker.py` to track fee totals
+  - [ ] Add `fees_paid_today` and `fees_paid_total` fields (sourced from closed-trade records in SQLite)
+  - [ ] Include both in the `portfolio_view()` snapshot
+
+- [ ] Update `backtest/engine.py` to apply fees to every simulated action
+  - [ ] Entry: deduct `entry_fees` from trade P&L at open
+  - [ ] Roll: deduct `roll_fees` at each roll event
+  - [ ] Exit: deduct `exit_fees` (and delivery fee if applicable) at close
+  - [ ] Add `total_fees` column to the backtest summary output per regime
+
+- [ ] Write/update unit tests
+  - [ ] `tests/test_fees.py` — full coverage: per-leg fee, combo discount, delivery fee, SOL zero-maker, fee cap, round-trip total
+  - [ ] `tests/test_scanner.py` — new tests: candidates rejected after fee-adjusted EV < MIN_EV; fee drag logged correctly
+  - [ ] `tests/test_decision.py` — new tests: entry rejected when fees push cost above MAX_LOSS_PCT; roll skipped when roll_fees > theta gain; fee-inclusive P&L at close
+  - [ ] `tests/test_executor.py` — new tests: paper fill returns correct `fees_paid`; fee amounts match `fees.py` output
+
+- [ ] Add `scratch/scratch_fees.py` — demonstrates fee calculation across all scenarios
+  - [ ] Entry fees (with and without combo discount) for BTC, ETH, SOL
+  - [ ] Expiry: near leg OTM (no delivery fee), near leg ITM with daily option (no delivery fee), near leg ITM with monthly option (delivery fee applies)
+  - [ ] Roll fees vs theta gain comparison — shows break-even roll threshold
+  - [ ] Early close (stop-loss / take-profit) — gross vs net P&L after fees
+  - [ ] Aborts if `TRADING_MODE == "live"`
+
+---
+
 ## Phase 9 — Paper Trading Validation
 
 - [ ] Run bot in paper mode (`DERIBIT_PAPER = True`) for minimum 4 weeks

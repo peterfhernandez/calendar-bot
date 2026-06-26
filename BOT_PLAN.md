@@ -191,6 +191,85 @@ The `alerts/notifier.py` module is implemented but not wired into the live execu
 - Add a `scratch/scratch_notify_live.py` that sends a test alert via the real SMTP/Telegram config
 - Add a startup self-test in `bot.py` that sends a "Bot started" notification; if it fails, log a warning but do not abort
 
+### 12. Trading Fee Integration *(new — medium effort)*
+
+Fees on Deribit are material relative to calendar spread premiums and must be accounted for at every stage of the trade lifecycle — not just at entry.
+
+#### Deribit fee schedule (options)
+
+| Asset | Taker fee | Maker fee | Minimum fee |
+| --- | --- | --- | --- |
+| BTC options | 0.03% of index | 0.03% of index | 0.0003 BTC/contract |
+| ETH options | 0.03% of index | 0.03% of index | 0.0003 ETH/contract |
+| SOL options | 0.03% of index | **0%** | 0.0003 SOL/contract (taker only) |
+
+**Combo/spread order discount:** For taker combo orders, the cheaper leg receives a **100% fee discount** — only the more expensive leg is charged. For maker combo orders, rebates are reduced by 50%.
+
+**Delivery fees** (charged at expiry when an option is ITM and settled):
+
+| Instrument | Delivery fee |
+| --- | --- |
+| Daily options (1d near leg) | **0%** — no delivery fee |
+| Weekly options (7d near leg) | **0%** — no delivery fee |
+| All other options (14d, 30d, 45d, 60d) | 0.015% of underlying, capped at 12.5% of option value |
+
+**Fee cap:** No single-leg fee can exceed 12.5% of the option's current market value. This protects against oversized fees on very cheap or deep-OTM options.
+
+#### Fee scenarios for calendar spreads
+
+| Scenario | Legs touched | Approximate fee (BTC at $100k, 1 contract) |
+| --- | --- | --- |
+| Entry via combo order | 2 (discount on cheap leg) | ~$30–$45 |
+| Entry via individual legs | 2 | ~$60 |
+| Close at expiry — near OTM | 1 (close far only) | ~$30 |
+| Close at expiry — near ITM, daily/weekly | 1 (close far) + 0 delivery | ~$30 |
+| Close at expiry — near ITM, monthly | 1 (close far) + delivery on near | ~$45 |
+| Roll near leg | 2 (close old near + open new near) | ~$60 additional |
+| Early close (stop-loss / take-profit) | 2 | ~$60 |
+
+#### Integration points
+
+**`core/fees.py`** — Central fee calculation module. Functions:
+- `leg_fee(asset, spot, qty, is_maker, option_price)` — per-leg fee in USD; applies rate, min floor, and 12.5% cap
+- `entry_fees(asset, spot, qty, near_price, far_price, via_combo)` — total entry cost; applies combo cheap-leg discount
+- `exit_fees(asset, spot, qty, near_price, far_price)` — total exit cost for closing both legs
+- `roll_fees(asset, spot, qty, near_price, new_near_price)` — cost to close old near + open new near
+- `delivery_fee(asset, spot, qty, option_price, expiry_days)` — 0 for daily/weekly, else 0.015% capped
+- `round_trip_fees(asset, spot, qty, near_price, far_price, via_combo)` — entry + exit combined; used in EV
+
+**`config.py`** — New fee constants:
+```python
+OPTIONS_FEE_PCT           = 0.0003   # 0.03% — taker/maker rate per leg (BTC, ETH)
+OPTIONS_MIN_FEE_BTC       = 0.0003   # minimum fee in BTC per contract
+OPTIONS_MIN_FEE_ETH       = 0.0003   # minimum fee in ETH per contract
+OPTIONS_MIN_FEE_SOL       = 0.0003   # minimum fee in SOL per contract (taker)
+SOL_MAKER_FEE_PCT         = 0.0      # SOL options maker fee is zero
+OPTIONS_DELIVERY_FEE_PCT  = 0.00015  # 0.015% delivery fee for monthly+ options
+OPTIONS_DELIVERY_FEE_CAP  = 0.125    # cap at 12.5% of option value
+COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # 100% taker discount on cheaper combo leg
+```
+
+**`strategy/scanner.py`** — Deduct `round_trip_fees` from EV before comparing to `MIN_EV`. Candidates that are profitable before fees but negative after fees are rejected at scan time.
+
+**`strategy/sizer.py`** — True max-loss = `net_debit × qty + entry_fees + exit_fees`. Sizing enforces this against `available_cash × MAX_LOSS_PCT`, not just the raw debit.
+
+**`strategy/decision.py`** — Three fee-aware changes:
+1. Entry gate: reject if `net_debit × qty + entry_fees > available_cash × MAX_LOSS_PCT`
+2. Roll gate: compute `roll_fees`; only roll if estimated theta gain exceeds roll cost; close instead if uneconomic
+3. P&L reporting: log fee-inclusive net P&L at every stop, TP, and expiry close
+
+**`execution/executor.py`** — Paper dry-run path deducts simulated fees using the same `fees.py` functions as test/live. Paper P&L must match real economics so paper trading results are meaningful.
+
+**`monitor/loop.py`** — Report `fees_paid_today` alongside unrealized P&L in every cycle log.
+
+**`portfolio/tracker.py`** — Track `fees_paid_today` and `fees_paid_total`; include in `portfolio_view()`.
+
+**`backtest/engine.py`** — Apply fees at every simulated event (entry, roll, exit, delivery). Add `total_fees` to backtest summary output so each vol regime report shows the true fee drag.
+
+#### Why this matters
+
+At BTC = $100,000, each calendar spread entry costs ~$30–$60 in fees — potentially 10–30% of the net debit on a tight spread. A stop-loss at 50% of debit loses $100 gross but $160 net after round-trip fees. Without fee modelling, EV scores are overstated, position sizing is too aggressive, and roll decisions can destroy value (the roll-loop bug that fired 207 times would have been commercially fatal in a live account).
+
 ### 11. Trading Mode — Paper, Test, and Live *(new — light effort)*
 
 The bot supports three operational modes selected by `TRADING_MODE` in `config.py`:
@@ -327,6 +406,9 @@ calendar-bot/
 | Cash over-commitment | Portfolio tracker enforces `available_cash` check before every entry |
 | Silent notification failures | Startup self-test notification; warning logged but bot continues |
 | Wrong environment | Startup banner clearly states PAPER / TEST / LIVE; bot refuses to start in live mode without DAILY_LOSS_LIMIT; scratch scripts abort if TRADING_MODE == "live" |
+| Fee drag erodes profitability | All EV scores deducted for round-trip fees before entry; sizer includes fees in max-loss; paper mode simulates fees identically to live |
+| Roll loop accumulating fees | Roll gate checks that theta gain exceeds `roll_fees` before proceeding; uneconomic rolls close the position instead |
+| Backtest overstates returns | `backtest/engine.py` applies entry, roll, exit, and delivery fees to every trade; summary reports include `total_fees` per regime |
 
 ---
 
@@ -437,6 +519,17 @@ DERIBIT_REST_URL = "https://www.deribit.com"           if _LIVE else "https://te
 
 DAILY_LOSS_LIMIT  = 500      # USD — halt bot if exceeded (required for live mode)
 
+# Fee model (Deribit schedule — do not change without verifying against support.deribit.com/hc/en-us/articles/25944746248989)
+OPTIONS_FEE_PCT           = 0.0003   # 0.03% per leg per trade (BTC and ETH options, taker and maker)
+OPTIONS_MIN_FEE_BTC       = 0.0003   # minimum fee in BTC per contract
+OPTIONS_MIN_FEE_ETH       = 0.0003   # minimum fee in ETH per contract
+OPTIONS_MIN_FEE_SOL       = 0.0003   # minimum fee in SOL per contract (taker only)
+SOL_MAKER_FEE_PCT         = 0.0      # SOL options maker fee is zero
+OPTIONS_DELIVERY_FEE_PCT  = 0.00015  # 0.015% of underlying at expiry for monthly+ options
+OPTIONS_DELIVERY_FEE_CAP  = 0.125    # cap: delivery fee never exceeds 12.5% of option value
+COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the cheaper leg
+# No delivery fee for daily (1d) or weekly (7d) options — only monthly and longer
+
 # Alerts (set in .env, referenced here for documentation)
 # ALERT_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
 # TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -467,5 +560,6 @@ DAILY_LOSS_LIMIT  = 500      # USD — halt bot if exceeded (required for live m
 | **1d near-leg horizon** | **0.5 day** | **Done** |
 | **Notification wiring** | **0.5–1 day** | **Done** |
 | **test.deribit.com wiring** | **0.5 day** | **Done** |
+| **Trading fee integration** | **1–2 days** | **Not started** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~8–14 days** | |
