@@ -16,6 +16,7 @@ even when python-telegram-bot is not installed and TELEGRAM_TOKEN is unset.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from pathlib import Path
@@ -89,10 +90,11 @@ class TelegramCommandListener:
         cache: ChainCache,
         db_path: Path = DB_PATH,
     ) -> None:
-        self._engine  = engine
-        self._cache   = cache
-        self._db_path = db_path
+        self._engine   = engine
+        self._cache    = cache
+        self._db_path  = db_path
         self._app: Application | None = None
+        self._stopped  = asyncio.Event()
 
     def _build_app(self) -> Application:
         from telegram.ext import Application, CommandHandler
@@ -173,11 +175,12 @@ class TelegramCommandListener:
         except Exception as exc:
             logger.warning("Failed to register Telegram command menu: %s", exc)
 
+        self._stopped.clear()
         await self._app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram command listener active.")
 
-        # Block until the updater stops (triggered by stop()).
-        await self._app.updater.idle()
+        # Block until stop() signals shutdown.
+        await self._stopped.wait()
 
     async def stop(self) -> None:
         """Cleanly shut down the polling loop."""
@@ -192,4 +195,5 @@ class TelegramCommandListener:
             logger.warning("Error stopping Telegram listener: %s", exc)
         finally:
             self._app = None
+            self._stopped.set()
         logger.info("Telegram command listener stopped.")
