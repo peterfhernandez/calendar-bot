@@ -41,6 +41,11 @@ def _mid(bid: float, ask: float) -> float | None:
     return None
 
 
+def _fmt_ev(ev_score: float) -> str:
+    """Return formatted EV string, or 'N/A' for the 0.0 sentinel (pre-tracking trades)."""
+    return f"{ev_score:.2f}" if ev_score != 0.0 else "N/A"
+
+
 def _fmt_expiry(expiry_iso: str) -> str:
     """Convert ISO date string to ddMMMYY format, e.g. '2026-06-27' → '27Jun26'."""
     try:
@@ -89,7 +94,7 @@ async def handle_positions(
         opt_type  = _fmt_type(t.option_type)
 
         lines.append(
-            f"ev={t.ev_score:.2f}  #{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}\n"
+            f"ev={_fmt_ev(t.ev_score)}  #{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}\n"
             f"  entry=${t.net_debit * t.qty:.2f}  {val_note}"
         )
 
@@ -156,7 +161,7 @@ async def handle_new_trades(
         far_date  = _fmt_expiry(t.expiry_far)
         opt_type  = _fmt_type(t.option_type)
         lines.append(
-            f"#{t.id} {t.asset}  debit=${t.net_debit * t.qty:.2f}  ev={t.ev_score:.2f}"
+            f"#{t.id} {t.asset}  debit=${t.net_debit * t.qty:.2f}  ev={_fmt_ev(t.ev_score)}"
             f"  {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
         )
 
@@ -233,7 +238,7 @@ async def handle_portfolio(
 
         lines.append(
             f"#{t.id} {t.asset} {opt_type} {t.strike:.0f}  {near_date}→{far_date}\n"
-            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  EV: {t.ev_score:.2f}\n"
+            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  EV: {_fmt_ev(t.ev_score)}\n"
             f"  Value: {val_str}"
         )
 
