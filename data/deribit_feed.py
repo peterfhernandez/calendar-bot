@@ -104,6 +104,8 @@ class DeribitFeed:
         self._req_id   = 0
         self._pending:  dict[int, asyncio.Future] = {}
         self._instruments: dict[str, list[str]] = {}  # asset → instrument names
+        self._offline  = False   # True while disconnected; suppresses repeated warnings
+        self._retry_count = 0    # retries since last successful connection
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -114,6 +116,12 @@ class DeribitFeed:
         while self._running:
             try:
                 await self._connect_and_stream()
+                if self._offline:
+                    logger.info(
+                        "Feed reconnected after %d attempt(s)", self._retry_count
+                    )
+                    self._offline = False
+                    self._retry_count = 0
                 backoff = 1.0  # reset on clean exit
             except (
                 websockets.exceptions.ConnectionClosed,
@@ -122,11 +130,27 @@ class DeribitFeed:
             ) as exc:
                 if not self._running:
                     break
-                logger.warning("Feed disconnected (%s); reconnecting in %.0fs", exc, backoff)
+                if not self._offline:
+                    logger.warning("Feed offline (%s) — retrying every %.0fs", exc, backoff)
+                    self._offline = True
+                    self._retry_count = 0
+                else:
+                    self._retry_count += 1
+                    logger.debug(
+                        "Feed still offline (attempt %d, next in %.0fs)", self._retry_count, backoff
+                    )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.backoff_max)
-            except Exception:
-                logger.exception("Unexpected error in feed; reconnecting in %.0fs", backoff)
+            except Exception as exc:
+                if not self._offline:
+                    logger.exception("Unexpected feed error — retrying in %.0fs", backoff)
+                    self._offline = True
+                    self._retry_count = 0
+                else:
+                    self._retry_count += 1
+                    logger.debug(
+                        "Feed still offline (attempt %d, next in %.0fs)", self._retry_count, backoff
+                    )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.backoff_max)
 

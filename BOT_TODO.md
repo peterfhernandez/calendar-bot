@@ -494,6 +494,28 @@ Updated existing commands and added new runtime-control commands.
 
 ---
 
+## Phase 10 — Offline Error Tracking
+
+- [x] Update `data/deribit_feed.py` — suppress repeated reconnect warnings
+  - [x] Add `_offline: bool` and `_retry_count: int` to `DeribitFeed.__init__`
+  - [x] Log `WARNING` once on first disconnect; `DEBUG` on subsequent attempts; `INFO` on reconnect with attempt count
+- [x] Update `portfolio/tracker.py` — suppress repeated REST failure warnings
+  - [x] Add `_api_offline: bool` and `_api_fail_count: int` to `PortfolioTracker.__init__`
+  - [x] Log `WARNING` once on first failure; `DEBUG` on subsequent attempts; `INFO` on recovery with attempt count
+  - [x] Per-currency `except` in `_refresh_from_api` re-raises to the outer handler (was logging once per asset per cycle)
+- [x] Add `TestDeribitFeedOfflineTracking` (3 tests) to `tests/test_feed.py`
+  - [x] First failure sets `_offline` flag
+  - [x] Repeated failures increment `_retry_count`
+  - [x] Recovery clears flag and resets counter
+- [x] Add `TestOfflineTracking` (5 tests) to `tests/test_portfolio.py`
+  - [x] First failure sets `_api_offline` flag
+  - [x] Repeated failures increment `_api_fail_count`
+  - [x] Only the first failure logs at WARNING; subsequent failures log at DEBUG
+  - [x] Recovery clears offline flag and resets counter
+  - [x] Recovery logs at INFO with the attempt count
+
+---
+
 ## Phase 8i — Feed Asset Expansion for Open Positions
 
 - [x] Update `bot.py` to expand the feed subscription beyond `config.ASSETS`
