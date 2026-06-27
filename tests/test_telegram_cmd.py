@@ -17,8 +17,8 @@ import config
 from db.state import (
     CalendarTrade,
     get_open_trades,
-    get_trades_closed_today,
-    get_trades_opened_today,
+    get_trades_closed_today_aest,
+    get_trades_opened_today_aest,
     init_db,
     DB_PATH,
 )
@@ -34,8 +34,8 @@ def _make_trade(
     asset: str = "BTC",
     option_type: str = "Call",
     strike: float = 90_000.0,
-    expiry_near: str = "27JUN26",
-    expiry_far: str = "25JUL26",
+    expiry_near: str = "2026-06-27",
+    expiry_far: str = "2026-07-25",
     qty: float = 1.0,
     net_debit: float = 0.02,
     open_fees: float = 0.001,
@@ -46,6 +46,8 @@ def _make_trade(
     far_instrument:  str | None = "BTC-25JUL26-90000-C",
     date_open: str = "2026-06-26",
     date_close: str | None = None,
+    notes: str | None = None,
+    ev_score: float = 0.15,
 ) -> CalendarTrade:
     return CalendarTrade(
         id=trade_id,
@@ -67,12 +69,13 @@ def _make_trade(
         close_fees=close_fees,
         result=result,
         broker=None,
-        notes=None,
+        notes=notes,
         near_instrument=near_instrument,
         far_instrument=far_instrument,
         date_close=date_close,
         spot_close=None,
         pnl=pnl,
+        ev_score=ev_score,
     )
 
 
@@ -83,8 +86,10 @@ def _make_update(chat_id: int = 12345) -> MagicMock:
     return update
 
 
-def _make_context() -> MagicMock:
-    return MagicMock()
+def _make_context(args=None) -> MagicMock:
+    ctx = MagicMock()
+    ctx.args = args or []
+    return ctx
 
 
 def _make_engine(db_path: Path | None = None) -> DecisionEngine:
@@ -175,21 +180,39 @@ class TestHandlePositions:
         assert "no open" in update.message.reply_text.call_args[0][0].lower()
 
     @pytest.mark.asyncio
-    async def test_positions_with_live_price(self):
-        """Reply contains instrument pair and unrealized PnL."""
+    async def test_positions_shows_ev_and_expiry_range(self):
+        """Reply contains ev score, expiry range, and entry cost."""
         update  = _make_update()
         context = _make_context()
         cache   = _make_cache()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        trade = _make_trade()
+        trade = _make_trade(ev_score=0.25)
         with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
         assert "BTC" in text
         assert "90000" in text
+        assert "ev=0.25" in text.lower() or "ev=" in text
+        assert "→" in text  # expiry range separator
+        assert "Call" in text  # full type name
         assert "entry=" in text.lower() or "entry" in text
+
+    @pytest.mark.asyncio
+    async def test_positions_shows_full_option_type(self):
+        """Option type shown as 'Put' or 'Call', not single letter."""
+        update  = _make_update()
+        context = _make_context()
+        cache   = _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        trade_put = _make_trade(option_type="Put")
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade_put]):
+            await handlers.handle_positions(update, context, cache, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Put" in text
 
     @pytest.mark.asyncio
     async def test_positions_stale_cache(self):
@@ -197,7 +220,7 @@ class TestHandlePositions:
         update  = _make_update()
         context = _make_context()
         cache   = MagicMock()
-        cache.get.return_value = None  # all instruments stale
+        cache.get.return_value = None
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trade = _make_trade()
@@ -208,9 +231,9 @@ class TestHandlePositions:
         assert "stale" in text.lower() or "N/A" in text
 
 
-# ── /closed_today handler ─────────────────────────────────────────────────────
+# ── /close_trades handler ─────────────────────────────────────────────────────
 
-class TestHandleClosedToday:
+class TestHandleCloseTrades:
     @pytest.mark.asyncio
     async def test_no_closed_today(self):
         update  = _make_update()
@@ -218,36 +241,39 @@ class TestHandleClosedToday:
         db_path = Path(tempfile.mktemp(suffix=".db"))
         init_db(db_path)
 
-        with patch("telegram_cmd.handlers.get_trades_closed_today", return_value=[]):
-            await handlers.handle_closed_today(update, context, db_path)
+        with patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
+            await handlers.handle_close_trades(update, context, db_path)
 
         text = update.message.reply_text.call_args[0][0].lower()
         assert "no trades" in text
 
     @pytest.mark.asyncio
-    async def test_closed_today_with_pnl(self):
-        """Reply includes count and total realized PnL."""
+    async def test_close_trades_shows_details(self):
+        """Reply includes trade id, asset, debit, pnl, and close reason."""
         update  = _make_update()
         context = _make_context()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trades = [
             _make_trade(trade_id=1, result="Win (Auto TP)", pnl=50.0,
-                        date_close="2026-06-26"),
+                        date_close="2026-06-26", notes="Take-profit (150% of debit)"),
             _make_trade(trade_id=2, result="Loss (Auto Stop)", pnl=-20.0,
-                        date_close="2026-06-26"),
+                        date_close="2026-06-26", notes="Stop-loss (50% of debit)"),
         ]
-        with patch("telegram_cmd.handlers.get_trades_closed_today", return_value=trades):
-            await handlers.handle_closed_today(update, context, db_path)
+        with patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=trades):
+            await handlers.handle_close_trades(update, context, db_path)
 
         text = update.message.reply_text.call_args[0][0]
-        assert "2" in text
-        assert "30" in text or "+30" in text  # total PnL = 50 - 20 = 30
+        assert "#1" in text
+        assert "#2" in text
+        assert "BTC" in text
+        assert "+30" in text or "30" in text  # total PnL
+        assert "Take-profit" in text or "Stop-loss" in text
 
 
-# ── /new_today handler ────────────────────────────────────────────────────────
+# ── /new_trades handler ────────────────────────────────────────────────────────
 
-class TestHandleNewToday:
+class TestHandleNewTrades:
     @pytest.mark.asyncio
     async def test_no_new_today(self):
         update  = _make_update()
@@ -255,27 +281,32 @@ class TestHandleNewToday:
         db_path = Path(tempfile.mktemp(suffix=".db"))
         init_db(db_path)
 
-        with patch("telegram_cmd.handlers.get_trades_opened_today", return_value=[]):
-            await handlers.handle_new_today(update, context, db_path)
+        with patch("telegram_cmd.handlers.get_trades_opened_today_aest", return_value=[]):
+            await handlers.handle_new_trades(update, context, db_path)
 
         text = update.message.reply_text.call_args[0][0].lower()
         assert "no new" in text
 
     @pytest.mark.asyncio
-    async def test_new_today_lists_instruments(self):
-        """Reply includes asset names and count."""
+    async def test_new_trades_shows_ev_and_expiry(self):
+        """Reply includes trade id, asset, debit, ev, strike, expiry range."""
         update  = _make_update()
         context = _make_context()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        trades = [_make_trade(trade_id=1), _make_trade(trade_id=2, asset="ETH")]
-        with patch("telegram_cmd.handlers.get_trades_opened_today", return_value=trades):
-            await handlers.handle_new_today(update, context, db_path)
+        trades = [
+            _make_trade(trade_id=1, ev_score=0.20),
+            _make_trade(trade_id=2, asset="ETH", strike=3000.0, ev_score=0.10),
+        ]
+        with patch("telegram_cmd.handlers.get_trades_opened_today_aest", return_value=trades):
+            await handlers.handle_new_trades(update, context, db_path)
 
         text = update.message.reply_text.call_args[0][0]
         assert "2" in text
         assert "BTC" in text
         assert "ETH" in text
+        assert "ev=" in text.lower()
+        assert "→" in text
 
 
 # ── /status handler ───────────────────────────────────────────────────────────
@@ -286,13 +317,16 @@ class TestHandleStatus:
         """Reply shows trading mode, drain mode, and paused flag."""
         monkeypatch.setattr(config, "TRADING_MODE", "paper")
         monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
 
         engine  = _make_engine()
         update  = _make_update()
         context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]):
-            await handlers.handle_status(update, context, engine)
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]), \
+             patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
+            await handlers.handle_status(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0].upper()
         assert "PAPER" in text
@@ -300,18 +334,41 @@ class TestHandleStatus:
         assert "PAUSED" in text
 
     @pytest.mark.asyncio
+    async def test_status_shows_today_and_session_pnl(self, monkeypatch):
+        """Reply includes both today AEST PnL and session PnL lines."""
+        monkeypatch.setattr(config, "TRADING_MODE", "paper")
+        monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+
+        engine = _make_engine()
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]), \
+             patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
+            await handlers.handle_status(update, context, engine, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "today" in text.lower() or "AEST" in text
+        assert "since start" in text.lower() or "session" in text.lower()
+
+    @pytest.mark.asyncio
     async def test_status_shows_paused_when_paused(self, monkeypatch):
         """Reply reflects paused=YES when engine is paused."""
         monkeypatch.setattr(config, "TRADING_MODE", "paper")
         monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
 
         engine = _make_engine()
         engine.pause()
         update  = _make_update()
         context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]):
-            await handlers.handle_status(update, context, engine)
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]), \
+             patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
+            await handlers.handle_status(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0]
         assert "YES" in text or "yes" in text.lower()
@@ -321,13 +378,16 @@ class TestHandleStatus:
         """Reply includes the number of open positions."""
         monkeypatch.setattr(config, "TRADING_MODE", "paper")
         monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
 
         engine  = _make_engine()
         update  = _make_update()
         context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[_make_trade(), _make_trade(trade_id=2)]):
-            await handlers.handle_status(update, context, engine)
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[_make_trade(), _make_trade(trade_id=2)]), \
+             patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
+            await handlers.handle_status(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0]
         assert "2" in text
@@ -351,8 +411,26 @@ class TestHandlePortfolio:
         assert "no open" in text
 
     @pytest.mark.asyncio
-    async def test_portfolio_includes_iv_and_oi(self):
-        """Reply includes IV and OI for each leg."""
+    async def test_portfolio_shows_ev_and_value(self):
+        """Reply includes EV and current value; does NOT include IV or OI."""
+        update  = _make_update()
+        context = _make_context()
+        cache   = _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[_make_trade(ev_score=0.30)]):
+            await handlers.handle_portfolio(update, context, cache, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "EV" in text or "ev" in text.lower()
+        assert "Value" in text or "value" in text.lower()
+        # IV and OI should NOT appear in the simplified portfolio
+        assert "IV" not in text
+        assert " OI" not in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_shows_expiry_range(self):
+        """Reply shows expiry dates as range with arrow separator."""
         update  = _make_update()
         context = _make_context()
         cache   = _make_cache()
@@ -362,12 +440,11 @@ class TestHandlePortfolio:
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
-        assert "IV" in text
-        assert "OI" in text
+        assert "→" in text
 
     @pytest.mark.asyncio
     async def test_portfolio_stale_cache_note(self):
-        """Reply includes '(cache stale)' when leg data is unavailable."""
+        """Reply includes 'N/A' or stale note when leg data is unavailable."""
         update  = _make_update()
         context = _make_context()
         cache   = MagicMock()
@@ -378,7 +455,7 @@ class TestHandlePortfolio:
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
-        assert "stale" in text.lower()
+        assert "stale" in text.lower() or "N/A" in text
 
 
 # ── /stop_bot and /start_bot ──────────────────────────────────────────────────
@@ -421,6 +498,7 @@ class TestStartDrain:
     async def test_start_drain_sets_drain_mode(self, monkeypatch):
         """/start_drain sets config.DRAIN_MODE = True."""
         monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
         engine  = _make_engine()
         update  = _make_update()
         context = _make_context()
@@ -435,6 +513,7 @@ class TestStartDrain:
     async def test_start_drain_resumes_if_paused(self, monkeypatch):
         """/start_drain also resumes the engine if it was paused."""
         monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
         engine  = _make_engine()
         engine.pause()
         update  = _make_update()
@@ -444,6 +523,108 @@ class TestStartDrain:
 
         assert not engine.paused
         assert config.DRAIN_MODE is True
+
+
+# ── /start_with_assets ────────────────────────────────────────────────────────
+
+class TestStartWithAssets:
+    @pytest.mark.asyncio
+    async def test_updates_assets_and_resumes(self, monkeypatch):
+        """/start_with_assets BTC,ETH updates config.ASSETS and resumes."""
+        monkeypatch.setattr(config, "ASSETS", ["BTC"])
+        monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+
+        engine  = _make_engine()
+        engine.pause()
+        update  = _make_update()
+        context = _make_context(args=["BTC,ETH,SOL"])
+
+        await handlers.handle_start_with_assets(update, context, engine)
+
+        assert config.ASSETS == ["BTC", "ETH", "SOL"]
+        assert not engine.paused
+        text = update.message.reply_text.call_args[0][0]
+        assert "BTC" in text and "ETH" in text and "SOL" in text
+
+    @pytest.mark.asyncio
+    async def test_no_args_sends_usage(self):
+        """/start_with_assets with no args replies with usage instructions."""
+        engine  = _make_engine()
+        update  = _make_update()
+        context = _make_context(args=[])
+
+        await handlers.handle_start_with_assets(update, context, engine)
+
+        text = update.message.reply_text.call_args[0][0].lower()
+        assert "usage" in text
+
+
+# ── /drain_and_new ────────────────────────────────────────────────────────────
+
+class TestDrainAndNew:
+    @pytest.mark.asyncio
+    async def test_sets_drain_and_new_mode(self, monkeypatch):
+        """/drain_and_new sets DRAIN_AND_NEW_MODE and clears DRAIN_MODE."""
+        monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+        monkeypatch.setattr(config, "PORTFOLIO_OVERRIDE", None)
+
+        engine  = _make_engine()
+        update  = _make_update()
+        context = _make_context(args=["portfolio=50000", "assets=BTC,ETH"])
+
+        await handlers.handle_drain_and_new(update, context, engine)
+
+        assert config.DRAIN_AND_NEW_MODE is True
+        assert config.DRAIN_MODE is False
+        assert config.PORTFOLIO_OVERRIDE == 50000.0
+        assert config.ASSETS == ["BTC", "ETH"]
+
+    @pytest.mark.asyncio
+    async def test_portfolio_override_updates_engine(self, monkeypatch):
+        """/drain_and_new portfolio=N also updates engine.portfolio_value."""
+        monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+        monkeypatch.setattr(config, "PORTFOLIO_OVERRIDE", None)
+
+        engine  = _make_engine()
+        update  = _make_update()
+        context = _make_context(args=["portfolio=75000"])
+
+        await handlers.handle_drain_and_new(update, context, engine)
+
+        assert engine.portfolio_value == 75000.0
+
+    @pytest.mark.asyncio
+    async def test_invalid_portfolio_value_replies_error(self, monkeypatch):
+        """/drain_and_new portfolio=abc replies with an error."""
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+
+        engine  = _make_engine()
+        update  = _make_update()
+        context = _make_context(args=["portfolio=abc"])
+
+        await handlers.handle_drain_and_new(update, context, engine)
+
+        text = update.message.reply_text.call_args[0][0].lower()
+        assert "invalid" in text
+
+    @pytest.mark.asyncio
+    async def test_resumes_if_paused(self, monkeypatch):
+        """/drain_and_new resumes the engine if it was paused."""
+        monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+        monkeypatch.setattr(config, "PORTFOLIO_OVERRIDE", None)
+
+        engine  = _make_engine()
+        engine.pause()
+        update  = _make_update()
+        context = _make_context(args=[])
+
+        await handlers.handle_drain_and_new(update, context, engine)
+
+        assert not engine.paused
 
 
 # ── /help handler and COMMAND_REGISTRY ───────────────────────────────────────
@@ -475,7 +656,6 @@ class TestHandleHelp:
 
         text = update.message.reply_text.call_args[0][0]
         for _cmd, desc in COMMAND_REGISTRY:
-            # At least a portion of each description should appear
             assert desc[:20] in text, f"Description '{desc[:20]}...' missing from /help"
 
 
@@ -486,8 +666,9 @@ class TestSetMyCommands:
 
         command_names = {cmd for cmd, _ in COMMAND_REGISTRY}
         expected = {
-            "positions", "closed_today", "new_today", "status",
-            "portfolio", "stop_bot", "start_bot", "start_drain", "help",
+            "positions", "close_trades", "new_trades", "status",
+            "portfolio", "stop_bot", "start_bot", "start_drain",
+            "start_with_assets", "drain_and_new", "help",
         }
         assert expected == command_names
 
@@ -522,7 +703,6 @@ class TestSetMyCommands:
         mock_app.shutdown = AsyncMock()
         mock_app.add_handler = MagicMock()
 
-        # Stub out BotCommand so the cryptography C extension is never loaded.
         mock_bot_command_cls = MagicMock(side_effect=lambda cmd, desc: MagicMock(command=cmd))
         mock_telegram_module = MagicMock()
         mock_telegram_module.BotCommand = mock_bot_command_cls

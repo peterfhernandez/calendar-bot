@@ -36,15 +36,17 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth for commands — drives both set_my_commands() and /help.
 COMMAND_REGISTRY: list[tuple[str, str]] = [
-    ("positions",    "Open trades: instrument pair, entry cost, current spread value, unrealized PnL"),
-    ("closed_today", "Trades closed since midnight UTC and their total realized PnL"),
-    ("new_today",    "Positions opened since midnight UTC and their instrument names"),
-    ("status",       "Trading mode, drain mode, paused state, uptime, open count, daily PnL"),
-    ("portfolio",    "Open trades with asset, strike, expiries, debit, fees, EV, IV, OI"),
-    ("stop_bot",     "Pause scanning and monitoring (feed and listener remain alive)"),
-    ("start_bot",    "Resume scanning and monitoring after a pause"),
-    ("start_drain",  "Activate drain mode — no new entries or rolls; positions close at stop/TP/expiry"),
-    ("help",         "List all available commands with descriptions"),
+    ("positions",         "Open trades: ev, strike/type, expiry range, entry cost, current value, PnL"),
+    ("portfolio",         "Open trades: asset, strike, expiry range, debit, fees, EV, current value"),
+    ("new_trades",        "Trades entered today AEST with id, asset, debit, ev, strike, expiry range"),
+    ("close_trades",      "Trades closed today AEST with id, asset, debit, pnl, close reason"),
+    ("status",            "Trading mode, drain mode, paused state, uptime, open count, today/session PnL"),
+    ("stop_bot",          "Pause scanning and monitoring (feed and listener remain alive)"),
+    ("start_bot",         "Resume scanning and monitoring after a pause"),
+    ("start_drain",       "Drain mode — no new entries or rolls; existing positions close at stop/TP/expiry"),
+    ("start_with_assets", "Override asset list and resume: /start_with_assets BTC,ETH,SOL"),
+    ("drain_and_new",     "Close existing positions (no rolls) but allow new entries: /drain_and_new portfolio=N assets=BTC,ETH"),
+    ("help",              "List all available commands with descriptions"),
 ]
 
 
@@ -111,16 +113,16 @@ class TelegramCommandListener:
             await handlers.handle_positions(update, context, cache, db_path)
 
         @_require_authorized_chat
-        async def cmd_closed_today(update, context):
-            await handlers.handle_closed_today(update, context, db_path)
+        async def cmd_close_trades(update, context):
+            await handlers.handle_close_trades(update, context, db_path)
 
         @_require_authorized_chat
-        async def cmd_new_today(update, context):
-            await handlers.handle_new_today(update, context, db_path)
+        async def cmd_new_trades(update, context):
+            await handlers.handle_new_trades(update, context, db_path)
 
         @_require_authorized_chat
         async def cmd_status(update, context):
-            await handlers.handle_status(update, context, engine)
+            await handlers.handle_status(update, context, engine, db_path)
 
         @_require_authorized_chat
         async def cmd_portfolio(update, context):
@@ -139,18 +141,28 @@ class TelegramCommandListener:
             await handlers.handle_start_drain(update, context, engine)
 
         @_require_authorized_chat
+        async def cmd_start_with_assets(update, context):
+            await handlers.handle_start_with_assets(update, context, engine)
+
+        @_require_authorized_chat
+        async def cmd_drain_and_new(update, context):
+            await handlers.handle_drain_and_new(update, context, engine)
+
+        @_require_authorized_chat
         async def cmd_help(update, context):
             await handlers.handle_help(update, context)
 
-        app.add_handler(CommandHandler("positions",    cmd_positions))
-        app.add_handler(CommandHandler("closed_today", cmd_closed_today))
-        app.add_handler(CommandHandler("new_today",    cmd_new_today))
-        app.add_handler(CommandHandler("status",       cmd_status))
-        app.add_handler(CommandHandler("portfolio",    cmd_portfolio))
-        app.add_handler(CommandHandler("stop_bot",     cmd_stop_bot))
-        app.add_handler(CommandHandler("start_bot",    cmd_start_bot))
-        app.add_handler(CommandHandler("start_drain",  cmd_start_drain))
-        app.add_handler(CommandHandler("help",         cmd_help))
+        app.add_handler(CommandHandler("positions",         cmd_positions))
+        app.add_handler(CommandHandler("close_trades",      cmd_close_trades))
+        app.add_handler(CommandHandler("new_trades",        cmd_new_trades))
+        app.add_handler(CommandHandler("status",            cmd_status))
+        app.add_handler(CommandHandler("portfolio",         cmd_portfolio))
+        app.add_handler(CommandHandler("stop_bot",          cmd_stop_bot))
+        app.add_handler(CommandHandler("start_bot",         cmd_start_bot))
+        app.add_handler(CommandHandler("start_drain",       cmd_start_drain))
+        app.add_handler(CommandHandler("start_with_assets", cmd_start_with_assets))
+        app.add_handler(CommandHandler("drain_and_new",     cmd_drain_and_new))
+        app.add_handler(CommandHandler("help",              cmd_help))
 
         return app
 

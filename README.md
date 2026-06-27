@@ -101,17 +101,21 @@ The bot accepts incoming commands from the same Telegram chat it uses for outgoi
 
 | Command | What it returns |
 | --- | --- |
-| `/positions` | One line per open trade: instrument pair, entry cost, current spread value, unrealized PnL in USD and % |
-| `/closed_today` | Count of trades closed since midnight UTC and their total realized PnL |
-| `/new_today` | Count of positions opened since midnight UTC and their instrument names |
-| `/status` | Trading mode, drain mode on/off, bot paused/running, uptime, open position count, daily PnL |
-| `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, near and far IV, near and far OI |
-| `/help` | Lists every available command with a one-line description |
+| `/positions` | One line per open trade: `ev=` at start, strike and full type (`Put`/`Call`), expiry range `ddMMMYY→ddMMMYY`, entry cost, current spread value, unrealized PnL |
+| `/portfolio` | One line per open trade: asset, strike, expiry range, debit, fees, EV at entry, current spread value (no IV or OI) |
+| `/new_trades` | List of trades entered today AEST — per trade: id, asset, debit, ev, strike, type, expiry range |
+| `/close_trades` | List of trades closed today AEST — per trade: id, asset, debit, pnl, close reason |
+| `/status` | Trading mode, drain/drain-and-new mode, paused/running, uptime, open count, today AEST PnL, session PnL since bot start |
+| `/help` | Lists every available commands with a one-line description |
 | `/stop_bot` | Pauses scan and monitor ticks; the feed and listener remain alive; positions are not closed |
 | `/start_bot` | Resumes normal scanning and monitoring |
-| `/start_drain` | Activates drain mode at runtime — no new entries or rolls; existing positions close at stop/TP/expiry |
+| `/start_drain` | Activates drain mode — no new entries or rolls; existing positions close at stop/TP/expiry |
+| `/start_with_assets BTC,ETH,...` | Override the active asset list at runtime and resume scanning |
+| `/drain_and_new [portfolio=N] [assets=A,B]` | Close existing positions outright (no rolls) while still allowing new entries; optionally sets a new portfolio budget and asset list |
 
 `/stop_bot` and `/start_bot` pause and resume the decision engine without restarting the process, so the listener stays connected throughout.
+
+`/drain_and_new` differs from `/start_drain` in that new entries are still allowed — existing positions are closed outright at stop/TP/expiry rather than rolled, but the scanner continues to find and enter new setups. An optional `portfolio=N` argument overrides the live account cash used for position sizing.
 
 Typing `/` in the Telegram chat will show a suggestion menu listing all commands — this is populated automatically when the bot starts via Telegram's `setMyCommands` API, with no manual BotFather setup required.
 

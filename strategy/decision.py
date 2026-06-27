@@ -209,6 +209,7 @@ class DecisionEngine:
         self._notifier        = notifier
         self._state           = BotState.IDLE
         self._today_pnl: float = 0.0       # realised P&L; accumulates from closed positions
+        self._session_pnl: float = 0.0     # realised P&L since bot start (never resets)
         self._unrealized_pnl: float = 0.0  # MTM P&L of currently-held positions; refreshed each monitor tick
         self._fees_paid_today: float = 0.0  # cumulative fees paid today (entry + exit + roll)
         self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
@@ -249,6 +250,11 @@ class DecisionEngine:
     def start_time(self) -> datetime:
         """UTC datetime when this engine instance was created."""
         return self._start_time
+
+    @property
+    def session_pnl(self) -> float:
+        """Total realised P&L accumulated since this engine instance started."""
+        return self._session_pnl
 
     def pause(self) -> None:
         """Suspend scan_tick and monitor_tick. Feed and portfolio tracker remain active."""
@@ -291,7 +297,11 @@ class DecisionEngine:
             try:
                 state = self._portfolio.refresh()
                 if state.available_cash > 0:
-                    self._portfolio_value = state.available_cash
+                    self._portfolio_value = (
+                        config.PORTFOLIO_OVERRIDE
+                        if config.PORTFOLIO_OVERRIDE is not None
+                        else state.available_cash
+                    )
                     logger.debug(
                         "Portfolio refreshed: available_cash=$%.2f equity=$%.2f",
                         state.available_cash, state.equity_usd,
@@ -308,8 +318,8 @@ class DecisionEngine:
 
         open_positions = self._load_all_open_positions()
 
-        # ── Drain mode: skip entry entirely ──────────────────────────────────
-        if config.DRAIN_MODE:
+        # ── Drain mode: skip entry entirely (drain_and_new still allows entry) ──
+        if config.DRAIN_MODE and not config.DRAIN_AND_NEW_MODE:
             self._state = BotState.IDLE if not open_positions else BotState.MONITOR
             logger.info("DRAIN MODE — scan_tick skipped (no new entries). Open: %d", len(open_positions))
             return self._status("Drain mode: no new entries.", open_positions)
@@ -575,6 +585,7 @@ class DecisionEngine:
             near_instrument=candidate.near_instrument,
             far_instrument=candidate.far_instrument,
             open_fees=open_fees_usd,
+            ev_score=candidate.ev_score,
             db_path=self._db_path,
         )
         logger.info(
@@ -668,7 +679,7 @@ class DecisionEngine:
         # Roll trigger: near leg approaching expiry and no exit signal yet.
         # In drain mode, skip rolling and close instead.
         if near_days_left <= _ROLL_TRIGGER_DAYS:
-            if config.DRAIN_MODE:
+            if config.DRAIN_MODE or config.DRAIN_AND_NEW_MODE:
                 logger.info(
                     "DRAIN MODE — trade_id=%d near leg expires in %d day(s), closing instead of rolling",
                     trade_id, near_days_left,
@@ -751,6 +762,7 @@ class DecisionEngine:
             db_path=self._db_path,
         )
         self._today_pnl += pnl
+        self._session_pnl += pnl
         logger.info(
             "CLOSE trade_id=%d  gross_pnl=%.2f  close_fees=%.2f  net_pnl=%.2f  "
             "open_fees=%.2f  total_fees=%.2f  reason=%s  daily_pnl=%.2f",
