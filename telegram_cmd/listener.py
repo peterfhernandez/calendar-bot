@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 COMMAND_REGISTRY: list[tuple[str, str]] = [
     ("positions",         "Open trades: ev, strike/type, expiry range, entry cost, current value, PnL"),
     ("portfolio",         "Open trades: asset, strike, expiry range, debit, fees, EV, current value"),
-    ("new_trades",        "Trades entered today AEST with id, asset, debit, ev, strike, expiry range"),
-    ("close_trades",      "Trades closed today AEST with id, asset, debit, pnl, close reason"),
+    ("new_trades",        "New trades: /new_trades [today|session] — defaults to today AEST"),
+    ("closed_trades",     "Closed trades: /closed_trades [today|session] — defaults to today AEST"),
     ("status",            "Trading mode, drain mode, paused state, uptime, open count, today/session PnL"),
     ("stop_bot",          "Pause scanning and monitoring (feed and listener remain alive)"),
     ("start_bot",         "Resume scanning and monitoring after a pause"),
@@ -113,12 +113,12 @@ class TelegramCommandListener:
             await handlers.handle_positions(update, context, cache, db_path)
 
         @_require_authorized_chat
-        async def cmd_close_trades(update, context):
-            await handlers.handle_close_trades(update, context, db_path)
+        async def cmd_closed_trades(update, context):
+            await handlers.handle_closed_trades(update, context, engine, db_path)
 
         @_require_authorized_chat
         async def cmd_new_trades(update, context):
-            await handlers.handle_new_trades(update, context, db_path)
+            await handlers.handle_new_trades(update, context, engine, db_path)
 
         @_require_authorized_chat
         async def cmd_status(update, context):
@@ -153,7 +153,7 @@ class TelegramCommandListener:
             await handlers.handle_help(update, context)
 
         app.add_handler(CommandHandler("positions",         cmd_positions))
-        app.add_handler(CommandHandler("close_trades",      cmd_close_trades))
+        app.add_handler(CommandHandler("closed_trades",     cmd_closed_trades))
         app.add_handler(CommandHandler("new_trades",        cmd_new_trades))
         app.add_handler(CommandHandler("status",            cmd_status))
         app.add_handler(CommandHandler("portfolio",         cmd_portfolio))

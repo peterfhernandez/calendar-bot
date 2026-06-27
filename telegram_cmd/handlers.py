@@ -18,7 +18,9 @@ import config
 from db.state import (
     get_open_trades,
     get_trades_closed_today_aest,
+    get_trades_closed_since,
     get_trades_opened_today_aest,
+    get_trades_opened_since,
     DB_PATH,
 )
 
@@ -94,19 +96,29 @@ async def handle_positions(
     await update.message.reply_text("\n\n".join(lines))
 
 
-async def handle_close_trades(
+async def handle_closed_trades(
     update: Update,
     context: CallbackContext,
+    engine: DecisionEngine,
     db_path: Path = DB_PATH,
 ) -> None:
-    """List of trades closed today AEST with id, asset, debit, pnl, close reason."""
-    trades = get_trades_closed_today_aest(db_path)
+    """List of closed trades. Usage: /closed_trades [today|session] (default: today)."""
+    args = context.args
+    mode = (args[0].lower() if args else "today")
+
+    if mode == "session":
+        trades = get_trades_closed_since(engine.start_time, db_path)
+        label = "since bot start"
+    else:
+        trades = get_trades_closed_today_aest(db_path)
+        label = f"today ({_AEST_LABEL})"
+
     if not trades:
-        await update.message.reply_text(f"No trades closed today ({_AEST_LABEL}).")
+        await update.message.reply_text(f"No trades closed {label}.")
         return
 
     total_pnl = sum(t.pnl for t in trades if t.pnl is not None)
-    lines = [f"{len(trades)} trade(s) closed today ({_AEST_LABEL}). Total PnL: ${total_pnl:+.2f}\n"]
+    lines = [f"{len(trades)} trade(s) closed {label}. Total PnL: ${total_pnl:+.2f}\n"]
     for t in trades:
         pnl_str = f"${t.pnl:+.2f}" if t.pnl is not None else "N/A"
         reason  = t.notes or t.result or "—"
@@ -120,15 +132,25 @@ async def handle_close_trades(
 async def handle_new_trades(
     update: Update,
     context: CallbackContext,
+    engine: DecisionEngine,
     db_path: Path = DB_PATH,
 ) -> None:
-    """List of new trades entered today AEST with id, asset, debit, ev, strike, expiry range."""
-    trades = get_trades_opened_today_aest(db_path)
+    """List of new trades. Usage: /new_trades [today|session] (default: today)."""
+    args = context.args
+    mode = (args[0].lower() if args else "today")
+
+    if mode == "session":
+        trades = get_trades_opened_since(engine.start_time, db_path)
+        label = "since bot start"
+    else:
+        trades = get_trades_opened_today_aest(db_path)
+        label = f"today ({_AEST_LABEL})"
+
     if not trades:
-        await update.message.reply_text(f"No new trades today ({_AEST_LABEL}).")
+        await update.message.reply_text(f"No new trades {label}.")
         return
 
-    lines = [f"{len(trades)} new trade(s) today ({_AEST_LABEL}):\n"]
+    lines = [f"{len(trades)} new trade(s) {label}:\n"]
     for t in trades:
         near_date = _fmt_expiry(t.expiry_near)
         far_date  = _fmt_expiry(t.expiry_far)
