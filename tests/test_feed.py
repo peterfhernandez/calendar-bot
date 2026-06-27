@@ -265,5 +265,60 @@ class TestChainCache(unittest.TestCase):
         self.assertIn("BTC-27JUN25-90000-C", instruments)
 
 
+class TestDeribitFeedOfflineTracking(unittest.IsolatedAsyncioTestCase):
+    """Verify that repeated connection failures are suppressed after the first warning."""
+
+    async def test_first_failure_sets_offline_flag(self):
+        """First connection failure marks the feed as offline."""
+        feed = DeribitFeed(assets=["BTC"], paper=True, backoff_max=0.01)
+        assert not feed._offline
+
+        call_count = [0]
+
+        async def fail_then_stop():
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                feed._running = False
+            raise OSError("refused")
+
+        with patch.object(feed, "_connect_and_stream", side_effect=fail_then_stop):
+            await feed.start()
+
+        assert feed._offline
+
+    async def test_repeated_failures_increment_count(self):
+        """After the first failure, _retry_count increments on each subsequent attempt."""
+        feed = DeribitFeed(assets=["BTC"], paper=True, backoff_max=0.01)
+        call_count = [0]
+
+        async def fail_then_stop():
+            call_count[0] += 1
+            if call_count[0] >= 4:
+                feed._running = False
+            raise OSError("refused")
+
+        with patch.object(feed, "_connect_and_stream", side_effect=fail_then_stop):
+            await feed.start()
+
+        assert feed._offline
+        assert feed._retry_count >= 2
+
+    async def test_recovery_clears_offline_flag(self):
+        """A successful _connect_and_stream clears the offline flag and resets counter."""
+        feed = DeribitFeed(assets=["BTC"], paper=True, backoff_max=0.01)
+        feed._offline = True
+        feed._retry_count = 3
+        feed._running = True
+
+        async def succeed_and_stop():
+            feed._running = False  # exit cleanly after one successful run
+
+        with patch.object(feed, "_connect_and_stream", side_effect=succeed_and_stop):
+            await feed.start()
+
+        assert not feed._offline
+        assert feed._retry_count == 0
+
+
 if __name__ == "__main__":
     unittest.main()

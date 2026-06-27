@@ -748,6 +748,7 @@ class TestSetMyCommands:
         mock_updater = MagicMock()
         mock_updater.running = False
 
+
         # start_polling signals the internal _stopped event so start() returns
         # without blocking forever on _stopped.wait().
         async def _start_polling(**kwargs):

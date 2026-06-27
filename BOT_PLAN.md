@@ -707,7 +707,47 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Telegram command listener (9a)** | **0.5–1 day** | **Done** |
 | **Telegram command menu + /help (9b)** | **0.5 day** | **Done** |
 | **Telegram command improvements (9c)** | **0.5 day** | **Done** |
+| **Offline error tracking (10)** | **0.5 day** | **Done** |
 | **Telegram UX polish + reliability (10)** | **0.5 day** | **Done** |
 | **Log hygiene — noise + secret redaction (9d)** | **< 0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
-| **Total remaining** | **~4–6 days** | |
+| **Total remaining** | **~3–5 days** | |
+
+---
+
+## Phase 10 — Offline Error Tracking
+
+When the bot runs without internet access (e.g. during development, network outages, or in CI), the reconnect loops in `DeribitFeed` and `PortfolioTracker` previously logged a warning on every retry attempt — potentially dozens of lines per minute flooding the logs and making real errors hard to spot.
+
+### Problem
+
+| Component | Old behaviour | Frequency |
+| --- | --- | --- |
+| `data/deribit_feed.py` | `WARNING Feed disconnected (...); reconnecting in Xs` | Every 1s → 2s → 4s → … → 60s, indefinitely |
+| `portfolio/tracker.py` | `WARNING Could not fetch BTC summary: ...` (once per currency) | Every scan cycle (default: every 5 min) |
+
+### Solution: log on state transitions only
+
+Both components now track an `_offline` flag and only log when the connectivity state changes:
+
+| Event | Log level | Message |
+| --- | --- | --- |
+| First failure | `WARNING` | "Feed offline (...) — retrying every Xs" / "Portfolio API offline (...)" |
+| Subsequent failures | `DEBUG` | "Feed still offline (attempt N, next in Xs)" — suppressed at default log level |
+| Recovery | `INFO` | "Feed reconnected after N attempt(s)" / "Portfolio API back online after N failed attempt(s)" |
+
+### Changes
+
+**`data/deribit_feed.py`**
+- Added `_offline: bool` and `_retry_count: int` to `DeribitFeed.__init__`
+- `start()` loop: logs `WARNING` on first `OSError`/`WebSocketException`; `DEBUG` on repeats; `INFO` on clean reconnect
+
+**`portfolio/tracker.py`**
+- Added `_api_offline: bool` and `_api_fail_count: int` to `PortfolioTracker.__init__`
+- `refresh()`: logs `WARNING` on first REST failure; `DEBUG` on repeats; `INFO` on recovery
+- Per-currency `except` in `_refresh_from_api` now re-raises so the outer handler owns the single warning (previously each currency logged separately, producing one warning per asset per cycle)
+
+### Tests
+
+- `tests/test_feed.py` — `TestDeribitFeedOfflineTracking` (3 tests): first failure sets flag; repeated failures increment `_retry_count`; recovery clears flag and counter
+- `tests/test_portfolio.py` — `TestOfflineTracking` (5 tests): first failure sets flag; repeated failures increment count; first failure is WARNING/repeats are DEBUG; recovery clears flag; recovery logs INFO with retry count
