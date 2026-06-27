@@ -652,6 +652,38 @@ Uses `get_trades_opened_since(engine.start_time)` / `get_trades_closed_since(eng
 
 `python-telegram-bot` v21 makes a final `getUpdates` call during the shutdown cleanup pass. With the default 30 s read timeout this produced a noisy `ConnectTimeout` warning in the logs on every bot restart. Fixed by setting `get_updates_connect_timeout=5.0` and `get_updates_read_timeout=5.0` on `ApplicationBuilder` — the cleanup call times out quickly instead of hanging.
 
+### 15. Log Hygiene — Telegram Noise and Secret Redaction *(Phase 9d)*
+
+Two operational issues discovered during paper trading:
+
+1. **`getUpdates` log spam** — `python-telegram-bot` long-polls the Telegram Bot API every few seconds. The `httpx` library logs each HTTP request at INFO level, producing thousands of identical lines per day like:
+   ```
+   2026-06-28 09:14:25 [INFO] httpx: HTTP Request: POST https://api.telegram.org/bot<TOKEN>/getUpdates "HTTP/1.1 200 OK"
+   ```
+   These lines are operationally useless and crowd out meaningful log entries.
+
+2. **Token exposed in logs** — the URL logged by httpx contains the literal Telegram bot token, which is a credential. Anyone with access to the log file can use it to impersonate the bot.
+
+#### Fix — `configure_logging()` in `monitor/loop.py`
+
+**Silence noisy loggers:**
+
+```python
+for noisy in ("httpx", "httpcore", "telegram.ext.Updater",
+              "telegram.vendor.ptb_urllib3"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+```
+
+This suppresses all INFO/DEBUG output from these libraries. Real errors (4xx, 5xx, connection failures) log at WARNING or higher and are still visible.
+
+**`_SecretRedactor` log filter:**
+
+A `logging.Filter` subclass is installed on the root logger so it covers both the console and the rotating-file handler. It reads `TELEGRAM_TOKEN` and `TELEGRAM_CHAT` once at startup and replaces any occurrence of those literal strings in a log record with `<redacted>` before the record reaches any handler.
+
+This acts as a belt-and-suspenders safety net: even if a future library or a new code path logs a URL or message containing the token, it is scrubbed before hitting disk or the terminal.
+
+The filter never raises — if the config import fails for any reason, the filter is skipped silently so that logging setup cannot crash the bot.
+
 ---
 
 ## Estimated Effort (remaining)
@@ -676,5 +708,6 @@ Uses `get_trades_opened_since(engine.start_time)` / `get_trades_closed_since(eng
 | **Telegram command menu + /help (9b)** | **0.5 day** | **Done** |
 | **Telegram command improvements (9c)** | **0.5 day** | **Done** |
 | **Telegram UX polish + reliability (10)** | **0.5 day** | **Done** |
+| **Log hygiene — noise + secret redaction (9d)** | **< 0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~4–6 days** | |

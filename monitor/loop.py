@@ -48,12 +48,46 @@ _logging_configured = False  # guard against double-init
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
+class _SecretRedactor(logging.Filter):
+    """
+    Scrubs sensitive values (Telegram token, chat ID) from log records before
+    they reach any handler.  Applied to the root logger so it covers both the
+    console and the rotating file.
+
+    Secrets are injected at configure_logging() time so the filter reads from
+    config once, not on every log record.
+    """
+
+    def __init__(self, secrets: list[str]) -> None:
+        super().__init__()
+        # Drop empty strings so we don't accidentally blank every log line.
+        self._secrets = [s for s in secrets if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._secrets:
+            try:
+                msg = record.getMessage()
+            except Exception:
+                return True
+            for secret in self._secrets:
+                if secret in msg:
+                    # Rewrite the pre-formatted message so handlers see the
+                    # redacted version; clear args so Formatter doesn't re-expand.
+                    record.msg = msg.replace(secret, "<redacted>")
+                    record.args = ()
+        return True
+
+
 def configure_logging(
     log_dir: str | Path = "logs",
     level: int = logging.INFO,
 ) -> None:
     """
     Configure root logger with a console handler and a rotating file handler.
+
+    Also suppresses noisy third-party loggers (httpx, httpcore, telegram)
+    and installs a secret-redacting filter so Telegram tokens never appear
+    in log output.
 
     Safe to call multiple times — extra calls are no-ops.
     """
@@ -82,6 +116,27 @@ def configure_logging(
     )
     fh.setFormatter(formatter)
     root.addHandler(fh)
+
+    # Silence high-frequency third-party loggers that add no operational value.
+    # httpx logs every HTTP request at INFO, flooding the log with getUpdates
+    # polling calls from python-telegram-bot.
+    for noisy in ("httpx", "httpcore", "telegram.ext.Updater",
+                  "telegram.vendor.ptb_urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Redact secrets from all log output.  Import here to avoid circular imports
+    # at module load time (config is imported before monitor.loop in some paths).
+    try:
+        import config as _cfg
+        secrets: list[str] = []
+        if getattr(_cfg, "TELEGRAM_TOKEN", None):
+            secrets.append(_cfg.TELEGRAM_TOKEN)
+        if getattr(_cfg, "TELEGRAM_CHAT", None):
+            secrets.append(str(_cfg.TELEGRAM_CHAT))
+        if secrets:
+            root.addFilter(_SecretRedactor(secrets))
+    except Exception:
+        pass  # never let logging setup crash the bot
 
     _logging_configured = True
 
