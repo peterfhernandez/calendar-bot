@@ -620,6 +620,38 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the 
 # DERIBIT_LIVE_CLIENT_ID, DERIBIT_LIVE_CLIENT_SECRET
 ```
 
+### 14. Telegram UX Polish and Reliability *(Phase 10)*
+
+Incremental improvements to the Telegram command interface discovered during paper trading operation.
+
+#### `/positions` — single-line format with `ev=` at end
+
+Each open trade is formatted on a single line for easy scanning in Telegram:
+
+```
+#28 BTC 55000 Put  10Jul26→28Aug26   entry=$161.43  sv=$160.84  PnL=$-0.59   ev=N/A
+```
+
+- `ev=N/A` is shown for trades that predate EV tracking (the `ev_score` column was added mid-run; existing rows have `ev_score=0.0` as the default sentinel).
+
+#### EV tracking — `ev_score` column
+
+A new `ev_score REAL NOT NULL DEFAULT 0.0` column was added to `calendar_trades` via a backward-compatible `ALTER TABLE … ADD COLUMN` migration. `DecisionEngine` passes `candidate.ev_score` to `create_calendar_trade` at entry so the EV at entry is permanently recorded. Handlers display it via `_fmt_ev(ev_score)` which returns `"N/A"` for the `0.0` sentinel.
+
+#### `/new_trades` and `/closed_trades` — `[today|session]` option
+
+Both commands accept an optional mode argument:
+
+- `/new_trades` or `/new_trades today` — trades opened since AEST midnight
+- `/new_trades session` — trades opened since the bot process started
+- `/closed_trades` and `/closed_trades session` — same for closed trades
+
+Uses `get_trades_opened_since(engine.start_time)` / `get_trades_closed_since(engine.start_time)` helpers in `db/state.py`.
+
+#### Shutdown `ConnectTimeout` fix
+
+`python-telegram-bot` v21 makes a final `getUpdates` call during the shutdown cleanup pass. With the default 30 s read timeout this produced a noisy `ConnectTimeout` warning in the logs on every bot restart. Fixed by setting `get_updates_connect_timeout=5.0` and `get_updates_read_timeout=5.0` on `ApplicationBuilder` — the cleanup call times out quickly instead of hanging.
+
 ---
 
 ## Estimated Effort (remaining)
@@ -643,5 +675,6 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the 
 | **Telegram command listener (9a)** | **0.5–1 day** | **Done** |
 | **Telegram command menu + /help (9b)** | **0.5 day** | **Done** |
 | **Telegram command improvements (9c)** | **0.5 day** | **Done** |
+| **Telegram UX polish + reliability (10)** | **0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~4–6 days** | |
