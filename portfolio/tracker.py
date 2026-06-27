@@ -109,6 +109,9 @@ class PortfolioTracker:
         self._last_refresh:        float | None = None
         self._fees_paid_today:     float = 0.0
         self._fees_paid_total:     float = 0.0
+        # Offline tracking — log once on first failure, once on recovery
+        self._api_offline:     bool = False
+        self._api_fail_count:  int  = 0
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -167,11 +170,28 @@ class PortfolioTracker:
         if has_credentials:
             try:
                 self._refresh_from_api(spot_prices)
+                if self._api_offline:
+                    logger.info(
+                        "Portfolio API back online after %d failed attempt(s)",
+                        self._api_fail_count,
+                    )
+                    self._api_offline = False
+                    self._api_fail_count = 0
             except Exception as exc:
-                logger.warning(
-                    "Portfolio API refresh failed (%s) — equity/available_cash unchanged",
-                    exc,
-                )
+                self._api_fail_count += 1
+                if not self._api_offline:
+                    logger.warning(
+                        "Portfolio API offline (%s) — equity/available_cash unchanged; "
+                        "further failures will be suppressed until connectivity returns",
+                        exc,
+                    )
+                    self._api_offline = True
+                else:
+                    logger.debug(
+                        "Portfolio API still offline (attempt %d): %s",
+                        self._api_fail_count,
+                        exc,
+                    )
         else:
             logger.debug("No API credentials configured — portfolio tracker in DB-only mode")
 
@@ -254,7 +274,8 @@ class PortfolioTracker:
                 )
 
             except Exception as exc:
-                logger.warning("Could not fetch %s summary: %s", currency, exc)
+                logger.debug("Could not fetch %s summary: %s", currency, exc)
+                raise
 
         self._equity_usd         = total_equity_usd
         self._available_cash     = max(0.0, total_available_usd)
