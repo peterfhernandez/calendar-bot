@@ -18,7 +18,9 @@ from db.state import (
     CalendarTrade,
     get_open_trades,
     get_trades_closed_today_aest,
+    get_trades_closed_since,
     get_trades_opened_today_aest,
+    get_trades_opened_since,
     init_db,
     DB_PATH,
 )
@@ -231,27 +233,29 @@ class TestHandlePositions:
         assert "stale" in text.lower() or "N/A" in text
 
 
-# ── /close_trades handler ─────────────────────────────────────────────────────
+# ── /closed_trades handler ────────────────────────────────────────────────────
 
-class TestHandleCloseTrades:
+class TestHandleClosedTrades:
     @pytest.mark.asyncio
     async def test_no_closed_today(self):
         update  = _make_update()
         context = _make_context()
+        engine  = _make_engine()
         db_path = Path(tempfile.mktemp(suffix=".db"))
         init_db(db_path)
 
         with patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
-            await handlers.handle_close_trades(update, context, db_path)
+            await handlers.handle_closed_trades(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0].lower()
         assert "no trades" in text
 
     @pytest.mark.asyncio
-    async def test_close_trades_shows_details(self):
-        """Reply includes trade id, asset, debit, pnl, and close reason."""
+    async def test_closed_trades_today_shows_details(self):
+        """Default (today) reply includes trade id, asset, debit, pnl, and close reason."""
         update  = _make_update()
         context = _make_context()
+        engine  = _make_engine()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trades = [
@@ -261,7 +265,7 @@ class TestHandleCloseTrades:
                         date_close="2026-06-26", notes="Stop-loss (50% of debit)"),
         ]
         with patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=trades):
-            await handlers.handle_close_trades(update, context, db_path)
+            await handlers.handle_closed_trades(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0]
         assert "#1" in text
@@ -269,6 +273,23 @@ class TestHandleCloseTrades:
         assert "BTC" in text
         assert "+30" in text or "30" in text  # total PnL
         assert "Take-profit" in text or "Stop-loss" in text
+
+    @pytest.mark.asyncio
+    async def test_closed_trades_session_uses_start_time(self):
+        """/closed_trades session queries trades since engine.start_time."""
+        update  = _make_update()
+        context = _make_context(args=["session"])
+        engine  = _make_engine()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        trades = [_make_trade(trade_id=5, result="Win (Auto TP)", pnl=100.0)]
+        with patch("telegram_cmd.handlers.get_trades_closed_since", return_value=trades) as mock_fn:
+            await handlers.handle_closed_trades(update, context, engine, db_path)
+
+        mock_fn.assert_called_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "since bot start" in text.lower() or "session" in text.lower() or "start" in text.lower()
+        assert "#5" in text
 
 
 # ── /new_trades handler ────────────────────────────────────────────────────────
@@ -278,20 +299,22 @@ class TestHandleNewTrades:
     async def test_no_new_today(self):
         update  = _make_update()
         context = _make_context()
+        engine  = _make_engine()
         db_path = Path(tempfile.mktemp(suffix=".db"))
         init_db(db_path)
 
         with patch("telegram_cmd.handlers.get_trades_opened_today_aest", return_value=[]):
-            await handlers.handle_new_trades(update, context, db_path)
+            await handlers.handle_new_trades(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0].lower()
         assert "no new" in text
 
     @pytest.mark.asyncio
-    async def test_new_trades_shows_ev_and_expiry(self):
-        """Reply includes trade id, asset, debit, ev, strike, expiry range."""
+    async def test_new_trades_today_shows_ev_and_expiry(self):
+        """Default (today) reply includes trade id, asset, debit, ev, strike, expiry range."""
         update  = _make_update()
         context = _make_context()
+        engine  = _make_engine()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trades = [
@@ -299,7 +322,7 @@ class TestHandleNewTrades:
             _make_trade(trade_id=2, asset="ETH", strike=3000.0, ev_score=0.10),
         ]
         with patch("telegram_cmd.handlers.get_trades_opened_today_aest", return_value=trades):
-            await handlers.handle_new_trades(update, context, db_path)
+            await handlers.handle_new_trades(update, context, engine, db_path)
 
         text = update.message.reply_text.call_args[0][0]
         assert "2" in text
@@ -307,6 +330,23 @@ class TestHandleNewTrades:
         assert "ETH" in text
         assert "ev=" in text.lower()
         assert "→" in text
+
+    @pytest.mark.asyncio
+    async def test_new_trades_session_uses_start_time(self):
+        """/new_trades session queries trades since engine.start_time."""
+        update  = _make_update()
+        context = _make_context(args=["session"])
+        engine  = _make_engine()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        trades = [_make_trade(trade_id=7, ev_score=0.18)]
+        with patch("telegram_cmd.handlers.get_trades_opened_since", return_value=trades) as mock_fn:
+            await handlers.handle_new_trades(update, context, engine, db_path)
+
+        mock_fn.assert_called_once()
+        text = update.message.reply_text.call_args[0][0]
+        assert "since bot start" in text.lower() or "session" in text.lower() or "start" in text.lower()
+        assert "#7" in text
 
 
 # ── /status handler ───────────────────────────────────────────────────────────
@@ -666,7 +706,7 @@ class TestSetMyCommands:
 
         command_names = {cmd for cmd, _ in COMMAND_REGISTRY}
         expected = {
-            "positions", "close_trades", "new_trades", "status",
+            "positions", "closed_trades", "new_trades", "status",
             "portfolio", "stop_bot", "start_bot", "start_drain",
             "start_with_assets", "drain_and_new", "help",
         }

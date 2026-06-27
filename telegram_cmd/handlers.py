@@ -18,7 +18,9 @@ import config
 from db.state import (
     get_open_trades,
     get_trades_closed_today_aest,
+    get_trades_closed_since,
     get_trades_opened_today_aest,
+    get_trades_opened_since,
     DB_PATH,
 )
 
@@ -37,6 +39,11 @@ def _mid(bid: float, ask: float) -> float | None:
     if bid > 0 and ask > 0:
         return (bid + ask) / 2.0
     return None
+
+
+def _fmt_ev(ev_score: float) -> str:
+    """Return formatted EV string, or 'N/A' for the 0.0 sentinel (pre-tracking trades)."""
+    return f"{ev_score:.2f}" if ev_score != 0.0 else "N/A"
 
 
 def _fmt_expiry(expiry_iso: str) -> str:
@@ -87,26 +94,36 @@ async def handle_positions(
         opt_type  = _fmt_type(t.option_type)
 
         lines.append(
-            f"ev={t.ev_score:.2f}  #{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}\n"
+            f"ev={_fmt_ev(t.ev_score)}  #{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}\n"
             f"  entry=${t.net_debit * t.qty:.2f}  {val_note}"
         )
 
     await update.message.reply_text("\n\n".join(lines))
 
 
-async def handle_close_trades(
+async def handle_closed_trades(
     update: Update,
     context: CallbackContext,
+    engine: DecisionEngine,
     db_path: Path = DB_PATH,
 ) -> None:
-    """List of trades closed today AEST with id, asset, debit, pnl, close reason."""
-    trades = get_trades_closed_today_aest(db_path)
+    """List of closed trades. Usage: /closed_trades [today|session] (default: today)."""
+    args = context.args
+    mode = (args[0].lower() if args else "today")
+
+    if mode == "session":
+        trades = get_trades_closed_since(engine.start_time, db_path)
+        label = "since bot start"
+    else:
+        trades = get_trades_closed_today_aest(db_path)
+        label = f"today ({_AEST_LABEL})"
+
     if not trades:
-        await update.message.reply_text(f"No trades closed today ({_AEST_LABEL}).")
+        await update.message.reply_text(f"No trades closed {label}.")
         return
 
     total_pnl = sum(t.pnl for t in trades if t.pnl is not None)
-    lines = [f"{len(trades)} trade(s) closed today ({_AEST_LABEL}). Total PnL: ${total_pnl:+.2f}\n"]
+    lines = [f"{len(trades)} trade(s) closed {label}. Total PnL: ${total_pnl:+.2f}\n"]
     for t in trades:
         pnl_str = f"${t.pnl:+.2f}" if t.pnl is not None else "N/A"
         reason  = t.notes or t.result or "—"
@@ -120,21 +137,31 @@ async def handle_close_trades(
 async def handle_new_trades(
     update: Update,
     context: CallbackContext,
+    engine: DecisionEngine,
     db_path: Path = DB_PATH,
 ) -> None:
-    """List of new trades entered today AEST with id, asset, debit, ev, strike, expiry range."""
-    trades = get_trades_opened_today_aest(db_path)
+    """List of new trades. Usage: /new_trades [today|session] (default: today)."""
+    args = context.args
+    mode = (args[0].lower() if args else "today")
+
+    if mode == "session":
+        trades = get_trades_opened_since(engine.start_time, db_path)
+        label = "since bot start"
+    else:
+        trades = get_trades_opened_today_aest(db_path)
+        label = f"today ({_AEST_LABEL})"
+
     if not trades:
-        await update.message.reply_text(f"No new trades today ({_AEST_LABEL}).")
+        await update.message.reply_text(f"No new trades {label}.")
         return
 
-    lines = [f"{len(trades)} new trade(s) today ({_AEST_LABEL}):\n"]
+    lines = [f"{len(trades)} new trade(s) {label}:\n"]
     for t in trades:
         near_date = _fmt_expiry(t.expiry_near)
         far_date  = _fmt_expiry(t.expiry_far)
         opt_type  = _fmt_type(t.option_type)
         lines.append(
-            f"#{t.id} {t.asset}  debit=${t.net_debit * t.qty:.2f}  ev={t.ev_score:.2f}"
+            f"#{t.id} {t.asset}  debit=${t.net_debit * t.qty:.2f}  ev={_fmt_ev(t.ev_score)}"
             f"  {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
         )
 
@@ -211,7 +238,7 @@ async def handle_portfolio(
 
         lines.append(
             f"#{t.id} {t.asset} {opt_type} {t.strike:.0f}  {near_date}→{far_date}\n"
-            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  EV: {t.ev_score:.2f}\n"
+            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  EV: {_fmt_ev(t.ev_score)}\n"
             f"  Value: {val_str}"
         )
 

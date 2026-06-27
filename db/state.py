@@ -358,6 +358,30 @@ def get_trades_closed_today_aest(db_path: Path = DB_PATH) -> list[CalendarTrade]
     return [_row_to_trade(r) for r in rows]
 
 
+def get_trades_opened_since(since: datetime, db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return trades opened on or after `since` (UTC datetime)."""
+    init_db(db_path)
+    since_str = since.date().isoformat()
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM calendar_trades WHERE date_open >= ? ORDER BY date_open",
+            (since_str,),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_trades_closed_since(since: datetime, db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return trades closed on or after `since` (UTC datetime, any non-open result)."""
+    init_db(db_path)
+    since_str = since.date().isoformat()
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM calendar_trades WHERE date_close >= ? AND result NOT IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY date_close",
+            (since_str, *_OPEN_STATUSES),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
 def get_calendar_stats(asset: Optional[str] = None, db_path: Path = DB_PATH) -> dict:
     """
     Aggregate performance statistics for closed calendar trades.
