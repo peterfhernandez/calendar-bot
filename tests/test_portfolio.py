@@ -290,6 +290,107 @@ class TestAvailableCashCalculation:
         assert tracker.equity_usd == pytest.approx(0.0)
 
 
+# ── Tests: offline state tracking ────────────────────────────────────────────
+
+class TestOfflineTracking:
+    """Verify that repeated API failures are suppressed after the first warning."""
+
+    def _make_tracker(self, db):
+        return PortfolioTracker(
+            db_path=db,
+            client_id="id",
+            client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+
+    def test_first_failure_sets_offline_flag(self):
+        """First REST failure marks tracker as offline."""
+        db = _make_db()
+        tracker = self._make_tracker(db)
+        assert not tracker._api_offline
+        with patch("portfolio.tracker._rest_get", side_effect=OSError("unreachable")):
+            with patch("config.ASSETS", ["BTC"]):
+                tracker.refresh()
+        assert tracker._api_offline
+        assert tracker._api_fail_count == 1
+
+    def test_repeated_failures_increment_count(self):
+        """Subsequent failures increment the counter without resetting offline flag."""
+        db = _make_db()
+        tracker = self._make_tracker(db)
+        with patch("portfolio.tracker._rest_get", side_effect=OSError("unreachable")):
+            with patch("config.ASSETS", ["BTC"]):
+                tracker.refresh()
+                tracker.refresh()
+                tracker.refresh()
+        assert tracker._api_offline
+        assert tracker._api_fail_count == 3
+
+    def test_first_failure_logs_warning_subsequent_log_debug(self, caplog):
+        """Only the first failure logs at WARNING; repeats are DEBUG."""
+        import logging
+        db = _make_db()
+        tracker = self._make_tracker(db)
+        with patch("portfolio.tracker._rest_get", side_effect=OSError("gone")):
+            with patch("config.ASSETS", ["BTC"]):
+                with caplog.at_level(logging.DEBUG, logger="portfolio.tracker"):
+                    tracker.refresh()
+                    tracker.refresh()
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        debugs   = [r for r in caplog.records if r.levelno == logging.DEBUG
+                    and "still offline" in r.message]
+        assert len(warnings) == 1
+        assert "offline" in warnings[0].message.lower()
+        assert len(debugs) >= 1
+
+    def _fake_rest_get(self, url, **kwargs):
+        """Return a minimal valid API response based on the URL path."""
+        if "auth" in url:
+            return {"result": {"access_token": "tok"}}
+        if "get_account_summary" in url:
+            return {"result": {"equity": 1.0, "available_funds": 0.9,
+                               "initial_margin": 0.0, "floating_profit_loss": 0.0}}
+        if "get_positions" in url:
+            return {"result": []}
+        return {"result": {}}
+
+    def test_recovery_clears_offline_flag(self):
+        """A successful refresh after failures clears the offline flag."""
+        db = _make_db()
+        tracker = self._make_tracker(db)
+
+        # First go offline
+        with patch("portfolio.tracker._rest_get", side_effect=OSError("gone")):
+            with patch("config.ASSETS", ["BTC"]):
+                tracker.refresh()
+        assert tracker._api_offline
+
+        # Then recover
+        with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
+            with patch("config.ASSETS", ["BTC"]):
+                tracker.refresh(spot_prices={"BTC": 100_000.0})
+
+        assert not tracker._api_offline
+        assert tracker._api_fail_count == 0
+
+    def test_recovery_logs_info(self, caplog):
+        """Recovery from offline state is logged at INFO with retry count."""
+        import logging
+        db = _make_db()
+        tracker = self._make_tracker(db)
+        # Force offline state directly
+        tracker._api_offline = True
+        tracker._api_fail_count = 5
+
+        with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
+            with patch("config.ASSETS", ["BTC"]):
+                with caplog.at_level(logging.INFO, logger="portfolio.tracker"):
+                    tracker.refresh(spot_prices={"BTC": 100_000.0})
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any("back online" in m.lower() and "5" in m for m in info_msgs)
+
+
 # ── Tests: reconciliation warning ────────────────────────────────────────────
 
 class TestReconciliation:

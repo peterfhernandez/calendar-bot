@@ -731,8 +731,13 @@ class TestSetMyCommands:
         mock_bot = AsyncMock()
         mock_updater = MagicMock()
         mock_updater.running = False
-        mock_updater.start_polling = AsyncMock()
-        mock_updater.idle = AsyncMock()
+
+        # Simulate a clean exit: start_polling signals the stopped event so
+        # listener.start() unblocks immediately instead of waiting forever.
+        async def fake_start_polling(**_kwargs):
+            listener._stopped.set()
+
+        mock_updater.start_polling = fake_start_polling
 
         mock_app = MagicMock()
         mock_app.bot = mock_bot
