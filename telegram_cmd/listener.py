@@ -101,7 +101,15 @@ class TelegramCommandListener:
     def _build_app(self) -> Application:
         from telegram.ext import Application, CommandHandler
 
-        app = Application.builder().token(config.TELEGRAM_TOKEN).build()
+        # Short get_updates timeouts prevent a harmless ConnectTimeout error
+        # in the library's shutdown cleanup pass (_get_updates_cleanup).
+        app = (
+            Application.builder()
+            .token(config.TELEGRAM_TOKEN)
+            .get_updates_connect_timeout(5.0)
+            .get_updates_read_timeout(5.0)
+            .build()
+        )
 
         engine  = self._engine
         cache   = self._cache

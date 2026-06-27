@@ -182,8 +182,8 @@ class TestHandlePositions:
         assert "no open" in update.message.reply_text.call_args[0][0].lower()
 
     @pytest.mark.asyncio
-    async def test_positions_shows_ev_and_expiry_range(self):
-        """Reply contains ev score, expiry range, and entry cost."""
+    async def test_positions_single_line_with_ev_at_end(self):
+        """Each position is a single line: id/asset/strike/type/expiry, entry, sv, PnL, ev= at end."""
         update  = _make_update()
         context = _make_context()
         cache   = _make_cache()
@@ -196,10 +196,26 @@ class TestHandlePositions:
         text = update.message.reply_text.call_args[0][0]
         assert "BTC" in text
         assert "90000" in text
-        assert "ev=0.25" in text.lower() or "ev=" in text
-        assert "→" in text  # expiry range separator
-        assert "Call" in text  # full type name
-        assert "entry=" in text.lower() or "entry" in text
+        assert "ev=0.25" in text          # ev at end of line
+        assert text.index("ev=") > text.index("entry=")  # ev comes after entry
+        assert "→" in text                # expiry range separator
+        assert "Call" in text             # full type name
+        assert "\n" not in text           # single line per trade
+
+    @pytest.mark.asyncio
+    async def test_positions_ev_na_for_untracked(self):
+        """Trades with ev_score=0.0 (pre-tracking default) show ev=N/A."""
+        update  = _make_update()
+        context = _make_context()
+        cache   = _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        trade = _make_trade(ev_score=0.0)
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+            await handlers.handle_positions(update, context, cache, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "ev=N/A" in text
 
     @pytest.mark.asyncio
     async def test_positions_shows_full_option_type(self):
@@ -763,3 +779,39 @@ class TestSetMyCommands:
         called_names = {c.command for c in called_commands}
         registry_names = {cmd for cmd, _ in COMMAND_REGISTRY}
         assert called_names == registry_names
+
+    def test_build_app_sets_get_updates_timeouts(self, monkeypatch):
+        """_build_app configures short get_updates timeouts to avoid shutdown ConnectTimeout."""
+        from telegram_cmd.listener import TelegramCommandListener
+
+        engine   = _make_engine()
+        cache    = _make_cache()
+        listener = TelegramCommandListener(engine, cache)
+
+        built_apps = []
+
+        class MockBuilder:
+            def token(self, t):        return self
+            def get_updates_connect_timeout(self, v):
+                self._conn_t = v; return self
+            def get_updates_read_timeout(self, v):
+                self._read_t = v; return self
+            def build(self):
+                built_apps.append(self)
+                app = MagicMock()
+                app.add_handler = MagicMock()
+                return app
+
+        mock_builder = MockBuilder()
+
+        with patch("config.TELEGRAM_TOKEN", "fake-token"), \
+             patch("telegram.ext.Application.builder", return_value=mock_builder), \
+             patch("telegram.ext.CommandHandler", MagicMock()):
+            try:
+                listener._build_app()
+            except Exception:
+                pass  # builder mock isn't a full Application; just check timeouts were set
+
+        assert built_apps, "builder.build() was never called"
+        assert built_apps[0]._conn_t <= 10.0, "connect timeout should be short"
+        assert built_apps[0]._read_t <= 10.0, "read timeout should be short"

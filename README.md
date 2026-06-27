@@ -102,12 +102,12 @@ The bot accepts incoming commands from the same Telegram chat it uses for outgoi
 
 | Command | What it returns |
 | --- | --- |
-| `/positions` | One line per open trade: `ev=` at start, strike and full type (`Put`/`Call`), expiry range `ddMMMYY→ddMMMYY`, entry cost, current spread value, unrealized PnL |
-| `/portfolio` | One line per open trade: asset, strike, expiry range, debit, fees, EV at entry, current spread value (no IV or OI) |
-| `/new_trades` | List of trades entered today AEST — per trade: id, asset, debit, ev, strike, type, expiry range |
-| `/close_trades` | List of trades closed today AEST — per trade: id, asset, debit, pnl, close reason |
+| `/positions` | One line per open trade: `#id asset strike type  nearDate→farDate   entry=$X  sv=$X  PnL=$X  ev=X` |
+| `/portfolio` | One block per open trade: asset, strike, expiry range, debit, fees, EV at entry, current spread value and PnL |
+| `/new_trades [today\|session]` | New trades (default: today AEST) — per trade: id, asset, debit, ev, strike, type, expiry range |
+| `/closed_trades [today\|session]` | Closed trades (default: today AEST) — per trade: id, asset, debit, pnl, close reason |
 | `/status` | Trading mode, drain/drain-and-new mode, paused/running, uptime, open count, today AEST PnL, session PnL since bot start |
-| `/help` | Lists every available commands with a one-line description |
+| `/help` | Lists every available command with a one-line description |
 | `/stop_bot` | Pauses scan and monitor ticks; the feed and listener remain alive; positions are not closed |
 | `/start_bot` | Resumes normal scanning and monitoring |
 | `/start_drain` | Activates drain mode — no new entries or rolls; existing positions close at stop/TP/expiry |
