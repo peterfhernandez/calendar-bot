@@ -444,6 +444,9 @@ Updated existing commands and added new runtime-control commands.
 - [x] `PORTFOLIO_OVERRIDE` bypasses live portfolio tracker for sizing decisions when set
 - [x] Update `COMMAND_REGISTRY` in `telegram_cmd/listener.py` — now the single source of truth for all 11 commands
 - [x] Update `tests/test_telegram_cmd.py` — tests rewritten for all renamed/new handlers
+- [x] Add `get_trades_opened_since` / `get_trades_closed_since` helpers for session mode (`db/state.py`)
+- [x] `/positions` reformatted to single line with `ev=` at the end; `ev=N/A` for pre-tracking trades (ev_score == 0.0)
+- [x] Telegram shutdown `ConnectTimeout` fixed — `ApplicationBuilder` configured with `get_updates_connect_timeout=5.0` and `get_updates_read_timeout=5.0`
 
 ---
 
