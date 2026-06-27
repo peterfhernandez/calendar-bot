@@ -60,8 +60,8 @@ class _SecretRedactor(logging.Filter):
 
     def __init__(self, secrets: list[str]) -> None:
         super().__init__()
-        # Drop empty strings so we don't accidentally blank every log line.
-        self._secrets = [s for s in secrets if s]
+        # Drop blank/whitespace-only strings so we don't accidentally redact every log line.
+        self._secrets = [s for s in secrets if s and s.strip()]
 
     def filter(self, record: logging.LogRecord) -> bool:
         if self._secrets:
@@ -69,12 +69,14 @@ class _SecretRedactor(logging.Filter):
                 msg = record.getMessage()
             except Exception:
                 return True
+            redacted = msg
             for secret in self._secrets:
-                if secret in msg:
-                    # Rewrite the pre-formatted message so handlers see the
-                    # redacted version; clear args so Formatter doesn't re-expand.
-                    record.msg = msg.replace(secret, "<redacted>")
-                    record.args = ()
+                redacted = redacted.replace(secret, "<redacted>")
+            if redacted is not msg:
+                # Rewrite the pre-formatted message so handlers see the
+                # redacted version; clear args so Formatter doesn't re-expand.
+                record.msg = redacted
+                record.args = ()
         return True
 
 
