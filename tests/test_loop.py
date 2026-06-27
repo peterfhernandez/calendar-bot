@@ -140,6 +140,93 @@ class TestConfigureLogging:
         _ml._logging_configured = False
 
 
+class TestSecretRedactor:
+    """Unit tests for _SecretRedactor logging filter."""
+
+    def _make_record(self, msg: str, *args: object) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg=msg, args=args, exc_info=None,
+        )
+        return record
+
+    def test_token_replaced(self) -> None:
+        from monitor.loop import _SecretRedactor
+        token = "bot123456:ABCDEFsecretTOKEN"
+        f = _SecretRedactor([token])
+        record = self._make_record("POST https://api.telegram.org/%s/getUpdates", token)
+        f.filter(record)
+        assert token not in record.getMessage()
+        assert "<redacted>" in record.getMessage()
+
+    def test_chat_id_replaced(self) -> None:
+        from monitor.loop import _SecretRedactor
+        chat_id = "987654321"
+        f = _SecretRedactor([chat_id])
+        record = self._make_record("Sending message to chat %s", chat_id)
+        f.filter(record)
+        assert chat_id not in record.getMessage()
+        assert "<redacted>" in record.getMessage()
+
+    def test_multiple_secrets_replaced(self) -> None:
+        from monitor.loop import _SecretRedactor
+        token = "bot999:SECRETtoken"
+        chat = "111222333"
+        f = _SecretRedactor([token, chat])
+        record = self._make_record(f"url=https://api.telegram.org/{token}/send chat={chat}")
+        f.filter(record)
+        msg = record.getMessage()
+        assert token not in msg
+        assert chat not in msg
+        assert msg.count("<redacted>") == 2
+
+    def test_record_without_secret_unchanged(self) -> None:
+        from monitor.loop import _SecretRedactor
+        f = _SecretRedactor(["MYTOKEN"])
+        original = "Scanner found 3 candidates for BTC"
+        record = self._make_record(original)
+        f.filter(record)
+        assert record.getMessage() == original
+
+    def test_empty_secrets_list_is_noop(self) -> None:
+        from monitor.loop import _SecretRedactor
+        f = _SecretRedactor([])
+        record = self._make_record("some log line with no secret")
+        result = f.filter(record)
+        assert result is True
+        assert record.getMessage() == "some log line with no secret"
+
+    def test_blank_secret_ignored(self) -> None:
+        """Empty and whitespace-only strings must not be added — they would redact every log line."""
+        from monitor.loop import _SecretRedactor
+        f = _SecretRedactor(["", "   ", "\t", "realtoken"])
+        assert "" not in f._secrets
+        assert "   " not in f._secrets
+        assert "\t" not in f._secrets
+        assert "realtoken" in f._secrets
+
+    def test_filter_always_returns_true(self) -> None:
+        """Filter must never suppress the record — only rewrite it."""
+        from monitor.loop import _SecretRedactor
+        f = _SecretRedactor(["tok"])
+        record = self._make_record("contains tok in message")
+        assert f.filter(record) is True
+
+    def test_configure_logging_silences_httpx(self, tmp_path: Path) -> None:
+        import monitor.loop as _ml
+        _ml._logging_configured = False
+        _ml.configure_logging(log_dir=tmp_path / "logs")
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert logging.getLogger("httpcore").level == logging.WARNING
+        # Cleanup
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            if hasattr(h, "close"):
+                h.close()
+        _ml._logging_configured = False
+
+
 class TestBotLoopProperties:
     def test_portfolio_value_passthrough(self, tmp_path: Path) -> None:
         import config as _cfg

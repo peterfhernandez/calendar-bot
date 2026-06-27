@@ -748,12 +748,13 @@ class TestSetMyCommands:
         mock_updater = MagicMock()
         mock_updater.running = False
 
-        # Simulate a clean exit: start_polling signals the stopped event so
-        # listener.start() unblocks immediately instead of waiting forever.
-        async def fake_start_polling(**_kwargs):
+
+        # start_polling signals the internal _stopped event so start() returns
+        # without blocking forever on _stopped.wait().
+        async def _start_polling(**kwargs):
             listener._stopped.set()
 
-        mock_updater.start_polling = fake_start_polling
+        mock_updater.start_polling = _start_polling
 
         mock_app = MagicMock()
         mock_app.bot = mock_bot
@@ -804,9 +805,14 @@ class TestSetMyCommands:
 
         mock_builder = MockBuilder()
 
+        mock_app_cls = MagicMock()
+        mock_app_cls.builder.return_value = mock_builder
+        mock_ext = MagicMock()
+        mock_ext.Application = mock_app_cls
+        mock_ext.CommandHandler = MagicMock()
+
         with patch("config.TELEGRAM_TOKEN", "fake-token"), \
-             patch("telegram.ext.Application.builder", return_value=mock_builder), \
-             patch("telegram.ext.CommandHandler", MagicMock()):
+             patch.dict("sys.modules", {"telegram.ext": mock_ext}):
             try:
                 listener._build_app()
             except Exception:

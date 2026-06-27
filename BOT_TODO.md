@@ -450,6 +450,18 @@ Updated existing commands and added new runtime-control commands.
 
 ---
 
+## Phase 9d — Log Hygiene (Telegram Noise and Secret Redaction)
+
+- [x] Suppress high-frequency `httpx` / `httpcore` / `telegram` INFO logs that flood the log with a `getUpdates` line every few seconds
+  - [x] In `configure_logging()` (`monitor/loop.py`), set `httpx`, `httpcore`, `telegram.ext.Updater`, and `telegram.vendor.ptb_urllib3` loggers to `WARNING` — errors and warnings still appear, but polling calls are silenced
+- [x] Add `_SecretRedactor` log filter (`monitor/loop.py`)
+  - [x] Reads `config.TELEGRAM_TOKEN` and `config.TELEGRAM_CHAT` once at startup
+  - [x] Applied to the root logger so it covers both the console and rotating-file handlers
+  - [x] Replaces any occurrence of the literal token or chat ID in a log record with `<redacted>` before the record reaches a handler
+  - [x] Never raises — if config import fails the filter is skipped silently so logging setup cannot crash the bot
+
+---
+
 ## Validation Phases
 
 ### Validation Phase 1 — Paper Trading Validation
