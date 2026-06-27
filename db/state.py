@@ -1,9 +1,12 @@
 """SQLite state persistence for calendar spread trades."""
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+_AEST = ZoneInfo("Australia/Sydney")
 
 DB_PATH = Path(__file__).parent / "calendar_bot.db"
 
@@ -35,6 +38,7 @@ class CalendarTrade:
     date_close: Optional[str]
     spot_close: Optional[float]
     pnl: Optional[float]
+    ev_score: float = field(default=0.0)
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -72,9 +76,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 far_instrument   TEXT,
                 date_close       TEXT,
                 spot_close       REAL,
-                pnl              REAL
+                pnl              REAL,
+                ev_score         REAL    NOT NULL DEFAULT 0.0
             )
         """)
+        # Migration: add ev_score column to existing databases
+        try:
+            conn.execute("ALTER TABLE calendar_trades ADD COLUMN ev_score REAL NOT NULL DEFAULT 0.0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def _row_to_trade(row: sqlite3.Row) -> CalendarTrade:
@@ -104,6 +114,7 @@ def _row_to_trade(row: sqlite3.Row) -> CalendarTrade:
         date_close=row["date_close"],
         spot_close=row["spot_close"],
         pnl=row["pnl"],
+        ev_score=row["ev_score"] if row["ev_score"] is not None else 0.0,
     )
 
 
@@ -129,6 +140,7 @@ def create_calendar_trade(
     near_instrument: Optional[str] = None,
     far_instrument: Optional[str] = None,
     open_fees: float = 0.0,
+    ev_score: float = 0.0,
     db_path: Path = DB_PATH,
 ) -> CalendarTrade:
     """Insert a new calendar trade record with result='Open'. Returns the persisted trade."""
@@ -140,14 +152,14 @@ def create_calendar_trade(
                 (asset, option_type, strike, expiry_near, expiry_far,
                  near_days, far_days, qty, date_open, spot_open,
                  near_prem, far_prem, net_debit, fees, open_fees,
-                 result, notes, broker, near_instrument, far_instrument)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0.0,?,?,?,?,?,?)
+                 result, notes, broker, near_instrument, far_instrument, ev_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0.0,?,?,?,?,?,?,?)
             """,
             (
                 asset, option_type, strike, expiry_near, expiry_far,
                 near_days, far_days, qty, date_open.isoformat(), spot_open,
                 near_prem, far_prem, net_debit, open_fees,
-                "Open", notes, broker, near_instrument, far_instrument,
+                "Open", notes, broker, near_instrument, far_instrument, ev_score,
             ),
         )
         row = conn.execute(
@@ -314,6 +326,30 @@ def get_trades_closed_today(db_path: Path = DB_PATH) -> list[CalendarTrade]:
     """Return trades closed since midnight UTC today (any non-open result)."""
     init_db(db_path)
     today_str = datetime.now(timezone.utc).date().isoformat()
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM calendar_trades WHERE date_close >= ? AND result NOT IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY date_close",
+            (today_str, *_OPEN_STATUSES),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_trades_opened_today_aest(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return trades opened since midnight AEST today."""
+    init_db(db_path)
+    today_str = datetime.now(_AEST).date().isoformat()
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM calendar_trades WHERE date_open >= ? ORDER BY date_open",
+            (today_str,),
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_trades_closed_today_aest(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return trades closed since midnight AEST today (any non-open result)."""
+    init_db(db_path)
+    today_str = datetime.now(_AEST).date().isoformat()
     with get_connection(db_path) as conn:
         rows = conn.execute(
             f"SELECT * FROM calendar_trades WHERE date_close >= ? AND result NOT IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY date_close",

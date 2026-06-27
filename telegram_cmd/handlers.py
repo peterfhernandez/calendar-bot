@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING
 import config
 from db.state import (
     get_open_trades,
-    get_trades_closed_today,
-    get_trades_opened_today,
+    get_trades_closed_today_aest,
+    get_trades_opened_today_aest,
     DB_PATH,
 )
 
@@ -30,11 +30,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_AEST_LABEL = "AEST"
+
 
 def _mid(bid: float, ask: float) -> float | None:
     if bid > 0 and ask > 0:
         return (bid + ask) / 2.0
     return None
+
+
+def _fmt_expiry(expiry_iso: str) -> str:
+    """Convert ISO date string to ddMMMYY format, e.g. '2026-06-27' → '27Jun26'."""
+    try:
+        return datetime.strptime(expiry_iso, "%Y-%m-%d").strftime("%d%b%y")
+    except (ValueError, TypeError):
+        return expiry_iso or "?"
+
+
+def _fmt_type(option_type: str) -> str:
+    """Return 'Call' or 'Put' from any option_type string."""
+    if option_type and option_type[0].upper() == "C":
+        return "Call"
+    return "Put"
 
 
 async def handle_positions(
@@ -43,7 +60,7 @@ async def handle_positions(
     cache: ChainCache,
     db_path: Path = DB_PATH,
 ) -> None:
-    """One line per open trade: instrument pair, entry cost, current spread value, unrealized PnL."""
+    """Open trades: ev, strike/type, expiry range, entry cost, current value, PnL."""
     trades = get_open_trades(db_path)
     if not trades:
         await update.message.reply_text("No open positions.")
@@ -65,72 +82,98 @@ async def handle_positions(
         else:
             val_note = "sv=N/A (stale cache)"
 
-        pair = f"{t.near_instrument or t.expiry_near} / {t.far_instrument or t.expiry_far}"
+        near_date = _fmt_expiry(t.expiry_near)
+        far_date  = _fmt_expiry(t.expiry_far)
+        opt_type  = _fmt_type(t.option_type)
+
         lines.append(
-            f"#{t.id} {t.asset} {t.strike:.0f}{t.option_type[0]}  {pair}\n"
+            f"ev={t.ev_score:.2f}  #{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}\n"
             f"  entry=${t.net_debit * t.qty:.2f}  {val_note}"
         )
 
     await update.message.reply_text("\n\n".join(lines))
 
 
-async def handle_closed_today(
+async def handle_close_trades(
     update: Update,
     context: CallbackContext,
     db_path: Path = DB_PATH,
 ) -> None:
-    """Count of trades closed since midnight UTC and their total realized PnL."""
-    trades = get_trades_closed_today(db_path)
+    """List of trades closed today AEST with id, asset, debit, pnl, close reason."""
+    trades = get_trades_closed_today_aest(db_path)
+    if not trades:
+        await update.message.reply_text(f"No trades closed today ({_AEST_LABEL}).")
+        return
+
     total_pnl = sum(t.pnl for t in trades if t.pnl is not None)
-    count = len(trades)
-    if count == 0:
-        await update.message.reply_text("No trades closed today.")
-    else:
-        await update.message.reply_text(
-            f"{count} trade(s) closed today.\nTotal realized PnL: ${total_pnl:+.2f}"
+    lines = [f"{len(trades)} trade(s) closed today ({_AEST_LABEL}). Total PnL: ${total_pnl:+.2f}\n"]
+    for t in trades:
+        pnl_str = f"${t.pnl:+.2f}" if t.pnl is not None else "N/A"
+        reason  = t.notes or t.result or "—"
+        lines.append(
+            f"#{t.id} {t.asset}  debit=${t.net_debit * t.qty:.2f}  pnl={pnl_str}  {reason}"
         )
 
+    await update.message.reply_text("\n".join(lines))
 
-async def handle_new_today(
+
+async def handle_new_trades(
     update: Update,
     context: CallbackContext,
     db_path: Path = DB_PATH,
 ) -> None:
-    """Count of positions opened since midnight UTC and their instrument names."""
-    trades = get_trades_opened_today(db_path)
-    count = len(trades)
-    if count == 0:
-        await update.message.reply_text("No new positions opened today.")
-    else:
-        pairs = [
-            f"#{t.id} {t.asset} {t.strike:.0f}{t.option_type[0]}"
-            for t in trades
-        ]
-        await update.message.reply_text(
-            f"{count} new position(s) opened today:\n" + "\n".join(pairs)
+    """List of new trades entered today AEST with id, asset, debit, ev, strike, expiry range."""
+    trades = get_trades_opened_today_aest(db_path)
+    if not trades:
+        await update.message.reply_text(f"No new trades today ({_AEST_LABEL}).")
+        return
+
+    lines = [f"{len(trades)} new trade(s) today ({_AEST_LABEL}):\n"]
+    for t in trades:
+        near_date = _fmt_expiry(t.expiry_near)
+        far_date  = _fmt_expiry(t.expiry_far)
+        opt_type  = _fmt_type(t.option_type)
+        lines.append(
+            f"#{t.id} {t.asset}  debit=${t.net_debit * t.qty:.2f}  ev={t.ev_score:.2f}"
+            f"  {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
         )
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_status(
     update: Update,
     context: CallbackContext,
     engine: DecisionEngine,
+    db_path: Path = DB_PATH,
 ) -> None:
-    """Trading mode, drain mode, paused state, uptime, open position count, daily PnL."""
-    open_count = len(get_open_trades(engine._db_path))
-    uptime_secs = int((datetime.now(timezone.utc) - engine.start_time).total_seconds())
+    """Trading mode, drain mode, paused state, uptime, open count, today AEST PnL, session PnL."""
+    open_count = len(get_open_trades(db_path))
+
+    uptime_secs  = int((datetime.now(timezone.utc) - engine.start_time).total_seconds())
     hours, rem   = divmod(uptime_secs, 3600)
     minutes, sec = divmod(rem, 60)
     uptime_str   = f"{hours}h {minutes}m {sec}s"
 
+    # Today AEST: sum closed trades since AEST midnight + current unrealized
+    closed_aest  = get_trades_closed_today_aest(db_path)
+    today_pnl    = sum(t.pnl for t in closed_aest if t.pnl is not None) + engine._unrealized_pnl
+    session_pnl  = engine.session_pnl + engine._unrealized_pnl
+
+    drain_label = (
+        "ON (drain+new)" if config.DRAIN_AND_NEW_MODE
+        else ("ON" if config.DRAIN_MODE else "off")
+    )
+
     status = (
-        f"Mode:    {config.TRADING_MODE.upper()}\n"
-        f"Drain:   {'ON' if config.DRAIN_MODE else 'off'}\n"
-        f"Paused:  {'YES' if engine.paused else 'no'}\n"
-        f"State:   {engine.state.value}\n"
-        f"Uptime:  {uptime_str}\n"
-        f"Open:    {open_count} position(s)\n"
-        f"PnL:     ${engine._today_pnl + engine._unrealized_pnl:+.2f} (today)"
+        f"Mode:         {config.TRADING_MODE.upper()}\n"
+        f"Drain:        {drain_label}\n"
+        f"Paused:       {'YES' if engine.paused else 'no'}\n"
+        f"State:        {engine.state.value}\n"
+        f"Uptime:       {uptime_str}\n"
+        f"Open:         {open_count} position(s)\n"
+        f"PnL today ({_AEST_LABEL}): ${today_pnl:+.2f}\n"
+        f"PnL since start: ${session_pnl:+.2f}"
     )
     await update.message.reply_text(status)
 
@@ -141,7 +184,7 @@ async def handle_portfolio(
     cache: ChainCache,
     db_path: Path = DB_PATH,
 ) -> None:
-    """One line per open trade with asset, strike, expiries, debit, fees, EV, IV, OI."""
+    """Open trades with asset, strike, expiry range, debit, fees, EV at entry, current value."""
     trades = get_open_trades(db_path)
     if not trades:
         await update.message.reply_text("No open positions.")
@@ -152,21 +195,24 @@ async def handle_portfolio(
         near_snap = cache.get(t.near_instrument) if t.near_instrument else None
         far_snap  = cache.get(t.far_instrument)  if t.far_instrument  else None
 
-        near_iv  = f"{near_snap.mark_iv:.1%}" if near_snap and near_snap.mark_iv else "N/A"
-        far_iv   = f"{far_snap.mark_iv:.1%}"  if far_snap  and far_snap.mark_iv  else "N/A"
-        near_oi  = f"{near_snap.open_interest:.0f}" if near_snap else "N/A"
-        far_oi   = f"{far_snap.open_interest:.0f}"  if far_snap  else "N/A"
+        near_mid = _mid(near_snap.bid, near_snap.ask) if near_snap else None
+        far_mid  = _mid(far_snap.bid,  far_snap.ask)  if far_snap  else None
 
-        stale_note = ""
-        if not near_snap or not far_snap:
-            stale_note = " (cache stale)"
+        if near_mid is not None and far_mid is not None:
+            curr_val = max(0.0, far_mid - near_mid) * t.qty
+            pnl      = curr_val - t.net_debit * t.qty
+            val_str  = f"${curr_val:.2f}  PnL=${pnl:+.2f}"
+        else:
+            val_str = "N/A (stale cache)"
+
+        near_date = _fmt_expiry(t.expiry_near)
+        far_date  = _fmt_expiry(t.expiry_far)
+        opt_type  = _fmt_type(t.option_type)
 
         lines.append(
-            f"#{t.id} {t.asset} {t.option_type} {t.strike:.0f}\n"
-            f"  Near: {t.expiry_near}  Far: {t.expiry_far}\n"
-            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}\n"
-            f"  Near IV: {near_iv}  Far IV: {far_iv}\n"
-            f"  Near OI: {near_oi}  Far OI: {far_oi}{stale_note}"
+            f"#{t.id} {t.asset} {opt_type} {t.strike:.0f}  {near_date}→{far_date}\n"
+            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  EV: {t.ev_score:.2f}\n"
+            f"  Value: {val_str}"
         )
 
     await update.message.reply_text("\n\n".join(lines))
@@ -213,9 +259,94 @@ async def handle_start_drain(
 ) -> None:
     """Activate drain mode at runtime: no new entries or rolls."""
     config.DRAIN_MODE = True
+    config.DRAIN_AND_NEW_MODE = False
     if engine.paused:
         engine.resume()
     await update.message.reply_text(
         "Drain mode activated — no new entries or rolls.\n"
         "Existing positions will close at stop/TP/expiry."
     )
+
+
+async def handle_start_with_assets(
+    update: Update,
+    context: CallbackContext,
+    engine: DecisionEngine,
+) -> None:
+    """Override ASSETS list and resume the bot: /start_with_assets BTC,ETH,SOL"""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /start_with_assets Asset1,Asset2,...\nExample: /start_with_assets BTC,ETH"
+        )
+        return
+
+    raw = " ".join(args)
+    assets = [a.strip().upper() for a in raw.split(",") if a.strip()]
+    if not assets:
+        await update.message.reply_text("No valid assets provided.")
+        return
+
+    config.ASSETS = assets
+    config.DRAIN_MODE = False
+    config.DRAIN_AND_NEW_MODE = False
+    if engine.paused:
+        engine.resume()
+
+    await update.message.reply_text(
+        f"Assets updated to: {', '.join(assets)}\n"
+        "Bot resumed — scanning and monitoring restarted."
+    )
+
+
+async def handle_drain_and_new(
+    update: Update,
+    context: CallbackContext,
+    engine: DecisionEngine,
+) -> None:
+    """
+    Activate drain-and-new mode: close existing positions (no rolls) but allow
+    new entries with an optional new portfolio value and asset list.
+
+    Usage: /drain_and_new portfolio=50000 assets=BTC,ETH
+    Both parameters are optional.
+    """
+    args = context.args
+    portfolio_override: float | None = None
+    new_assets: list[str] | None = None
+
+    for arg in args:
+        if arg.lower().startswith("portfolio="):
+            try:
+                portfolio_override = float(arg.split("=", 1)[1])
+            except ValueError:
+                await update.message.reply_text(
+                    f"Invalid portfolio value: '{arg}'. Use portfolio=50000"
+                )
+                return
+        elif arg.lower().startswith("assets="):
+            raw = arg.split("=", 1)[1]
+            new_assets = [a.strip().upper() for a in raw.split(",") if a.strip()]
+
+    config.DRAIN_AND_NEW_MODE = True
+    config.DRAIN_MODE = False
+
+    if portfolio_override is not None:
+        config.PORTFOLIO_OVERRIDE = portfolio_override
+        engine.portfolio_value = portfolio_override
+
+    if new_assets:
+        config.ASSETS = new_assets
+
+    if engine.paused:
+        engine.resume()
+
+    parts = ["Drain-and-new mode activated:"]
+    parts.append("  • Existing positions: close outright (no rolls)")
+    parts.append("  • New entries: allowed")
+    if portfolio_override is not None:
+        parts.append(f"  • Portfolio override: ${portfolio_override:,.0f}")
+    if new_assets:
+        parts.append(f"  • Assets: {', '.join(new_assets)}")
+
+    await update.message.reply_text("\n".join(parts))

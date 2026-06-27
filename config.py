@@ -140,6 +140,17 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # 100% taker discount on the cheaper leg of
 # without starting new ones.
 DRAIN_MODE = _os.environ.get("DRAIN_MODE", "").lower() in ("1", "true", "yes")
 
+# Drain-and-new mode — like DRAIN_MODE for existing positions (no rolling,
+# close outright) but new entries ARE allowed.  Set at runtime via
+# /drain_and_new Telegram command.  Takes precedence over DRAIN_MODE when True.
+DRAIN_AND_NEW_MODE: bool = False
+
+# Portfolio override — when set to a positive float, replaces the live
+# available_cash reported by PortfolioTracker for all sizing decisions.
+# Set at runtime via /drain_and_new portfolio=N or /start_with_assets.
+# Set back to None to resume using the live tracker value.
+PORTFOLIO_OVERRIDE: float | None = None
+
 # Alerts
 # All alert settings are read from env vars (set in .env, never commit).
 # Email — set ALERT_EMAIL to enable; SMTP defaults to Gmail on port 587.

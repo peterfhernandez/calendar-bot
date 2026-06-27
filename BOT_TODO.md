@@ -416,6 +416,37 @@ The best approach is to call `set_my_commands()` once at startup inside `listene
 
 ---
 
+## Phase 9c — Telegram Command Improvements
+
+Updated existing commands and added new runtime-control commands.
+
+### Updated commands
+
+- [x] `/portfolio` — simplified output: removed IV and OI; added EV at entry and current spread value
+- [x] `/positions` — expiry range format `ddMMMYY→ddMMMYY`; full option type (`Put`/`Call` not `P`/`C`); `ev=` at start of each line
+- [x] `/new_trades` (renamed from `/new_today`) — AEST midnight; per-trade details: trade id, asset, debit, ev, strike, expiry range
+- [x] `/close_trades` (renamed from `/closed_today`) — AEST midnight; per-trade details: trade id, asset, debit, pnl, close reason
+- [x] `/status` — PnL computed from AEST midnight (from DB, not accumulated counter); added session PnL line (since bot start)
+
+### New commands
+
+- [x] `/start_with_assets Asset1,Asset2,...` — override `config.ASSETS` at runtime and resume the bot
+- [x] `/drain_and_new portfolio=N assets=A,B` — close existing positions (no rolls) while still allowing new entries; optional portfolio value override and asset list override
+
+### Supporting changes
+
+- [x] Add `ev_score` column to `calendar_trades` table (`db/state.py`) with backward-compatible migration
+- [x] Store `ev_score` from `CalendarCandidate` when creating trade records (`strategy/decision.py`)
+- [x] Add `get_trades_opened_today_aest` / `get_trades_closed_today_aest` helpers (`db/state.py`)
+- [x] Add `DRAIN_AND_NEW_MODE: bool` and `PORTFOLIO_OVERRIDE: float | None` to `config.py`
+- [x] Add `_session_pnl` accumulator and `session_pnl` property to `DecisionEngine` (`strategy/decision.py`)
+- [x] `DRAIN_AND_NEW_MODE` causes scan_tick to run (new entries allowed) but monitor closes instead of rolling
+- [x] `PORTFOLIO_OVERRIDE` bypasses live portfolio tracker for sizing decisions when set
+- [x] Update `COMMAND_REGISTRY` in `telegram_cmd/listener.py` — now the single source of truth for all 11 commands
+- [x] Update `tests/test_telegram_cmd.py` — tests rewritten for all renamed/new handlers
+
+---
+
 ## Validation Phases
 
 ### Validation Phase 1 — Paper Trading Validation

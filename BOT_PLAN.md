@@ -217,16 +217,35 @@ Rather than killing and restarting the OS process (which would take the listener
 
 | Command | Response |
 | --- | --- |
-| `/positions` | One line per open trade: instrument pair, entry cost, current spread value, unrealized PnL in USD and % |
-| `/closed_today` | Count of trades closed since midnight UTC and their total realized PnL |
-| `/new_today` | Count of positions opened since midnight UTC and their instrument names |
-| `/status` | Trading mode, drain mode, paused state, uptime, open position count, daily PnL |
-| `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, IV (near and far legs), OI (near and far legs) |
-| `/stop_bot` | Pauses scan/monitor ticks; confirms to chat; feed and listener remain alive |
-| `/start_bot` | Resumes scan/monitor ticks; confirms to chat |
-| `/portfolio` | One line per open trade: asset, strike, near/far expiry dates, net debit paid, fees paid, EV score at entry, near and far IV, near and far OI |
+| `/positions` | One line per open trade: `ev=` at start, strike and full type (`Put`/`Call`), expiry range `ddMMMYY→ddMMMYY`, entry cost, current spread value, unrealized PnL |
+| `/portfolio` | One line per open trade: asset, strike, expiry range, debit, fees, EV at entry, current spread value, unrealized PnL (no IV or OI) |
+| `/new_trades` | Trades entered today AEST — per trade: id, asset, debit, ev, strike, type, expiry range |
+| `/close_trades` | Trades closed today AEST — per trade: id, asset, debit, pnl, close reason |
+| `/status` | Trading mode, drain/drain-and-new mode, paused state, uptime, open count, today AEST PnL, session PnL since bot start |
+| `/stop_bot` | Pauses scan/monitor ticks; feed and listener remain alive |
+| `/start_bot` | Resumes scan/monitor ticks |
+| `/start_drain` | Sets `DRAIN_MODE = True`; no new entries or rolls; existing positions close at stop/TP/expiry |
+| `/start_with_assets BTC,ETH,...` | Override `config.ASSETS` at runtime and resume scanning |
+| `/drain_and_new [portfolio=N] [assets=A,B]` | Close existing positions outright (no rolls) but allow new entries; optional portfolio value and asset list override |
 | `/help` | Lists every available command with a one-line description |
-| `/start_drain` | Sets `DRAIN_MODE = True` at runtime; confirms; no new entries or rolls from this point |
+
+**`/start_with_assets`**
+
+Sets `config.ASSETS` to the provided comma-separated list, clears drain mode, and resumes the engine if paused. Useful for switching the bot to trade a different asset set without restarting the process.
+
+**`/drain_and_new`**
+
+A hybrid mode distinct from `/start_drain`:
+
+| Behaviour | `/start_drain` | `/drain_and_new` |
+| --- | --- | --- |
+| New entries | Blocked | Allowed |
+| Near-leg rolling | Blocked | Blocked |
+| Existing positions | Close at stop/TP/expiry | Close at stop/TP/expiry |
+| Portfolio override | No | Optional (`portfolio=N`) |
+| Asset list override | No | Optional (`assets=A,B`) |
+
+Sets `config.DRAIN_AND_NEW_MODE = True` and optionally `config.PORTFOLIO_OVERRIDE` and `config.ASSETS`. Clears `DRAIN_MODE`. The `PORTFOLIO_OVERRIDE` bypasses the live PortfolioTracker so sizing uses the specified USD value instead of the live account cash.
 
 **Telegram command menu (`setMyCommands`)**
 
@@ -623,5 +642,6 @@ COMBO_CHEAP_LEG_DISCOUNT  = 1.0      # taker combo orders: 100% discount on the 
 | **Trading fee integration** | **1–2 days** | **Done** |
 | **Telegram command listener (9a)** | **0.5–1 day** | **Done** |
 | **Telegram command menu + /help (9b)** | **0.5 day** | **Done** |
+| **Telegram command improvements (9c)** | **0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~4–6 days** | |
