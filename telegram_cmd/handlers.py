@@ -94,8 +94,8 @@ async def handle_positions(
         opt_type  = _fmt_type(t.option_type)
 
         lines.append(
-            f"#{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}  ev={_fmt_ev(t.ev_score)}\n"
-            f"  entry=${t.net_debit * t.qty:.2f}  {val_note}"
+            f"#{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
+            f"   entry=${t.net_debit * t.qty:.2f}  {val_note}   ev={_fmt_ev(t.ev_score)}"
         )
 
     await update.message.reply_text("\n\n".join(lines))
