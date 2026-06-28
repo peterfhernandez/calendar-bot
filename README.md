@@ -79,10 +79,22 @@ Copy `.env` and set:
 TRADING_MODE=test
 BOT_DB_PATH=calendar_bot_test.db
 BOT_LOG_FILE=logs/bot_test.log
+BOT_CONFIG_FILE=config_test.py   # optional — omit if no strategy overrides needed
 # credentials are the same (both modes share DERIBIT_TEST_* keys)
 ```
 
-**Step 2 — start both instances**
+**Step 2 — optionally create `config_test.py`**
+
+A plain Python file that overrides only the strategy parameters you want to change. Anything not listed here inherits from `config.py`.
+
+```python
+# config_test.py
+ASSETS        = ["BTC"]   # trade only BTC while testing
+MAX_POSITIONS = 1         # one position at a time for controlled observation
+MAX_LOSS_PCT  = 0.005     # 0.5% max loss per trade (half the paper default)
+```
+
+**Step 3 — start both instances**
 
 ```bash
 # Terminal 1 — paper mode (uses .env, calendar_bot.db, logs/bot.log)
@@ -92,13 +104,13 @@ python bot.py
 python bot.py --env .env.test
 ```
 
-You can also override the database or log path directly on the CLI without modifying the env file:
+You can also override the database, log path, or config file directly on the CLI without modifying the env file:
 
 ```bash
-python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log
+python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log --config config_test.py
 ```
 
-The three flags (`--env`, `--db`, `--log`) are pre-parsed before any module imports so `TRADING_MODE`, `DB_PATH`, and the log file path are all resolved correctly at startup.
+The four flags (`--env`, `--db`, `--log`, `--config`) are pre-parsed before any module imports so `TRADING_MODE`, `DB_PATH`, the log file path, and all strategy overrides are resolved correctly at startup.
 
 ---
 
