@@ -59,6 +59,7 @@ from alerts.notifier import Notifier
 from data.chain_cache import ChainCache
 from data.deribit_feed import DeribitFeed
 from db.state import list_assets_with_open_positions
+from execution.executor import CalendarExecutor
 from monitor.loop import BotLoop, configure_logging
 
 logger = logging.getLogger("bot")
@@ -85,6 +86,25 @@ def _check_startup() -> None:
         print("*** DRAIN MODE — no new entries, no rolls; existing positions close at stop/TP/expiry ***", flush=True)
 
 
+
+
+async def _cancel_open_orders(client_id: str, client_secret: str) -> None:
+    """Cancel any open option orders left from prior sessions on startup."""
+    from execution.executor import _DeribitRPCClient
+    try:
+        async with _DeribitRPCClient(client_id, client_secret) as client:
+            for asset in config.ASSETS:
+                try:
+                    orders = await client._rpc(
+                        "private/cancel_all_by_currency",
+                        {"currency": asset, "kind": "option"},
+                    )
+                    if orders:
+                        logger.info("Cancelled %s open %s option order(s) from prior session", orders, asset)
+                except Exception as exc:
+                    logger.warning("Could not cancel open %s orders on startup: %s", asset, exc)
+    except Exception as exc:
+        logger.warning("Startup order cleanup failed (non-fatal): %s", exc)
 
 
 async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
@@ -117,9 +137,19 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
         on_ticker=cache.update,
     )
 
+    executor = None
+    if config.TRADING_MODE != "paper":
+        executor = CalendarExecutor(
+            client_id=config.DERIBIT_CLIENT_ID,
+            client_secret=config.DERIBIT_CLIENT_SECRET,
+            portfolio_value=portfolio_value,
+        )
+        await _cancel_open_orders(config.DERIBIT_CLIENT_ID, config.DERIBIT_CLIENT_SECRET)
+
     loop = BotLoop(
         cache=cache,
         portfolio_value=portfolio_value,
+        executor=executor,
         notifier=notifier,
     )
 
