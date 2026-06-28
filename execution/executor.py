@@ -803,10 +803,16 @@ class CalendarExecutor:
         import concurrent.futures
         try:
             asyncio.get_running_loop()
-            # Already inside a running event loop — run in a new thread.
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+
+        if in_loop:
+            # Already inside a running event loop — run in a new thread so that
+            # asyncio.run() can create its own event loop there.
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(asyncio.run, coro).result()
-        except RuntimeError:
+        else:
             return asyncio.run(coro)
 
     # ── ExecutorProtocol implementation ───────────────────────────────────────
