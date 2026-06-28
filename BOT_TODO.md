@@ -568,6 +568,66 @@ Ensures that no credentials from `.env` ever appear in log files, and provides a
 
 ---
 
+## Phase 12 — Parallel Mode Isolation (--env, --db, --log)
+
+Allows running a paper-mode and a test-mode bot instance side by side on the same machine, each with its own credentials, database, and log file.
+
+### How it works
+
+`bot.py` now accepts three flags that are pre-parsed before any module-level imports:
+
+| Flag | Env var set | Default |
+| --- | --- | --- |
+| `--env FILE` | `BOT_ENV_FILE` | `.env` |
+| `--db PATH` | `BOT_DB_PATH` | `db/calendar_bot.db` |
+| `--log PATH` | `BOT_LOG_FILE` | `logs/bot.log` |
+
+Pre-parsing (setting os.environ before importing `config` or `db.state`) ensures that module-level code (`TRADING_MODE`, `DB_PATH`, etc.) sees the right values at import time — no import-order tricks required.
+
+The `.env.test` file includes `TRADING_MODE=test` plus any per-instance overrides. Only credentials and mode need to differ from `.env`; all other parameters are shared.
+
+### Usage
+
+```bash
+# Terminal 1 — paper mode (default)
+python bot.py
+
+# Terminal 2 — test mode, separate DB and log
+python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log
+```
+
+Or put `BOT_DB_PATH` and `BOT_LOG_FILE` directly in `.env.test` to avoid repeating them on the command line:
+```
+python bot.py --env .env.test
+```
+
+### Changes
+
+- [x] Add `_preparse_argv()` to `bot.py` — pre-parses `--env`, `--db`, `--log` and sets `BOT_ENV_FILE`, `BOT_DB_PATH`, `BOT_LOG_FILE` in `os.environ` before any imports
+- [x] Register `--env`, `--db`, `--log` in argparse so they appear in `--help`
+- [x] Update `config.py` `_load_env()` — use `os.environ.setdefault` (don't overwrite pre-loaded vars); read `BOT_ENV_FILE` as the default path
+- [x] Update `db/state.py` `DB_PATH` — read from `BOT_DB_PATH` env var; fall back to `db/calendar_bot.db`
+- [x] Update `monitor/loop.py` `configure_logging()` — read `BOT_LOG_FILE` env var for the rotating log file path; fall back to `{log_dir}/bot.log`
+
+### `.env.test` template
+
+```ini
+# Deribit test exchange — shared key pair used by both paper and test modes
+TRADING_MODE=test
+DERIBIT_TEST_CLIENT_ID=<your test client id>
+DERIBIT_TEST_CLIENT_SECRET=<your test client secret>
+
+# Isolate state and logs from the paper-mode instance
+BOT_DB_PATH=calendar_bot_test.db
+BOT_LOG_FILE=logs/bot_test.log
+
+# Alerts — point to same or different endpoints
+TELEGRAM_BOT_TOKEN=<token>
+TELEGRAM_CHAT=<chat id>
+```
+
+---
+
 ## Phase 8i — Feed Asset Expansion for Open Positions
 
 - [x] Update `bot.py` to expand the feed subscription beyond `config.ASSETS`

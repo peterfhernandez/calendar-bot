@@ -1,4 +1,5 @@
 """SQLite state persistence for calendar spread trades."""
+import os as _os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -8,7 +9,10 @@ from zoneinfo import ZoneInfo
 
 _AEST = ZoneInfo("Australia/Sydney")
 
-DB_PATH = Path(__file__).parent / "calendar_bot.db"
+# BOT_DB_PATH lets a separate bot instance (e.g. test mode) use its own DB
+# without touching the paper-mode database.  Set via --db CLI flag or directly
+# in the instance's .env file.
+DB_PATH = Path(_os.environ.get("BOT_DB_PATH", str(Path(__file__).parent / "calendar_bot.db")))
 
 
 @dataclass
