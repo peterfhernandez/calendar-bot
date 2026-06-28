@@ -283,14 +283,18 @@ class PortfolioTracker:
         self._unrealized_pnl     = total_unrealized
 
     def _authenticate(self) -> str:
-        """Obtain a short-lived Deribit access token via client_credentials."""
-        params = urllib.parse.urlencode({
+        """Obtain a short-lived Deribit access token via client_credentials.
+
+        Credentials are sent as a JSON POST body, not as URL query parameters,
+        so they never appear in exception messages or log output.
+        """
+        url  = f"{self._rest_url}/api/v2/public/auth"
+        body = {
             "grant_type":    "client_credentials",
             "client_id":     self._client_id,
             "client_secret": self._client_secret,
-        })
-        url  = f"{self._rest_url}/api/v2/public/auth?{params}"
-        data = _rest_get(url)
+        }
+        data  = _rest_post(url, body)
         token: str = data["result"]["access_token"]
         logger.debug("Deribit REST authentication successful")
         return token
@@ -435,6 +439,23 @@ def _rest_get(url: str, bearer_token: str | None = None, timeout: int = 10) -> d
     req = urllib.request.Request(url)
     if bearer_token:
         req.add_header("Authorization", f"Bearer {bearer_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc
+
+
+def _rest_post(url: str, payload: dict, timeout: int = 10) -> dict:
+    """POST a JSON body to a Deribit REST endpoint and return the parsed JSON response.
+
+    Used for authentication so credentials are sent in the request body rather
+    than as URL query parameters (which would appear in exception messages and logs).
+    """
+    encoded = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=encoded, method="POST")
+    req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())

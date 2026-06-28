@@ -528,6 +528,46 @@ Updated existing commands and added new runtime-control commands.
 
 ---
 
+## Phase 11 — Secret Leak Prevention in Logs
+
+Ensures that no credentials from `.env` ever appear in log files, and provides a one-time script to scrub any existing log files that may have captured secrets before these fixes.
+
+### Root-cause fixes (prevent generation)
+
+- [x] Fix `portfolio/tracker.py` `_authenticate()` — switch Deribit auth from GET (credentials in URL query string) to POST (credentials in JSON body), so the URL that appears in any HTTP error message contains no secrets
+  - [x] Add `_rest_post(url, payload)` helper alongside the existing `_rest_get`
+  - [x] `_authenticate()` now calls `_rest_post` with `client_id` and `client_secret` in the body
+- [x] Remove `logger.info("Authenticating as %s", self.client_id)` from `data/deribit_feed.py` — replaced with a no-argument `logger.debug(...)` that logs no credential values
+
+### Belt-and-suspenders redaction
+
+- [x] Expand `_SecretRedactor` in `monitor/loop.py` to cover all secrets from `.env`, not just the Telegram pair
+  - [x] `DERIBIT_TEST_CLIENT_ID` and `DERIBIT_TEST_CLIENT_SECRET`
+  - [x] `DERIBIT_LIVE_CLIENT_ID` and `DERIBIT_LIVE_CLIENT_SECRET`
+  - [x] `SMTP_USER` and `SMTP_PASS`
+  - [x] `TELEGRAM_TOKEN` and `TELEGRAM_CHAT` (already covered; now consolidated with the others)
+  - [x] Filter still skips blank/whitespace strings so it cannot accidentally redact empty-string matches
+
+### Test updates
+
+- [x] Update `tests/test_portfolio.py` — auth now goes via `_rest_post`; all tests that previously relied on `_rest_get` routing `public/auth` URLs now patch `_rest_post` instead
+  - [x] Add `_fake_rest_post` module-level helper returning a valid token response
+  - [x] `TestAvailableCashCalculation._run_refresh_mocked` — add `patch("portfolio.tracker._rest_post")` alongside existing `_rest_get` patch; remove auth-URL branch from `fake_rest_get`
+  - [x] `TestOfflineTracking` — failure tests now trigger `_rest_post` to raise; recovery tests patch both `_rest_post` and `_rest_get`
+  - [x] `TestReconciliation._run_with_margin` — add `_rest_post` patch
+  - [x] `TestApiRefresh.test_api_failure_leaves_cached_state_unchanged` — patch `_rest_post` to raise instead of `_rest_get`
+
+### One-time log scrub
+
+- [x] Add `scratch/scrub_logs.py` — reads all secrets from `.env`, then rewrites every `logs/bot.log*` file in place, replacing any occurrence of a secret with `<redacted>`
+  - [x] Reads `.env` via the same key names as `config.py` (no dependency on config module — safe to run standalone)
+  - [x] Processes all rotation files: `bot.log`, `bot.log.1`, … `bot.log.5`
+  - [x] Reports count of replacements per file so the operator can see what was found
+  - [x] Skips files that do not exist; exits cleanly if the `logs/` directory is absent
+  - [x] Dry-run mode (`--dry-run`) prints what would be replaced without writing
+
+---
+
 ## Phase 8i — Feed Asset Expansion for Open Positions
 
 - [x] Update `bot.py` to expand the feed subscription beyond `config.ASSETS`

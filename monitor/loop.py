@@ -130,13 +130,17 @@ def configure_logging(
     # at module load time (config is imported before monitor.loop in some paths).
     try:
         import config as _cfg
-        secrets: list[str] = []
-        if getattr(_cfg, "TELEGRAM_TOKEN", None):
-            secrets.append(_cfg.TELEGRAM_TOKEN)
-        if getattr(_cfg, "TELEGRAM_CHAT", None):
-            secrets.append(str(_cfg.TELEGRAM_CHAT))
-        if secrets:
-            root.addFilter(_SecretRedactor(secrets))
+        secrets: list[str] = [
+            getattr(_cfg, "TELEGRAM_TOKEN",             ""),
+            str(getattr(_cfg, "TELEGRAM_CHAT",          "") or ""),
+            getattr(_cfg, "DERIBIT_TEST_CLIENT_ID",     ""),
+            getattr(_cfg, "DERIBIT_TEST_CLIENT_SECRET", ""),
+            getattr(_cfg, "DERIBIT_LIVE_CLIENT_ID",     ""),
+            getattr(_cfg, "DERIBIT_LIVE_CLIENT_SECRET", ""),
+            getattr(_cfg, "SMTP_USER", ""),
+            getattr(_cfg, "SMTP_PASS", ""),
+        ]
+        root.addFilter(_SecretRedactor(secrets))
     except Exception:
         pass  # never let logging setup crash the bot
 
