@@ -909,3 +909,31 @@ class TestPaperFeeSimulation:
                               near_price=sol_candidate.near_bid,
                               far_price=sol_candidate.far_ask, via_combo=True)
         assert result["fees_paid"] == pytest.approx(expected, rel=1e-6)
+
+
+class TestRunInsideEventLoop:
+    """CalendarExecutor._run() must work when called from within a running event loop."""
+
+    def test_run_from_running_loop(self):
+        """_run() should not raise when called from an async context (simulates bot runtime)."""
+        async def inner():
+            async def dummy():
+                return 42
+
+            exc = CalendarExecutor(client_id="", client_secret="", portfolio_value=10_000.0)
+            return exc._run(dummy())
+
+        result = asyncio.run(inner())
+        assert result == 42
+
+    def test_enter_spread_paper_from_running_loop(self):
+        """Paper-mode enter_spread() must succeed when called from within a running event loop."""
+        async def inner():
+            candidate = _make_candidate(spot=100_000.0)
+            with patch.object(config, "TRADING_MODE", "paper"):
+                exc = CalendarExecutor(client_id="", client_secret="", portfolio_value=50_000.0)
+                return exc.enter_spread(candidate)
+
+        result = asyncio.run(inner())
+        assert result is not None
+        assert "fees_paid" in result

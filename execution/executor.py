@@ -799,8 +799,15 @@ class CalendarExecutor:
         self.order_timeout   = order_timeout
 
     def _run(self, coro):
-        """Run an async coroutine in a fresh event loop."""
-        return asyncio.run(coro)
+        """Run an async coroutine, handling both standalone and in-loop contexts."""
+        import concurrent.futures
+        try:
+            asyncio.get_running_loop()
+            # Already inside a running event loop — run in a new thread.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, coro).result()
+        except RuntimeError:
+            return asyncio.run(coro)
 
     # ── ExecutorProtocol implementation ───────────────────────────────────────
 
