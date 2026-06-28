@@ -710,6 +710,7 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Offline error tracking (10)** | **0.5 day** | **Done** |
 | **Telegram UX polish + reliability (10)** | **0.5 day** | **Done** |
 | **Log hygiene — noise + secret redaction (9d)** | **< 0.5 day** | **Done** |
+| **Secret leak prevention in logs (11)** | **< 0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~3–5 days** | |
 
@@ -751,3 +752,50 @@ Both components now track an `_offline` flag and only log when the connectivity 
 
 - `tests/test_feed.py` — `TestDeribitFeedOfflineTracking` (3 tests): first failure sets flag; repeated failures increment `_retry_count`; recovery clears flag and counter
 - `tests/test_portfolio.py` — `TestOfflineTracking` (5 tests): first failure sets flag; repeated failures increment count; first failure is WARNING/repeats are DEBUG; recovery clears flag; recovery logs INFO with retry count
+
+---
+
+## Phase 11 — Secret Leak Prevention in Logs
+
+Credentials from `.env` must never appear in `logs/bot.log*`. Two root-cause fixes eliminate the known leakage paths; a `_SecretRedactor` expansion provides belt-and-suspenders coverage; and a one-time scrub script cleans any existing log files.
+
+### Root-cause fix 1 — Auth URL no longer contains credentials (`portfolio/tracker.py`)
+
+The original `_authenticate()` encoded `client_id` and `client_secret` as URL query parameters:
+```
+/api/v2/public/auth?grant_type=client_credentials&client_id=XXX&client_secret=YYY
+```
+Any HTTP error (401, 429, 503) would raise `RuntimeError(f"HTTP {code} from {url}: {body}")`, embedding both credentials in the exception message. That message then appeared in `logger.warning()` and in `logger.exception()` tracebacks.
+
+**Fix:** `_authenticate()` now calls a new `_rest_post(url, payload)` helper that sends credentials as a JSON POST body. The URL in any error message is simply `/api/v2/public/auth` — no query parameters.
+
+### Root-cause fix 2 — Client ID removed from feed log (`data/deribit_feed.py`)
+
+`DeribitFeed._authenticate()` logged `logger.info("Authenticating as %s", self.client_id)` on every WebSocket reconnect. Replaced with `logger.debug("Authenticating with Deribit WebSocket API")` — no credential value is logged.
+
+### Belt-and-suspenders — expanded `_SecretRedactor` (`monitor/loop.py`)
+
+The existing `_SecretRedactor` filter (installed on the root logger, covering both console and file handlers) previously only redacted `TELEGRAM_TOKEN` and `TELEGRAM_CHAT`. It now redacts all secrets loaded from `.env`:
+
+| Secret | Source |
+| --- | --- |
+| `DERIBIT_TEST_CLIENT_ID` | config |
+| `DERIBIT_TEST_CLIENT_SECRET` | config |
+| `DERIBIT_LIVE_CLIENT_ID` | config |
+| `DERIBIT_LIVE_CLIENT_SECRET` | config |
+| `SMTP_USER` | config |
+| `SMTP_PASS` | config |
+| `TELEGRAM_TOKEN` | config (was already covered) |
+| `TELEGRAM_CHAT` | config (was already covered) |
+
+Blank values are still excluded so an unconfigured credential cannot accidentally redact every log line.
+
+### One-time log scrub (`scratch/scrub_logs.py`)
+
+A standalone script rewrites every `logs/bot.log*` rotation file in place:
+
+- Loads secrets from `.env` using the same key names as `config.py` (no import of bot modules — safe to run without dependencies installed)
+- Also checks `os.environ` so it works when variables are exported rather than in a file
+- Reports per-file replacement counts so the operator can see what was found
+- `--dry-run` mode prints findings without writing
+- Notes that `.gz` compressed rotations (if any) must be deleted manually

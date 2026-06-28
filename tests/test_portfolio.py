@@ -21,6 +21,7 @@ from portfolio.tracker import (
     PortfolioState,
     _assets_to_currencies,
     _rest_get,
+    _rest_post,
 )
 
 
@@ -93,6 +94,11 @@ def _make_tracker(db: Path, client_id: str = "", client_secret: str = "") -> Por
 
 def _fake_auth_response() -> dict:
     return {"result": {"access_token": "test-token-abc", "expires_in": 900}}
+
+
+def _fake_rest_post(url: str, payload: dict, timeout: int = 10) -> dict:
+    """Fake _rest_post that returns a valid auth token for any URL."""
+    return _fake_auth_response()
 
 
 def _fake_summary_btc(equity: float = 0.5, available: float = 0.4, margin: float = 0.1) -> dict:
@@ -205,8 +211,6 @@ class TestAvailableCashCalculation:
         positions = positions or {}
 
         def fake_rest_get(url: str, bearer_token: str | None = None, timeout: int = 10) -> dict:
-            if "public/auth" in url:
-                return _fake_auth_response()
             if "get_account_summary" in url:
                 for currency, summary in summaries.items():
                     if f"currency={currency}" in url:
@@ -224,9 +228,10 @@ class TestAvailableCashCalculation:
             client_secret="test-secret",
             rest_url="https://test.deribit.com",
         )
-        with patch("portfolio.tracker._rest_get", side_effect=fake_rest_get):
-            with patch("config.ASSETS", ["BTC"]):
-                tracker.refresh(spot_prices=spot_prices)
+        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post):
+            with patch("portfolio.tracker._rest_get", side_effect=fake_rest_get):
+                with patch("config.ASSETS", ["BTC"]):
+                    tracker.refresh(spot_prices=spot_prices)
         return tracker
 
     def test_available_cash_uses_api_available_funds(self):
@@ -283,7 +288,7 @@ class TestAvailableCashCalculation:
             client_secret="bad-secret",
             rest_url="https://test.deribit.com",
         )
-        with patch("portfolio.tracker._rest_get", side_effect=RuntimeError("timeout")):
+        with patch("portfolio.tracker._rest_post", side_effect=RuntimeError("timeout")):
             with patch("config.ASSETS", ["BTC"]):
                 tracker.refresh()
         # equity_usd was never set → stays 0
@@ -308,7 +313,7 @@ class TestOfflineTracking:
         db = _make_db()
         tracker = self._make_tracker(db)
         assert not tracker._api_offline
-        with patch("portfolio.tracker._rest_get", side_effect=OSError("unreachable")):
+        with patch("portfolio.tracker._rest_post", side_effect=OSError("unreachable")):
             with patch("config.ASSETS", ["BTC"]):
                 tracker.refresh()
         assert tracker._api_offline
@@ -318,7 +323,7 @@ class TestOfflineTracking:
         """Subsequent failures increment the counter without resetting offline flag."""
         db = _make_db()
         tracker = self._make_tracker(db)
-        with patch("portfolio.tracker._rest_get", side_effect=OSError("unreachable")):
+        with patch("portfolio.tracker._rest_post", side_effect=OSError("unreachable")):
             with patch("config.ASSETS", ["BTC"]):
                 tracker.refresh()
                 tracker.refresh()
@@ -331,7 +336,7 @@ class TestOfflineTracking:
         import logging
         db = _make_db()
         tracker = self._make_tracker(db)
-        with patch("portfolio.tracker._rest_get", side_effect=OSError("gone")):
+        with patch("portfolio.tracker._rest_post", side_effect=OSError("gone")):
             with patch("config.ASSETS", ["BTC"]):
                 with caplog.at_level(logging.DEBUG, logger="portfolio.tracker"):
                     tracker.refresh()
@@ -345,8 +350,6 @@ class TestOfflineTracking:
 
     def _fake_rest_get(self, url, **kwargs):
         """Return a minimal valid API response based on the URL path."""
-        if "auth" in url:
-            return {"result": {"access_token": "tok"}}
         if "get_account_summary" in url:
             return {"result": {"equity": 1.0, "available_funds": 0.9,
                                "initial_margin": 0.0, "floating_profit_loss": 0.0}}
@@ -360,15 +363,16 @@ class TestOfflineTracking:
         tracker = self._make_tracker(db)
 
         # First go offline
-        with patch("portfolio.tracker._rest_get", side_effect=OSError("gone")):
+        with patch("portfolio.tracker._rest_post", side_effect=OSError("gone")):
             with patch("config.ASSETS", ["BTC"]):
                 tracker.refresh()
         assert tracker._api_offline
 
         # Then recover
-        with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
-            with patch("config.ASSETS", ["BTC"]):
-                tracker.refresh(spot_prices={"BTC": 100_000.0})
+        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post):
+            with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
+                with patch("config.ASSETS", ["BTC"]):
+                    tracker.refresh(spot_prices={"BTC": 100_000.0})
 
         assert not tracker._api_offline
         assert tracker._api_fail_count == 0
@@ -382,10 +386,11 @@ class TestOfflineTracking:
         tracker._api_offline = True
         tracker._api_fail_count = 5
 
-        with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
-            with patch("config.ASSETS", ["BTC"]):
-                with caplog.at_level(logging.INFO, logger="portfolio.tracker"):
-                    tracker.refresh(spot_prices={"BTC": 100_000.0})
+        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post):
+            with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
+                with patch("config.ASSETS", ["BTC"]):
+                    with caplog.at_level(logging.INFO, logger="portfolio.tracker"):
+                        tracker.refresh(spot_prices={"BTC": 100_000.0})
 
         info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
         assert any("back online" in m.lower() and "5" in m for m in info_msgs)
@@ -408,8 +413,6 @@ class TestReconciliation:
         }
 
         def fake_rest_get(url, bearer_token=None, timeout=10):
-            if "public/auth" in url:
-                return _fake_auth_response()
             if "get_account_summary" in url:
                 return {"result": summaries["BTC"]}
             return {"result": []}
@@ -435,9 +438,10 @@ class TestReconciliation:
         old_level = log.level
         log.setLevel(logging.WARNING)
         try:
-            with patch("portfolio.tracker._rest_get", side_effect=fake_rest_get):
-                with patch("config.ASSETS", ["BTC"]):
-                    tracker.refresh(spot_prices={"BTC": 100_000.0})
+            with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post):
+                with patch("portfolio.tracker._rest_get", side_effect=fake_rest_get):
+                    with patch("config.ASSETS", ["BTC"]):
+                        tracker.refresh(spot_prices={"BTC": 100_000.0})
         finally:
             log.removeHandler(handler)
             log.setLevel(old_level)

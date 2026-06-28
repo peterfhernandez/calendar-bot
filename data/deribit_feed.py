@@ -237,7 +237,7 @@ class DeribitFeed:
             await self._handle_message(raw_msg)
 
     async def _authenticate(self) -> None:
-        logger.info("Authenticating as %s", self.client_id)
+        logger.debug("Authenticating with Deribit WebSocket API")
         await self._rpc(
             "public/auth",
             {
