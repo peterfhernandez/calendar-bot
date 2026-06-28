@@ -574,17 +574,20 @@ Allows running a paper-mode and a test-mode bot instance side by side on the sam
 
 ### How it works
 
-`bot.py` now accepts three flags that are pre-parsed before any module-level imports:
+`bot.py` now accepts four flags that are pre-parsed before any module-level imports:
 
 | Flag | Env var set | Default |
 | --- | --- | --- |
 | `--env FILE` | `BOT_ENV_FILE` | `.env` |
 | `--db PATH` | `BOT_DB_PATH` | `db/calendar_bot.db` |
 | `--log PATH` | `BOT_LOG_FILE` | `logs/bot.log` |
+| `--config FILE` | `BOT_CONFIG_FILE` | *(none)* |
 
 Pre-parsing (setting os.environ before importing `config` or `db.state`) ensures that module-level code (`TRADING_MODE`, `DB_PATH`, etc.) sees the right values at import time — no import-order tricks required.
 
 The `.env.test` file includes `TRADING_MODE=test` plus any per-instance overrides. Only credentials and mode need to differ from `.env`; all other parameters are shared.
+
+`--config` points to a plain Python override file that is `exec`'d at the end of `config.py`. It can reassign any config variable — only set what differs from the defaults (e.g. `ASSETS`, `MAX_POSITIONS`, `MAX_LOSS_PCT`).
 
 ### Usage
 
@@ -596,7 +599,7 @@ python bot.py
 python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log
 ```
 
-Or put `BOT_DB_PATH` and `BOT_LOG_FILE` directly in `.env.test` to avoid repeating them on the command line:
+Or put `BOT_DB_PATH`, `BOT_LOG_FILE`, and `BOT_CONFIG_FILE` directly in `.env.test` to avoid repeating them on the command line:
 
 ```bash
 python bot.py --env .env.test
@@ -604,11 +607,12 @@ python bot.py --env .env.test
 
 ### Changes
 
-- [x] Add `_preparse_argv()` to `bot.py` — pre-parses `--env`, `--db`, `--log` and sets `BOT_ENV_FILE`, `BOT_DB_PATH`, `BOT_LOG_FILE` in `os.environ` before any imports
-- [x] Register `--env`, `--db`, `--log` in argparse so they appear in `--help`
+- [x] Add `_preparse_argv()` to `bot.py` — pre-parses `--env`, `--db`, `--log`, `--config` and sets `BOT_ENV_FILE`, `BOT_DB_PATH`, `BOT_LOG_FILE`, `BOT_CONFIG_FILE` in `os.environ` before any imports
+- [x] Register `--env`, `--db`, `--log`, `--config` in argparse so they appear in `--help`
 - [x] Update `config.py` `_load_env()` — use `os.environ.setdefault` (don't overwrite pre-loaded vars); read `BOT_ENV_FILE` as the default path
 - [x] Update `db/state.py` `DB_PATH` — read from `BOT_DB_PATH` env var; fall back to `db/calendar_bot.db`
 - [x] Update `monitor/loop.py` `configure_logging()` — read `BOT_LOG_FILE` env var for the rotating log file path; fall back to `{log_dir}/bot.log`
+- [x] Add config override support to `config.py` — `exec` `BOT_CONFIG_FILE` into the config namespace at the end of module load; raises `SystemExit` if the file is specified but not found
 
 ### `.env.test` template
 
@@ -621,10 +625,21 @@ DERIBIT_TEST_CLIENT_SECRET=<your test client secret>
 # Isolate state and logs from the paper-mode instance
 BOT_DB_PATH=calendar_bot_test.db
 BOT_LOG_FILE=logs/bot_test.log
+BOT_CONFIG_FILE=config_test.py   # optional — omit if no strategy overrides needed
 
 # Alerts — point to same or different endpoints
 TELEGRAM_BOT_TOKEN=<token>
 TELEGRAM_CHAT=<chat id>
+```
+
+### `config_test.py` example
+
+```python
+# config_test.py — strategy overrides for the test-mode instance.
+# Only set variables that differ from config.py defaults.
+ASSETS        = ["BTC"]   # trade only BTC while testing
+MAX_POSITIONS = 1         # one position at a time for controlled observation
+MAX_LOSS_PCT  = 0.005     # 0.5% max loss per trade (half the paper default)
 ```
 
 ---
