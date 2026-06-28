@@ -597,7 +597,8 @@ python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log
 ```
 
 Or put `BOT_DB_PATH` and `BOT_LOG_FILE` directly in `.env.test` to avoid repeating them on the command line:
-```
+
+```bash
 python bot.py --env .env.test
 ```
 
