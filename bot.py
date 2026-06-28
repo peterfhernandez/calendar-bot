@@ -29,9 +29,10 @@ import sys as _sys
 def _preparse_argv() -> None:
     """Extract --env / --db / --log from sys.argv and set env vars immediately."""
     _flags = {
-        "--env": "BOT_ENV_FILE",   # which .env file to load
-        "--db":  "BOT_DB_PATH",    # SQLite database path override
-        "--log": "BOT_LOG_FILE",   # log file path override
+        "--env":    "BOT_ENV_FILE",    # which .env file to load
+        "--db":     "BOT_DB_PATH",     # SQLite database path override
+        "--log":    "BOT_LOG_FILE",    # log file path override
+        "--config": "BOT_CONFIG_FILE", # strategy config override file
     }
     _argv = _sys.argv[1:]
     _i = 0
@@ -233,6 +234,18 @@ def main() -> None:
             "Log file path (default: logs/bot.log). "
             "Override to write a separate log per instance, e.g. "
             "--log logs/bot_test.log."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="FILE",
+        default="",
+        help=(
+            "Path to a Python config override file (default: none). "
+            "Variables assigned in this file overwrite their counterparts in "
+            "config.py — use it to tune strategy parameters (ASSETS, "
+            "MAX_POSITIONS, MAX_LOSS_PCT, etc.) per instance without forking "
+            "the main config."
         ),
     )
     args = parser.parse_args()

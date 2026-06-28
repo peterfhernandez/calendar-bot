@@ -169,3 +169,19 @@ TELEGRAM_TOKEN      = _os.environ.get("TELEGRAM_TOKEN",      "")  # bot token (T
 TELEGRAM_BOT_TOKEN  = TELEGRAM_TOKEN                               # alias for compatibility
 TELEGRAM_CHAT       = _os.environ.get("TELEGRAM_CHAT",       "")  # chat ID  (TELEGRAM_CHAT in .env)
 TELEGRAM_CHAT_ID    = TELEGRAM_CHAT                                # alias for compatibility
+
+# Config override — exec a per-instance Python file (BOT_CONFIG_FILE env var,
+# set via --config CLI flag) so strategy parameters can differ between a
+# paper-mode and a test-mode instance without forking the whole config.
+# The override file is plain Python; assign only the variables you want to
+# change.  Example (config_test.py):
+#   ASSETS       = ["BTC"]
+#   MAX_POSITIONS = 1
+#   MAX_LOSS_PCT  = 0.005
+_cfg_override = _os.environ.get("BOT_CONFIG_FILE", "")
+if _cfg_override:
+    try:
+        with open(_cfg_override) as _f:
+            exec(compile(_f.read(), _cfg_override, "exec"), globals())
+    except FileNotFoundError:
+        raise SystemExit(f"Config override file not found: {_cfg_override!r}")

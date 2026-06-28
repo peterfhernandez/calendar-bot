@@ -711,7 +711,7 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Telegram UX polish + reliability (10)** | **0.5 day** | **Done** |
 | **Log hygiene — noise + secret redaction (9d)** | **< 0.5 day** | **Done** |
 | **Secret leak prevention in logs (11)** | **< 0.5 day** | **Done** |
-| **Parallel mode isolation — --env/--db/--log (12)** | **< 0.5 day** | **Done** |
+| **Parallel mode isolation — --env/--db/--log/--config (12)** | **< 0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~3–5 days** | |
 
