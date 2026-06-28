@@ -13,9 +13,41 @@ Usage
     python bot.py --portfolio 50000
     python bot.py --collect              # also run the data collector alongside the bot
     python bot.py --drain                # start in drain mode (no new entries or rolls)
+    python bot.py --env .env.test        # run test mode alongside paper using a separate env file
+    python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log
 """
 
 from __future__ import annotations
+
+# ── Pre-parse --env / --db / --log before importing config or db.state ─────────
+# config.py and db/state.py execute module-level code that reads env vars
+# (TRADING_MODE, BOT_DB_PATH, etc.) at import time.  We must set those vars
+# before the first import so the right values are captured.
+import os as _os
+import sys as _sys
+
+def _preparse_argv() -> None:
+    """Extract --env / --db / --log from sys.argv and set env vars immediately."""
+    _flags = {
+        "--env": "BOT_ENV_FILE",   # which .env file to load
+        "--db":  "BOT_DB_PATH",    # SQLite database path override
+        "--log": "BOT_LOG_FILE",   # log file path override
+    }
+    _argv = _sys.argv[1:]
+    _i = 0
+    while _i < len(_argv):
+        for _flag, _var in _flags.items():
+            if _argv[_i] == _flag and _i + 1 < len(_argv):
+                _os.environ[_var] = _argv[_i + 1]
+                break
+            elif _argv[_i].startswith(_flag + "="):
+                _os.environ[_var] = _argv[_i].split("=", 1)[1]
+                break
+        _i += 1
+
+_preparse_argv()
+del _preparse_argv  # keep module namespace tidy
+# ── End pre-parse ──────────────────────────────────────────────────────────────
 
 import argparse
 import asyncio
@@ -172,6 +204,36 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Start in drain mode: no new entries or rolls; existing positions close normally",
+    )
+    parser.add_argument(
+        "--env",
+        metavar="FILE",
+        default=".env",
+        help=(
+            "Path to the .env credentials file (default: .env). "
+            "Use a separate file (e.g. .env.test) to run a test-mode instance "
+            "alongside the paper-mode bot without sharing credentials or state."
+        ),
+    )
+    parser.add_argument(
+        "--db",
+        metavar="PATH",
+        default="",
+        help=(
+            "SQLite database path (default: db/calendar_bot.db). "
+            "Override to keep test-mode trades in a dedicated database, e.g. "
+            "--db calendar_bot_test.db."
+        ),
+    )
+    parser.add_argument(
+        "--log",
+        metavar="PATH",
+        default="",
+        help=(
+            "Log file path (default: logs/bot.log). "
+            "Override to write a separate log per instance, e.g. "
+            "--log logs/bot_test.log."
+        ),
     )
     args = parser.parse_args()
 

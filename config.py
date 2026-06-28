@@ -1,7 +1,12 @@
 import os as _os
 
-# Load .env file if present (never commit .env to git)
-def _load_env(path: str = ".env") -> None:
+# Load .env file if present (never commit .env to git).
+# Uses setdefault so that values already in os.environ (e.g. pre-loaded by
+# bot.py's --env pre-parser) are not overwritten.
+def _load_env(path: str | None = None) -> None:
+    if path is None:
+        # Honour BOT_ENV_FILE if set by the --env pre-parser in bot.py.
+        path = _os.environ.get("BOT_ENV_FILE", ".env")
     try:
         with open(path) as _f:
             for _line in _f:
@@ -9,7 +14,7 @@ def _load_env(path: str = ".env") -> None:
                 if _line and not _line.startswith("#") and "=" in _line:
                     _k, _, _v = _line.partition("=")
                     _val = _v.strip().strip('"').strip("'")
-                    _os.environ[_k.strip()] = _val
+                    _os.environ.setdefault(_k.strip(), _val)
     except FileNotFoundError:
         pass
 

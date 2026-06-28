@@ -107,11 +107,14 @@ def configure_logging(
     ch.setFormatter(formatter)
     root.addHandler(ch)
 
-    # Rotating file
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
+    # Rotating file — BOT_LOG_FILE env var lets a separate instance write to its
+    # own file (e.g. logs/bot_test.log) so paper and test logs don't interleave.
+    import os as _os
+    _log_override = _os.environ.get("BOT_LOG_FILE", "")
+    _log_full = Path(_log_override) if _log_override else Path(log_dir) / "bot.log"
+    _log_full.parent.mkdir(parents=True, exist_ok=True)
     fh = logging.handlers.RotatingFileHandler(
-        log_path / "bot.log",
+        _log_full,
         maxBytes=10 * 1024 * 1024,  # 10 MB
         backupCount=5,
         encoding="utf-8",

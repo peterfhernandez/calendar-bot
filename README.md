@@ -67,6 +67,41 @@ See [BOT_PLAN.md](BOT_PLAN.md) for the full design and [BOT_TODO.md](BOT_TODO.md
 
 ---
 
+## Running parallel instances (paper + test)
+
+To run a paper-mode and a test-mode instance at the same time — for example, to observe live execution on test.deribit.com while the paper bot continues recording simulated trades — give each instance its own env file, database, and log file.
+
+**Step 1 — create `.env.test`**
+
+Copy `.env` and set:
+
+```ini
+TRADING_MODE=test
+BOT_DB_PATH=calendar_bot_test.db
+BOT_LOG_FILE=logs/bot_test.log
+# credentials are the same (both modes share DERIBIT_TEST_* keys)
+```
+
+**Step 2 — start both instances**
+
+```bash
+# Terminal 1 — paper mode (uses .env, calendar_bot.db, logs/bot.log)
+python bot.py
+
+# Terminal 2 — test mode (uses .env.test, calendar_bot_test.db, logs/bot_test.log)
+python bot.py --env .env.test
+```
+
+You can also override the database or log path directly on the CLI without modifying the env file:
+
+```bash
+python bot.py --env .env.test --db calendar_bot_test.db --log logs/bot_test.log
+```
+
+The three flags (`--env`, `--db`, `--log`) are pre-parsed before any module imports so `TRADING_MODE`, `DB_PATH`, and the log file path are all resolved correctly at startup.
+
+---
+
 ## Trading modes
 
 The bot supports three operational modes set by `TRADING_MODE` in `config.py`:
