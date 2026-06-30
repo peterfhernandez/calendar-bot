@@ -595,8 +595,8 @@ class TestDailyPnlUnrealized:
         """daily_pnl in EngineStatus must include unrealized MTM when positions are held."""
         engine, _ = _make_engine()
         pos = self._open_pos()
-        # sv=0.025 (already qty-weighted, qty=1), net_debit=0.02 per unit
-        # unrealized = sv - net_debit * qty = 0.025 - 0.02 * 1.0 = 0.005
+        # sv=0.025 (already qty-weighted, qty=1), net_debit=0.02 per unit, open_fees=0.0
+        # unrealized = sv - net_debit * qty - open_fees = 0.025 - 0.02 * 1.0 - 0.0 = 0.005
         with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
              patch("strategy.decision.check_calendar_status",
                    return_value=("ok", 0.025, 1.25, "OK")):
@@ -604,7 +604,7 @@ class TestDailyPnlUnrealized:
             engine._get_iv = MagicMock(return_value=0.80)
             status = engine.monitor_tick()
 
-        assert status.daily_pnl == pytest.approx(0.005)  # 0.025 - 0.02 * 1.0
+        assert status.daily_pnl == pytest.approx(0.005)  # 0.025 - 0.02*1.0 - 0.0 (open_fees=0)
 
     def test_daily_pnl_zero_when_iv_skipped(self):
         """Unrealized P&L contribution is 0 when IV is missing (position not valued)."""
@@ -1973,6 +1973,43 @@ class TestFeeIntegration:
 
         # fees_paid_today should have increased (BTC spot=90k → fees ≈ $54)
         assert engine.fees_paid_today >= initial_fees
+
+    def test_close_pnl_deducts_open_and_close_fees(self, monkeypatch):
+        """_today_pnl after close equals gross_pnl minus both open_fees and close_fees."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.03
+        engine, _ = _make_engine(executor=executor)
+
+        # Construct a position with known open_fees; force close_fees to zero
+        # by setting near_prem/far_prem to 0 (exit_fees returns 0 when prices are 0).
+        pos = self._open_pos(qty=1.0, net_debit=0.05)
+        pos["open_fees"] = 5.0   # $5 entry fee (non-zero, clearly visible in assertion)
+        pos["near_prem"] = 0.0
+        pos["far_prem"]  = 0.0
+
+        engine._cache.get_spot.return_value = 90_000.0
+        spread_value = 0.08  # qty-weighted; gross_pnl = 0.08 - 0.05*1 = 0.03
+        with patch("strategy.decision.close_calendar_trade"):
+            engine._close_position(pos, spot=90_000.0, reason="tp", spread_value=spread_value)
+
+        # pnl = gross_pnl - open_fees - close_fees = 0.03 - 5.0 - 0 = -4.97
+        assert engine._today_pnl == pytest.approx(0.03 - 5.0)
+
+    def test_unrealized_deducts_open_fees(self):
+        """monitor_tick unrealized P&L must deduct open_fees from each position."""
+        engine, _ = _make_engine()
+        pos = self._open_pos(qty=1.0, net_debit=0.02)
+        pos["open_fees"] = 0.003  # $0.003 entry fee
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.25, "OK")):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            status = engine.monitor_tick()
+
+        # unrealized = 0.025 - 0.02*1.0 - 0.003 = 0.002
+        assert status.daily_pnl == pytest.approx(0.002)
 
 
 # ── Pause / resume ────────────────────────────────────────────────────────────

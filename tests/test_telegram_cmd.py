@@ -248,6 +248,28 @@ class TestHandlePositions:
         text = update.message.reply_text.call_args[0][0]
         assert "stale" in text.lower() or "N/A" in text
 
+    @pytest.mark.asyncio
+    async def test_positions_pnl_deducts_open_fees(self):
+        """PnL in /positions must deduct open_fees from the cost basis."""
+        update  = _make_update()
+        context = _make_context()
+        # Cache: near_mid=0.0125, far_mid=0.0325 → spread_val=0.02
+        cache   = _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        # net_debit=0.02, qty=1.0, open_fees=0.005
+        # cost_basis = 0.02*1 + 0.005 = 0.025
+        # spread_val = (0.0325 - 0.0125) * 1.0 = 0.02
+        # unr_pnl = 0.02 - 0.025 = -0.005
+        trade = _make_trade(net_debit=0.02, qty=1.0, open_fees=0.005)
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+            await handlers.handle_positions(update, context, cache, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        # PnL must be negative to reflect the fee cost
+        assert "-" in text  # net loss shown
+        assert "sv=" in text
+
 
 # ── /closed_trades handler ────────────────────────────────────────────────────
 
@@ -448,6 +470,27 @@ class TestHandleStatus:
         text = update.message.reply_text.call_args[0][0]
         assert "2" in text
 
+    @pytest.mark.asyncio
+    async def test_status_shows_fees_session(self, monkeypatch):
+        """Reply includes a 'Fees (session)' line showing accumulated session fees."""
+        monkeypatch.setattr(config, "TRADING_MODE", "paper")
+        monkeypatch.setattr(config, "DRAIN_MODE", False)
+        monkeypatch.setattr(config, "DRAIN_AND_NEW_MODE", False)
+
+        engine  = _make_engine()
+        engine._fees_paid_today = 12.50
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]), \
+             patch("telegram_cmd.handlers.get_trades_closed_today_aest", return_value=[]):
+            await handlers.handle_status(update, context, engine, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Fees" in text
+        assert "12.50" in text
+
 
 # ── /portfolio handler ────────────────────────────────────────────────────────
 
@@ -512,6 +555,25 @@ class TestHandlePortfolio:
 
         text = update.message.reply_text.call_args[0][0]
         assert "stale" in text.lower() or "N/A" in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_pnl_deducts_open_fees(self):
+        """PnL in /portfolio must deduct open_fees so fees are reflected in the net figure."""
+        update  = _make_update()
+        context = _make_context()
+        # Cache: near_mid=0.0125, far_mid=0.0325 → curr_val=0.02
+        cache   = _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+
+        # net_debit=0.02, qty=1.0, open_fees=0.005
+        # pnl = 0.02 - 0.02*1.0 - 0.005 = -0.005
+        trade = _make_trade(net_debit=0.02, qty=1.0, open_fees=0.005)
+        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+            await handlers.handle_portfolio(update, context, cache, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        # Net PnL should reflect the fee cost even when price movement is zero
+        assert "PnL=$-0.01" in text or "-0.005" in text or "PnL=-" in text.replace("PnL=$", "PnL=")
 
 
 # ── /stop_bot and /start_bot ──────────────────────────────────────────────────
