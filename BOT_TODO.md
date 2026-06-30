@@ -734,3 +734,7 @@ All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field
 - [x] `TestHandlePositions.test_positions_pnl_deducts_open_fees` — `/positions` PnL is negative when open_fees exceed price gain
 - [x] `TestHandlePortfolio.test_portfolio_pnl_deducts_open_fees` — `/portfolio` PnL deducts open_fees
 - [x] `TestHandleStatus.test_status_shows_fees_session` — `/status` reply contains "Fees" and the session amount
+
+### Automate pull after PR
+
+- after a Pull Request is done, the windows runner will pull changes locally and restart the bot (all bots)
