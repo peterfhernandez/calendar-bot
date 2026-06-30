@@ -691,10 +691,15 @@ class DecisionEngine:
             # If roll fails, close cleanly
             return self._close_position(pos, spot, "Roll failed — closing"), 0.0
 
-        # Position held — compute unrealized P&L vs entry debit.
+        # Position held — compute unrealized P&L vs entry cost (debit + open fees).
         # sv is already qty-weighted (spread_value multiplies by qty internally),
         # so total debit is net_debit * qty — do NOT multiply the difference by qty again.
-        unrealized = sv - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
+        # open_fees are already paid so they are included in the cost basis immediately.
+        unrealized = (
+            sv
+            - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
+            - pos.get("open_fees", 0.0)
+        )
         return None, unrealized
 
     def _close_position(
@@ -742,9 +747,9 @@ class DecisionEngine:
         self._fees_paid_today += close_fees_usd
 
         open_fees_usd = pos.get("open_fees", 0.0) or 0.0
-        net_pnl = gross_pnl - close_fees_usd  # open_fees already deducted at entry
+        net_pnl = gross_pnl - open_fees_usd - close_fees_usd  # all fees deducted
 
-        pnl = gross_pnl  # P&L stored in DB is gross (pre-close-fees); fees tracked separately
+        pnl = net_pnl  # stored as true net P&L (entry + exit fees already deducted)
         result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
         if "Take-profit" in reason:
             result = "Win (Auto TP)"
