@@ -681,3 +681,56 @@ MAX_LOSS_PCT  = 0.005     # 0.5% max loss per trade (half the paper default)
 - [x] **Test/live mode used DryRunExecutor instead of CalendarExecutor** — `bot.py` was not passing an executor to `BotLoop`, so `DecisionEngine` silently fell back to `DryRunExecutor` in all modes. In test mode this meant all fills were simulated locally and logged as `[DRY-RUN]` while no orders were sent to Deribit. Fixed by instantiating `CalendarExecutor` in `bot.py` when `TRADING_MODE != "paper"` and passing it to `BotLoop`.
 - [x] **Stale open orders left on exchange after unclean shutdown** — when the bot was killed mid-fill (e.g. during the individual-leg fallback), open limit orders were left sitting on Deribit with no process to cancel them. Added `_cancel_open_orders()` to `bot.py` which calls `private/cancel_all_by_currency` for each configured asset at startup in test/live mode, clearing any orders from a prior session before the new session begins.
 - [x] **`CalendarExecutor._run()` fails when called from within the bot's event loop** — `_run()` called `asyncio.run()` unconditionally. Since `_scan_job` and `_monitor_job` are `async def` (running inside `AsyncIOScheduler`'s event loop), calling `asyncio.run()` from within them raised `RuntimeError: asyncio.run() cannot be called from a running event loop`, causing every real order attempt to fail silently. Fixed in `execution/executor.py`: `_run()` now detects an active event loop via `asyncio.get_running_loop()` and, when one exists, runs the coroutine in a `ThreadPoolExecutor` thread where `asyncio.run()` is safe. Standalone (test/paper) calls fall through to the original `asyncio.run()` path. Tests: `TestRunInsideEventLoop` (2 tests) in `tests/test_executor.py`.
+
+---
+
+## Phase 13 — Fee-Inclusive PnL Display
+
+All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field) previously reported gross PnL — the pure spread price movement — without deducting fees. The `open_fees` and `close_fees` columns existed and were correctly populated, but were never subtracted from any PnL figure. At BTC spot $100k with ~$30–$60 per round-trip in fees, this materially overstated profitability: a position showing `PnL=$+0.60` was actually `PnL=$-2.94` after fees.
+
+### Root causes fixed
+
+**`strategy/decision.py` — `_close_position()`**
+- Changed `pnl = gross_pnl` → `pnl = gross_pnl - open_fees_usd - close_fees_usd`
+- DB `pnl` column now stores true net P&L; `_today_pnl` and `_session_pnl` accumulate net values
+- Misleading comment "open_fees already deducted at entry" replaced with accurate description
+- Close alert notifications (`notify_stop`, `notify_take_profit`) automatically receive net PnL since they read `pnl`
+
+**`strategy/decision.py` — `_monitor_position()`**
+- `unrealized` now deducts `open_fees` from cost basis: `sv - net_debit*qty - open_fees`
+- `engine._unrealized_pnl` (fed to `/status` and internal status) is now fee-inclusive for open positions
+
+**`telegram_cmd/handlers.py` — `handle_positions()`**
+- PnL formula: `unr_pnl = spread_val - (net_debit*qty + open_fees)` — open fees in cost basis
+- PnL%: denominator is `net_debit*qty + open_fees` (total capital deployed including entry fees)
+
+**`telegram_cmd/handlers.py` — `handle_portfolio()`**
+- PnL formula: `pnl = curr_val - net_debit*qty - open_fees`
+- Previously showed `Fees: $3.11` on the line above a PnL that ignored those fees; now consistent
+
+**`telegram_cmd/handlers.py` — `handle_status()`**
+- Added `Fees (session): $X.XX` line showing cumulative fees paid since bot start
+- `/status` PnL today and PnL since start now correctly reflect net figures (closed: DB net pnl; open: unrealized net of open fees)
+
+### What remains gross vs net
+
+| Metric | Before | After |
+|---|---|---|
+| DB `pnl` field | gross (no fees) | net (open + close fees deducted) |
+| `_today_pnl` / `_session_pnl` | gross | net |
+| `_unrealized_pnl` | gross | net of open fees |
+| `/positions` PnL | gross | net of open fees |
+| `/portfolio` PnL | gross (fees shown separately) | net of open fees |
+| `/status` PnL today | gross | net |
+| `/status` PnL since start | gross | net |
+| Close alert PnL | gross | net |
+| `fees_paid_today` tracking | correct (unchanged) | correct (unchanged) |
+
+### Tests
+
+- [x] `TestFeeIntegration.test_close_pnl_deducts_open_and_close_fees` — `_today_pnl` after close equals `gross - open_fees - close_fees`
+- [x] `TestFeeIntegration.test_unrealized_deducts_open_fees` — `monitor_tick` daily_pnl deducts `open_fees` from each open position
+- [x] `TestDailyPnlUnrealized.test_daily_pnl_includes_unrealized` — comment updated; result unchanged (open_fees=0.0 in fixture)
+- [x] `TestHandlePositions.test_positions_pnl_deducts_open_fees` — `/positions` PnL is negative when open_fees exceed price gain
+- [x] `TestHandlePortfolio.test_portfolio_pnl_deducts_open_fees` — `/portfolio` PnL deducts open_fees
+- [x] `TestHandleStatus.test_status_shows_fees_session` — `/status` reply contains "Fees" and the session amount

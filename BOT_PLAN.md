@@ -712,6 +712,7 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Log hygiene — noise + secret redaction (9d)** | **< 0.5 day** | **Done** |
 | **Secret leak prevention in logs (11)** | **< 0.5 day** | **Done** |
 | **Parallel mode isolation — --env/--db/--log/--config (12)** | **< 0.5 day** | **Done** |
+| **Fee-inclusive PnL display (13)** | **< 0.5 day** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~3–5 days** | |
 
@@ -800,3 +801,81 @@ A standalone script rewrites every `logs/bot.log*` rotation file in place:
 - Reports per-file replacement counts so the operator can see what was found
 - `--dry-run` mode prints findings without writing
 - Notes that `.gz` compressed rotations (if any) must be deleted manually
+
+---
+
+## Phase 13 — Fee-Inclusive PnL Display
+
+All PnL figures visible to the operator — Telegram commands, internal engine accumulators, and the DB `pnl` field — previously reported gross PnL (spread price movement only). The `open_fees` and `close_fees` columns were correctly populated but never subtracted from any PnL metric. At BTC spot $100k, round-trip fees of ~$60 per trade are material relative to calendar spread premiums of $150–$200. A position showing `PnL=+$0.60` could actually be `PnL=-$2.94` net of the entry fee already paid.
+
+### Problem summary
+
+| Metric | Old formula | Fee-inclusive? |
+| --- | --- | --- |
+| DB `pnl` on close | `sv - debit × qty` | No fees at all |
+| `_today_pnl` / `_session_pnl` | sum of DB `pnl` | No fees |
+| `_unrealized_pnl` (monitor tick) | `sv - debit × qty` | No fees |
+| `/positions` PnL | `spread_val - debit × qty` | No fees |
+| `/portfolio` PnL | `curr_val - debit × qty` | Shows fees separately, not deducted |
+| `/status` PnL today | `sum(closed pnl) + unrealized` | No fees |
+| Close alert PnL | gross `pnl` | No fees |
+
+### Fixes
+
+**`strategy/decision.py` — `_close_position()`**
+
+```python
+# Before
+pnl = gross_pnl  # P&L stored in DB is gross (pre-close-fees); fees tracked separately
+
+# After
+net_pnl = gross_pnl - open_fees_usd - close_fees_usd  # all fees deducted
+pnl = net_pnl  # stored as true net P&L (entry + exit fees already deducted)
+```
+
+`_today_pnl`, `_session_pnl`, and the DB `pnl` column all receive `net_pnl` automatically.
+
+**`strategy/decision.py` — `_monitor_position()`**
+
+```python
+# Before
+unrealized = sv - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
+
+# After
+unrealized = (
+    sv
+    - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
+    - pos.get("open_fees", 0.0)
+)
+```
+
+Open fees are already paid at entry so they belong in the unrealized cost basis immediately. This flows into `engine._unrealized_pnl` and through to `/status` PnL today and PnL since start.
+
+**`telegram_cmd/handlers.py` — `handle_positions()`**
+
+```python
+# Before
+unr_pnl = spread_val - t.net_debit * t.qty
+pnl_pct = (unr_pnl / (t.net_debit * t.qty) * 100) if t.net_debit else 0.0
+
+# After
+cost_basis = t.net_debit * t.qty + t.open_fees
+unr_pnl    = spread_val - cost_basis
+pnl_pct    = (unr_pnl / cost_basis * 100) if cost_basis else 0.0
+```
+
+**`telegram_cmd/handlers.py` — `handle_portfolio()`**
+
+```python
+# Before
+pnl = curr_val - t.net_debit * t.qty
+
+# After
+pnl = curr_val - t.net_debit * t.qty - t.open_fees
+```
+
+Previously `Fees: $3.11` appeared on the line above a PnL that ignored it; now the two figures are consistent.
+
+**`telegram_cmd/handlers.py` — `handle_status()`**
+
+Added a `Fees (session): $X.XX` line so the operator can see cumulative session fees alongside the net PnL figures.

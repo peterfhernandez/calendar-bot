@@ -83,8 +83,9 @@ async def handle_positions(
 
         if near_mid is not None and far_mid is not None:
             spread_val = max(0.0, far_mid - near_mid) * t.qty
-            unr_pnl    = spread_val - t.net_debit * t.qty
-            pnl_pct    = (unr_pnl / (t.net_debit * t.qty) * 100) if t.net_debit else 0.0
+            cost_basis = t.net_debit * t.qty + t.open_fees
+            unr_pnl    = spread_val - cost_basis
+            pnl_pct    = (unr_pnl / cost_basis * 100) if cost_basis else 0.0
             val_note   = f"sv=${spread_val:.2f}  PnL=${unr_pnl:+.2f} ({pnl_pct:+.1f}%)"
         else:
             val_note = "sv=N/A (stale cache)"
@@ -200,7 +201,8 @@ async def handle_status(
         f"Uptime:       {uptime_str}\n"
         f"Open:         {open_count} position(s)\n"
         f"PnL today ({_AEST_LABEL}): ${today_pnl:+.2f}\n"
-        f"PnL since start: ${session_pnl:+.2f}"
+        f"PnL since start: ${session_pnl:+.2f}\n"
+        f"Fees (session):  ${engine.fees_paid_today:.2f}"
     )
     await update.message.reply_text(status)
 
@@ -227,7 +229,7 @@ async def handle_portfolio(
 
         if near_mid is not None and far_mid is not None:
             curr_val = max(0.0, far_mid - near_mid) * t.qty
-            pnl      = curr_val - t.net_debit * t.qty
+            pnl      = curr_val - t.net_debit * t.qty - t.open_fees
             val_str  = f"${curr_val:.2f}  PnL=${pnl:+.2f}"
         else:
             val_str = "N/A (stale cache)"
