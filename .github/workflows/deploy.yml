@@ -17,7 +17,13 @@ jobs:
           Get-Process -Name python -ErrorAction SilentlyContinue | 
             Where-Object { $_.CommandLine -like '*bot.py*' } | 
             Stop-Process -Force
-          
+
+          # Start test bot in background, output to log
+          Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --portfolio=10000" `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput "C:\Users\Peter\coderepoo\calendar-bot\logs\bot-paper_stdout.log" `
+            -RedirectStandardError "C:\Users\Peter\coderepoo\logs\bot-paper_err.log"
+            
           # Start test bot in background, output to log
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log" `
             -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
