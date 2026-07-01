@@ -740,3 +740,4 @@ All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field
 - after a Pull Request is done, the windows runner will pull changes locally and restart the bot (all bots)
 - restarts paper and testnet bots
 - added to test the merge PR to main workflow
+- and now does it work?
