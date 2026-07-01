@@ -636,29 +636,45 @@ async def _async_close_spread(
 
         # Close near leg: buy back the short (we sold it at entry)
         near_close_price = near_mid * 1.02 if near_mid > 0 else 0.001  # pay a little to close
-        near_result = await client.place_order(
-            near_instr, "buy", amount, round(near_close_price, 4),
-            label=f"CLOSE-NEAR-{asset}",
-        )
-        near_close_id = near_result["order"]["order_id"]
-        order_manager.track(TrackedOrder(
-            order_id=near_close_id, instrument=near_instr,
-            direction="buy", amount=amount, limit_price=near_close_price,
-            label=f"CLOSE-NEAR-{asset}",
-        ))
+        near_close_id = None
+        try:
+            near_result = await client.place_order(
+                near_instr, "buy", amount, round(near_close_price, 4),
+                label=f"CLOSE-NEAR-{asset}",
+            )
+            near_close_id = near_result["order"]["order_id"]
+            order_manager.track(TrackedOrder(
+                order_id=near_close_id, instrument=near_instr,
+                direction="buy", amount=amount, limit_price=near_close_price,
+                label=f"CLOSE-NEAR-{asset}",
+            ))
+        except (OSError, websockets.exceptions.WebSocketException, RuntimeError, Exception) as exc:
+            logger.error("Failed to submit near close order: %s", exc)
+            return None
 
         # Close far leg: sell back the long (we bought it at entry)
         far_close_price = far_mid * 0.98 if far_mid > 0 else 0.001
-        far_result = await client.place_order(
-            far_instr, "sell", amount, round(far_close_price, 4),
-            label=f"CLOSE-FAR-{asset}",
-        )
-        far_close_id = far_result["order"]["order_id"]
-        order_manager.track(TrackedOrder(
-            order_id=far_close_id, instrument=far_instr,
-            direction="sell", amount=amount, limit_price=far_close_price,
-            label=f"CLOSE-FAR-{asset}",
-        ))
+        far_close_id = None
+        try:
+            far_result = await client.place_order(
+                far_instr, "sell", amount, round(far_close_price, 4),
+                label=f"CLOSE-FAR-{asset}",
+            )
+            far_close_id = far_result["order"]["order_id"]
+            order_manager.track(TrackedOrder(
+                order_id=far_close_id, instrument=far_instr,
+                direction="sell", amount=amount, limit_price=far_close_price,
+                label=f"CLOSE-FAR-{asset}",
+            ))
+        except (OSError, websockets.exceptions.WebSocketException, RuntimeError, Exception) as exc:
+            logger.error("Failed to submit far close order: %s", exc)
+            # Try to cancel near leg if it was submitted
+            if near_close_id:
+                try:
+                    await client.cancel_order(near_close_id)
+                except Exception:
+                    pass
+            return None
 
         near_state = None
         far_state = None
