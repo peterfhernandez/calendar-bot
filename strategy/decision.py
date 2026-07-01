@@ -594,12 +594,13 @@ class DecisionEngine:
             far_instrument=candidate.far_instrument,
             open_fees=open_fees_usd,
             ev_score=candidate.ev_score,
+            ev_score_initial=candidate.ev_score,
             db_path=self._db_path,
         )
         logger.info(
-            "ENTER filled: trade_id=%d  %s %s strike=%.0f  qty=%.1f  debit=%.4f  fees=%.2f",
+            "ENTER filled: trade_id=%d  %s %s strike=%.0f  qty=%.1f  debit=%.4f  fees=%.2f  ev=%.4f",
             trade.id, trade.asset, trade.option_type, trade.strike,
-            trade.qty, trade.net_debit, open_fees_usd,
+            trade.qty, trade.net_debit, open_fees_usd, candidate.ev_score,
         )
         if self._notifier:
             self._notifier.notify_entry(
@@ -809,9 +810,10 @@ class DecisionEngine:
         self._fees_paid_today += close_fees_usd
 
         open_fees_usd = pos.get("open_fees", 0.0) or 0.0
-        net_pnl = gross_pnl - open_fees_usd - close_fees_usd  # all fees deducted
+        roll_pnl_total = pos.get("roll_pnl", 0.0) or 0.0
+        net_pnl = gross_pnl + roll_pnl_total - open_fees_usd - close_fees_usd  # include roll profit, deduct all fees
 
-        pnl = net_pnl  # stored as true net P&L (entry + exit fees already deducted)
+        pnl = net_pnl  # stored as true net P&L (entry + roll + exit fees already deducted)
         result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
         if "Take-profit" in reason:
             result = "Win (Auto TP)"
@@ -831,10 +833,11 @@ class DecisionEngine:
         self._today_pnl += pnl
         self._session_pnl += pnl
         logger.info(
-            "CLOSE trade_id=%d  gross_pnl=%.2f  close_fees=%.2f  net_pnl=%.2f  "
-            "open_fees=%.2f  total_fees=%.2f  reason=%s  daily_pnl=%.2f",
-            trade_id, gross_pnl, close_fees_usd, net_pnl,
+            "CLOSE trade_id=%d  gross_pnl=%.2f  roll_pnl=%.2f  close_fees=%.2f  net_pnl=%.2f  "
+            "open_fees=%.2f  total_fees=%.2f  ev_initial=%.4f  reason=%s  daily_pnl=%.2f",
+            trade_id, gross_pnl, roll_pnl_total, close_fees_usd, net_pnl,
             open_fees_usd, open_fees_usd + close_fees_usd,
+            pos.get("ev_score_initial", 0.0),
             reason, self._today_pnl,
         )
         if self._notifier:
@@ -859,7 +862,8 @@ class DecisionEngine:
         Attempt to roll the near leg to a new expiry.
 
         Scans for a fresh near candidate on the same asset/strike/type and asks
-        the executor to roll if one is found.
+        the executor to roll if one is found. Validates the new candidate meets
+        all entry criteria and recalculates EV before rolling.
         """
         candidates = scan(self._cache, assets=[pos["asset"]])
         target_strike = pos["strike"]
@@ -884,6 +888,15 @@ class DecisionEngine:
             logger.info(
                 "Roll: new near instrument (%s) is the same as current — skipping",
                 new_candidate.near_instrument,
+            )
+            return False
+
+        # Validate new candidate passes liquidity gate (entry criteria)
+        rejection_reason = self._check_liquidity_gate(new_candidate)
+        if rejection_reason:
+            logger.info(
+                "Roll: candidate rejected by liquidity gate — %s (trade_id=%d)",
+                rejection_reason, pos.get("trade_id"),
             )
             return False
 
@@ -921,13 +934,19 @@ class DecisionEngine:
             new_near_instr  = new_candidate.near_instrument
             new_expiry_near = _instrument_expiry_label(new_near_instr)
 
+            # Calculate roll P&L: what we originally sold the near leg for minus what we're buying it back at
+            old_near_sell_price = pos.get("near_prem", 0.0) or 0.0
+            roll_pnl_realized = (old_near_sell_price - new_candidate.near_bid) * qty_pos
+            self._today_pnl += roll_pnl_realized
+            self._session_pnl += roll_pnl_realized
+
             # Track roll fees
             try:
                 roll_fee_usd = compute_roll_fees(
                     pos.get("asset", new_candidate.asset),
                     spot,
                     qty_pos,
-                    near_price=pos.get("near_prem", new_candidate.near_bid) or new_candidate.near_bid,
+                    near_price=near_price_now,
                     new_near_price=new_candidate.near_bid,
                 )
                 self._fees_paid_today += roll_fee_usd
@@ -935,19 +954,27 @@ class DecisionEngine:
                 roll_fee_usd = 0.0
 
             logger.info(
-                "ROLL trade_id=%d  → new near=%s  roll_fees=%.2f",
-                trade_id, new_near_instr, roll_fee_usd,
+                "ROLL trade_id=%d  → new near=%s  roll_pnl=%.2f  roll_fees=%.2f  "
+                "ev_new=%.4f  daily_pnl=%.2f",
+                trade_id, new_near_instr, roll_pnl_realized, roll_fee_usd,
+                new_candidate.ev_score, self._today_pnl,
             )
 
-            # Fix 1: persist the new near leg to the DB so _days_left reads fresh data.
+            # Fix 1: persist the new near leg to the DB with roll P&L and new EV.
             try:
-                update_near_leg(trade_id, new_near_instr, new_expiry_near, db_path=self._db_path)
+                update_near_leg(
+                    trade_id, new_near_instr, new_expiry_near,
+                    roll_pnl=roll_pnl_realized,
+                    ev_score_at_roll=new_candidate.ev_score,
+                    db_path=self._db_path,
+                )
             except Exception as exc:
                 logger.error("Roll: failed to update near leg in DB for trade_id=%d: %s", trade_id, exc)
 
             # Fix 2: update the in-memory dict so this tick's logic sees the new expiry.
             pos["near_instrument"] = new_near_instr
             pos["expiry_near"]     = new_expiry_near
+            pos["roll_pnl"] = roll_pnl_realized  # track in position dict
 
             # Fix 4: mark as rolled so the same tick won't evaluate this position again.
             self._rolled_this_tick.add(trade_id)

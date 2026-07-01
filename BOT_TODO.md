@@ -688,6 +688,55 @@ MAX_LOSS_PCT  = 0.005     # 0.5% max loss per trade (half the paper default)
 
 ---
 
+## Phase 14 — Roll P&L Tracking and EV Recalculation
+
+Previously, when a near leg was rolled, the profit/loss realized from closing the old near leg was not captured in the final position P&L. The formula `spread_value - net_debit` compared the final spread value to the original entry debit, missing all intermediate roll cash flows. Additionally, new near-leg candidates were not validated or scored for EV at roll time.
+
+### Root causes fixed
+
+**`db/state.py` — New tracking columns**
+- Added `roll_pnl REAL NOT NULL DEFAULT 0.0` — tracks cumulative profit from rolling near legs
+- Added `ev_score_initial REAL NOT NULL DEFAULT 0.0` — stores EV at entry (initial scan)
+- Added `ev_score_at_roll REAL NOT NULL DEFAULT 0.0` — stores EV of new near leg at roll time
+- Updated `update_near_leg()` to accept and accumulate `roll_pnl` and store `ev_score_at_roll`
+- Migration adds all three columns to existing databases with backward-compatible defaults
+
+**`strategy/decision.py` — Roll validation and P&L inclusion**
+- `_try_roll()` now validates new candidate passes `_check_liquidity_gate()` (same gates as entry)
+- Recalculates EV for new candidate before rolling and passes it to DB
+- Calculates roll P&L: `(old_near_sell_price - new_near_bid_price) * qty`
+- Immediately adds roll_pnl to `_today_pnl` and `_session_pnl` when roll succeeds
+- Logs roll details including roll_pnl and new EV at roll time
+- `_close_position()` now includes roll_pnl in final P&L: `net_pnl = gross_pnl + roll_pnl - fees`
+- Logs both gross and roll P&L separately at close time
+
+**`telegram_cmd/handlers.py` — Roll P&L visibility**
+- `/positions` — shows separate roll P&L: `roll=$X.XX` alongside unrealized PnL when a roll has occurred
+- `/positions` — displays both `ev_init=X.XXXX` (entry EV) and `ev_roll=X.XXXX` (roll EV, if rolled)
+- `/portfolio` — shows total P&L including roll: `PnL=$(unr + roll)`
+- `/portfolio` — breaks down `Fees:` and `Roll PnL:` as separate line items
+- `/portfolio` — displays both `EV_init:` and `EV_roll:` when roll has occurred
+
+**Entry logging improvements**
+- `ENTER` log now includes `ev=X.XXXX` to show EV at entry
+- `ROLL` log now includes `roll_pnl=X.XX` and `ev_new=X.XXXX` to show realized profit and new EV
+- `CLOSE` log now includes `roll_pnl=X.XX` and `ev_initial=X.XXXX` for full lifecycle visibility
+
+### Example
+
+Position #42 BTC 60K Put, 1d→7d:
+```
+ENTER filled: trade_id=42 BTC Put strike=60000 qty=1.0 debit=0.0060 fees=0.00012 ev=0.0385
+[24 hours later, near leg at 2 days to expiry]
+ROLL trade_id=42 → new near=BTC-3JAN26-60000-P roll_pnl=+0.0008 roll_fees=0.00015 ev_new=0.0421
+[more time passes]
+CLOSE trade_id=42 gross_pnl=+0.0015 roll_pnl=+0.0008 close_fees=0.00012 net_pnl=+0.0011 ev_initial=0.0385
+```
+
+The `net_pnl=+0.0011` correctly includes the roll profit of `+0.0008` that was locked in during the roll, plus the spread movement P&L of `+0.0015`, minus fees.
+
+---
+
 ## Phase 13 — Fee-Inclusive PnL Display
 
 All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field) previously reported gross PnL — the pure spread price movement — without deducting fees. The `open_fees` and `close_fees` columns existed and were correctly populated, but were never subtracted from any PnL figure. At BTC spot $100k with ~$30–$60 per round-trip in fees, this materially overstated profitability: a position showing `PnL=$+0.60` was actually `PnL=$-2.94` after fees.
