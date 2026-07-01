@@ -21,12 +21,12 @@ jobs:
           # Start test bot in background, output to log
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --portfolio=10000" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\Users\Peter\coderepoo\calendar-bot\logs\bot-paper_stdout.log" `
-            -RedirectStandardError "C:\Users\Peter\coderepoo\logs\bot-paper_err.log"
+            -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_stdout.log" `
+            -RedirectStandardError "C:\Users\Peter\coderepo\logs\bot-paper_err.log"
             
           # Start test bot in background, output to log
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log" `
             -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\Users\Peter\coderepoo\calendar-bot\logs\bot-test_stdout.log" `
-            -RedirectStandardError "C:\Users\Peter\coderepoo\logs\bot-test_err.log"
+            -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-test_stdout.log" `
+            -RedirectStandardError "C:\Users\Peter\coderepo\logs\bot-test_err.log"
