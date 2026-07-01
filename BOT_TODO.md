@@ -408,7 +408,7 @@ The best approach is to call `set_my_commands()` once at startup inside `listene
 
 - [x] `handle_help(update, context)` — iterates `COMMAND_REGISTRY` and replies with a formatted list: `/<command> — <description>` on each line
 
-### Tests
+### Tests (continued)
 
 - [x] Add to `tests/test_telegram_cmd.py`
   - [x] Verify `handle_help` reply contains every command in `COMMAND_REGISTRY`
@@ -695,6 +695,7 @@ Previously, when a near leg was rolled, the profit/loss realized from closing th
 ### Root causes fixed
 
 **`db/state.py` — New tracking columns**
+
 - Added `roll_pnl REAL NOT NULL DEFAULT 0.0` — tracks cumulative profit from rolling near legs
 - Added `ev_score_initial REAL NOT NULL DEFAULT 0.0` — stores EV at entry (initial scan)
 - Added `ev_score_at_roll REAL NOT NULL DEFAULT 0.0` — stores EV of new near leg at roll time
@@ -702,6 +703,7 @@ Previously, when a near leg was rolled, the profit/loss realized from closing th
 - Migration adds all three columns to existing databases with backward-compatible defaults
 
 **`strategy/decision.py` — Roll validation and P&L inclusion**
+
 - `_try_roll()` now validates new candidate passes `_check_liquidity_gate()` (same gates as entry)
 - Recalculates EV for new candidate before rolling and passes it to DB
 - Calculates roll P&L: `(old_near_sell_price - new_near_bid_price) * qty`
@@ -711,13 +713,15 @@ Previously, when a near leg was rolled, the profit/loss realized from closing th
 - Logs both gross and roll P&L separately at close time
 
 **`telegram_cmd/handlers.py` — Roll P&L visibility**
+
 - `/positions` — shows separate roll P&L: `roll=$X.XX` alongside unrealized PnL when a roll has occurred
 - `/positions` — displays both `ev_init=X.XXXX` (entry EV) and `ev_roll=X.XXXX` (roll EV, if rolled)
 - `/portfolio` — shows total P&L including roll: `PnL=$(unr + roll)`
 - `/portfolio` — breaks down `Fees:` and `Roll PnL:` as separate line items
 - `/portfolio` — displays both `EV_init:` and `EV_roll:` when roll has occurred
 
-**Entry logging improvements**
+### Entry logging improvements
+
 - `ENTER` log now includes `ev=X.XXXX` to show EV at entry
 - `ROLL` log now includes `roll_pnl=X.XX` and `ev_new=X.XXXX` to show realized profit and new EV
 - `CLOSE` log now includes `roll_pnl=X.XX` and `ev_initial=X.XXXX` for full lifecycle visibility
@@ -725,7 +729,8 @@ Previously, when a near leg was rolled, the profit/loss realized from closing th
 ### Example
 
 Position #42 BTC 60K Put, 1d→7d:
-```
+
+```text
 ENTER filled: trade_id=42 BTC Put strike=60000 qty=1.0 debit=0.0060 fees=0.00012 ev=0.0385
 [24 hours later, near leg at 2 days to expiry]
 ROLL trade_id=42 → new near=BTC-3JAN26-60000-P roll_pnl=+0.0008 roll_fees=0.00015 ev_new=0.0421
@@ -744,31 +749,36 @@ All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field
 ### Root causes fixed
 
 **`strategy/decision.py` — `_close_position()`**
+
 - Changed `pnl = gross_pnl` → `pnl = gross_pnl - open_fees_usd - close_fees_usd`
 - DB `pnl` column now stores true net P&L; `_today_pnl` and `_session_pnl` accumulate net values
 - Misleading comment "open_fees already deducted at entry" replaced with accurate description
 - Close alert notifications (`notify_stop`, `notify_take_profit`) automatically receive net PnL since they read `pnl`
 
 **`strategy/decision.py` — `_monitor_position()`**
+
 - `unrealized` now deducts `open_fees` from cost basis: `sv - net_debit*qty - open_fees`
 - `engine._unrealized_pnl` (fed to `/status` and internal status) is now fee-inclusive for open positions
 
 **`telegram_cmd/handlers.py` — `handle_positions()`**
+
 - PnL formula: `unr_pnl = spread_val - (net_debit*qty + open_fees)` — open fees in cost basis
 - PnL%: denominator is `net_debit*qty + open_fees` (total capital deployed including entry fees)
 
 **`telegram_cmd/handlers.py` — `handle_portfolio()`**
+
 - PnL formula: `pnl = curr_val - net_debit*qty - open_fees`
 - Previously showed `Fees: $3.11` on the line above a PnL that ignored those fees; now consistent
 
 **`telegram_cmd/handlers.py` — `handle_status()`**
+
 - Added `Fees (session): $X.XX` line showing cumulative fees paid since bot start
 - `/status` PnL today and PnL since start now correctly reflect net figures (closed: DB net pnl; open: unrealized net of open fees)
 
 ### What remains gross vs net
 
 | Metric | Before | After |
-|---|---|---|
+| --- | --- | --- |
 | DB `pnl` field | gross (no fees) | net (open + close fees deducted) |
 | `_today_pnl` / `_session_pnl` | gross | net |
 | `_unrealized_pnl` | gross | net of open fees |
@@ -792,5 +802,4 @@ All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field
 
 - after a Pull Request is done, the windows runner will pull changes locally and restart the bot (all bots)
 - restarts paper and testnet bots
-- added to test the merge PR to main workflow
-- and now does it work?
+- this is not working as far as I know
