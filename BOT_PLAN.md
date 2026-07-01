@@ -489,6 +489,7 @@ calendar-bot/
 | Wrong environment | Startup banner clearly states PAPER / TEST / LIVE; bot refuses to start in live mode without DAILY_LOSS_LIMIT; scratch scripts abort if TRADING_MODE == "live" |
 | Fee drag erodes profitability | All EV scores deducted for round-trip fees before entry; sizer includes fees in max-loss; paper mode simulates fees identically to live |
 | Roll loop accumulating fees | Roll gate checks that theta gain exceeds `roll_fees` before proceeding; uneconomic rolls close the position instead |
+| Roll profit not captured in final P&L | DB tracks `roll_pnl` for each position; `_close_position()` includes roll profit in final net P&L calculation; `/positions` and `/portfolio` display roll P&L separately; new near-leg candidates validated with liquidity gate and EV recalculated at roll time |
 | Backtest overstates returns | `backtest/engine.py` applies entry, roll, exit, and delivery fees to every trade; summary reports include `total_fees` per regime |
 
 ---

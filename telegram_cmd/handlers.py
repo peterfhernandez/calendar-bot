@@ -67,7 +67,7 @@ async def handle_positions(
     cache: ChainCache,
     db_path: Path = DB_PATH,
 ) -> None:
-    """Open trades: ev, strike/type, expiry range, entry cost, current value, PnL."""
+    """Open trades: ev, strike/type, expiry range, entry cost, current value, PnL (separated by roll)."""
     trades = get_open_trades(db_path)
     if not trades:
         await update.message.reply_text("No open positions.")
@@ -85,8 +85,13 @@ async def handle_positions(
             spread_val = max(0.0, far_mid - near_mid) * t.qty
             cost_basis = t.net_debit * t.qty + t.open_fees
             unr_pnl    = spread_val - cost_basis
-            pnl_pct    = (unr_pnl / cost_basis * 100) if cost_basis else 0.0
-            val_note   = f"sv=${spread_val:.2f}  PnL=${unr_pnl:+.2f} ({pnl_pct:+.1f}%)"
+            total_pnl  = unr_pnl + t.roll_pnl  # add roll profit
+            pnl_pct    = (total_pnl / cost_basis * 100) if cost_basis else 0.0
+
+            pnl_note = f"PnL=${total_pnl:+.2f} ({pnl_pct:+.1f}%)"
+            if t.roll_pnl != 0.0:
+                pnl_note += f"  [unr=${unr_pnl:+.2f}  roll=${t.roll_pnl:+.2f}]"
+            val_note   = f"sv=${spread_val:.2f}  {pnl_note}"
         else:
             val_note = "sv=N/A (stale cache)"
 
@@ -94,9 +99,13 @@ async def handle_positions(
         far_date  = _fmt_expiry(t.expiry_far)
         opt_type  = _fmt_type(t.option_type)
 
+        ev_display = f"ev_init={_fmt_ev(t.ev_score_initial)}"
+        if t.ev_score_at_roll != 0.0:
+            ev_display += f"  ev_roll={_fmt_ev(t.ev_score_at_roll)}"
+
         lines.append(
             f"#{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
-            f"   entry=${t.net_debit * t.qty:.2f}  {val_note}   ev={_fmt_ev(t.ev_score)}"
+            f"   entry=${t.net_debit * t.qty:.2f}  {val_note}   {ev_display}"
         )
 
     await update.message.reply_text("\n\n".join(lines))
@@ -213,7 +222,7 @@ async def handle_portfolio(
     cache: ChainCache,
     db_path: Path = DB_PATH,
 ) -> None:
-    """Open trades with asset, strike, expiry range, debit, fees, EV at entry, current value."""
+    """Open trades with asset, strike, expiry range, debit, fees, EV at entry & roll, total PnL."""
     trades = get_open_trades(db_path)
     if not trades:
         await update.message.reply_text("No open positions.")
@@ -229,8 +238,9 @@ async def handle_portfolio(
 
         if near_mid is not None and far_mid is not None:
             curr_val = max(0.0, far_mid - near_mid) * t.qty
-            pnl      = curr_val - t.net_debit * t.qty - t.open_fees
-            val_str  = f"${curr_val:.2f}  PnL=${pnl:+.2f}"
+            unr_pnl  = curr_val - t.net_debit * t.qty - t.open_fees
+            total_pnl = unr_pnl + t.roll_pnl  # total includes roll profit
+            val_str  = f"${curr_val:.2f}  PnL=${total_pnl:+.2f}"
         else:
             val_str = "N/A (stale cache)"
 
@@ -238,9 +248,14 @@ async def handle_portfolio(
         far_date  = _fmt_expiry(t.expiry_far)
         opt_type  = _fmt_type(t.option_type)
 
+        ev_line = f"  EV_init: {_fmt_ev(t.ev_score_initial)}"
+        if t.ev_score_at_roll != 0.0:
+            ev_line += f"  EV_roll: {_fmt_ev(t.ev_score_at_roll)}"
+
         lines.append(
             f"#{t.id} {t.asset} {opt_type} {t.strike:.0f}  {near_date}→{far_date}\n"
-            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  EV: {_fmt_ev(t.ev_score)}\n"
+            f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  Roll PnL: ${t.roll_pnl:+.2f}\n"
+            f"{ev_line}\n"
             f"  Value: {val_str}"
         )
 

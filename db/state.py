@@ -43,6 +43,9 @@ class CalendarTrade:
     spot_close: Optional[float]
     pnl: Optional[float]
     ev_score: float = field(default=0.0)
+    ev_score_initial: float = field(default=0.0)
+    ev_score_at_roll: float = field(default=0.0)
+    roll_pnl: float = field(default=0.0)
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -81,14 +84,23 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 date_close       TEXT,
                 spot_close       REAL,
                 pnl              REAL,
-                ev_score         REAL    NOT NULL DEFAULT 0.0
+                ev_score         REAL    NOT NULL DEFAULT 0.0,
+                ev_score_initial REAL    NOT NULL DEFAULT 0.0,
+                ev_score_at_roll REAL    NOT NULL DEFAULT 0.0,
+                roll_pnl         REAL    NOT NULL DEFAULT 0.0
             )
         """)
-        # Migration: add ev_score column to existing databases
-        try:
-            conn.execute("ALTER TABLE calendar_trades ADD COLUMN ev_score REAL NOT NULL DEFAULT 0.0")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Migrations: add new columns to existing databases
+        for col_name, col_type in [
+            ("ev_score", "REAL NOT NULL DEFAULT 0.0"),
+            ("ev_score_initial", "REAL NOT NULL DEFAULT 0.0"),
+            ("ev_score_at_roll", "REAL NOT NULL DEFAULT 0.0"),
+            ("roll_pnl", "REAL NOT NULL DEFAULT 0.0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE calendar_trades ADD COLUMN {col_name} {col_type}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 def _row_to_trade(row: sqlite3.Row) -> CalendarTrade:
@@ -119,6 +131,9 @@ def _row_to_trade(row: sqlite3.Row) -> CalendarTrade:
         spot_close=row["spot_close"],
         pnl=row["pnl"],
         ev_score=row["ev_score"] if row["ev_score"] is not None else 0.0,
+        ev_score_initial=row["ev_score_initial"] if row["ev_score_initial"] is not None else 0.0,
+        ev_score_at_roll=row["ev_score_at_roll"] if row["ev_score_at_roll"] is not None else 0.0,
+        roll_pnl=row["roll_pnl"] if row["roll_pnl"] is not None else 0.0,
     )
 
 
@@ -145,10 +160,14 @@ def create_calendar_trade(
     far_instrument: Optional[str] = None,
     open_fees: float = 0.0,
     ev_score: float = 0.0,
+    ev_score_initial: float = 0.0,
     db_path: Path = DB_PATH,
 ) -> CalendarTrade:
     """Insert a new calendar trade record with result='Open'. Returns the persisted trade."""
     init_db(db_path)
+    # If ev_score_initial is not provided, use ev_score (for backward compat)
+    if ev_score_initial == 0.0:
+        ev_score_initial = ev_score
     with get_connection(db_path) as conn:
         cur = conn.execute(
             """
@@ -156,14 +175,14 @@ def create_calendar_trade(
                 (asset, option_type, strike, expiry_near, expiry_far,
                  near_days, far_days, qty, date_open, spot_open,
                  near_prem, far_prem, net_debit, fees, open_fees,
-                 result, notes, broker, near_instrument, far_instrument, ev_score)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0.0,?,?,?,?,?,?,?)
+                 result, notes, broker, near_instrument, far_instrument, ev_score, ev_score_initial)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0.0,?,?,?,?,?,?,?,?)
             """,
             (
                 asset, option_type, strike, expiry_near, expiry_far,
                 near_days, far_days, qty, date_open.isoformat(), spot_open,
                 near_prem, far_prem, net_debit, open_fees,
-                "Open", notes, broker, near_instrument, far_instrument, ev_score,
+                "Open", notes, broker, near_instrument, far_instrument, ev_score, ev_score_initial,
             ),
         )
         row = conn.execute(
@@ -244,22 +263,26 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
 
     open_positions = [
         {
-            "trade_id":        trade.id,
-            "status":          trade.result,
-            "asset":           trade.asset,
-            "option_type":     trade.option_type,
-            "strike":          trade.strike,
-            "expiry_near":     trade.expiry_near,
-            "expiry_far":      trade.expiry_far,
-            "qty":             trade.qty,
-            "net_debit":       trade.net_debit,
-            "spot_open":       trade.spot_open,
-            "near_days":       trade.near_days,
-            "far_days":        trade.far_days,
-            "near_instrument": trade.near_instrument,
-            "far_instrument":  trade.far_instrument,
-            "open_fees":       trade.open_fees,
-            "close_fees":      trade.close_fees,
+            "trade_id":           trade.id,
+            "status":             trade.result,
+            "asset":              trade.asset,
+            "option_type":        trade.option_type,
+            "strike":             trade.strike,
+            "expiry_near":        trade.expiry_near,
+            "expiry_far":         trade.expiry_far,
+            "qty":                trade.qty,
+            "net_debit":          trade.net_debit,
+            "spot_open":          trade.spot_open,
+            "near_days":          trade.near_days,
+            "far_days":           trade.far_days,
+            "near_instrument":    trade.near_instrument,
+            "far_instrument":     trade.far_instrument,
+            "open_fees":          trade.open_fees,
+            "close_fees":         trade.close_fees,
+            "roll_pnl":           trade.roll_pnl,
+            "ev_score":           trade.ev_score,
+            "ev_score_initial":   trade.ev_score_initial,
+            "ev_score_at_roll":   trade.ev_score_at_roll,
         }
         for trade in trades
         if trade.result in _OPEN_STATUSES
@@ -279,9 +302,11 @@ def update_near_leg(
     trade_id: int,
     new_near_instrument: str,
     new_expiry_near: str,
+    roll_pnl: float = 0.0,
+    ev_score_at_roll: float = 0.0,
     db_path: Path = DB_PATH,
 ) -> CalendarTrade:
-    """Update a trade's near leg after a successful roll."""
+    """Update a trade's near leg after a successful roll, including roll P&L and EV."""
     init_db(db_path)
     with get_connection(db_path) as conn:
         trade = conn.execute(
@@ -292,10 +317,11 @@ def update_near_leg(
         conn.execute(
             """
             UPDATE calendar_trades
-            SET near_instrument = ?, expiry_near = ?, result = 'Near Leg Rolled'
+            SET near_instrument = ?, expiry_near = ?, result = 'Near Leg Rolled',
+                roll_pnl = roll_pnl + ?, ev_score_at_roll = ?
             WHERE id = ?
             """,
-            (new_near_instrument, new_expiry_near, trade_id),
+            (new_near_instrument, new_expiry_near, roll_pnl, ev_score_at_roll, trade_id),
         )
         row = conn.execute(
             "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
