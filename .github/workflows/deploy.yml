@@ -27,8 +27,8 @@ jobs:
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_stdout.log" `
             -RedirectStandardError "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_err.log"
-
-          # Start test bot (test mode, separate env/db/log)
+            
+          # Start test bot in background, output to log
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log" `
             -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
             -WindowStyle Hidden `
