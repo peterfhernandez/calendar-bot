@@ -1551,6 +1551,123 @@ class TestRollFixes:
         assert result is True
 
 
+# ── Fix 7: Close/expiry retry limit ───────────────────────────────────────────
+
+class TestCloseAfterExpiryRetryLimit:
+    """
+    When a near leg has expired and close_spread fails (e.g. Deribit -32602
+    Invalid params for expired instrument), retries should be capped at 3
+    failures. On the 4th attempt, the position should be force-closed to
+    prevent infinite retry loops.
+    """
+
+    def _make_expired_pos(self, trade_id: int = 4) -> dict:
+        """Position whose near leg has already expired."""
+        near_label = _future_label(-2)  # expired 2 days ago
+        far_label  = _future_label(30)
+        return {
+            "trade_id":        trade_id,
+            "status":          "Open",
+            "asset":           "BTC",
+            "option_type":     "Call",
+            "strike":          59_000.0,
+            "expiry_near":     near_label,
+            "expiry_far":      far_label,
+            "qty":             1.0,
+            "net_debit":       0.02,
+            "spot_open":       60_000.0,
+            "near_days":       -2,
+            "far_days":        30,
+            "near_instrument": f"BTC-{near_label}-59000-C",
+            "far_instrument":  f"BTC-{far_label}-59000-C",
+            "open_fees":       0.05,
+            "close_fees":      0.0,
+        }
+
+    def test_first_close_failure_increments_counter(self):
+        """First failed close increments the failure counter."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # failure
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expired_pos(trade_id=4)
+
+        # Mock _load_all_open_positions to return the position on both calls
+        # (first call at line 414, second call at line 443 for refresh).
+        # This prevents the counter from being cleared due to the position
+        # appearing to be "closed" after close_calendar_trade is called.
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 60_000.0
+            engine.monitor_tick()
+
+        assert engine._close_roll_failures.get(4) == 1
+
+    def test_second_close_failure_increments_counter(self):
+        """Second failed close increments counter to 2."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expired_pos(trade_id=4)
+        engine._close_roll_failures[4] = 1  # already failed once
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 60_000.0
+            engine.monitor_tick()
+
+        assert engine._close_roll_failures.get(4) == 2
+
+    def test_third_close_failure_increments_counter(self):
+        """Third failed close increments counter to 3."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expired_pos(trade_id=4)
+        engine._close_roll_failures[4] = 2  # already failed twice
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 60_000.0
+            engine.monitor_tick()
+
+        assert engine._close_roll_failures.get(4) == 3
+
+    def test_fourth_failure_force_closes_position(self):
+        """On 4th failed close, position is force-closed and removed from tracking."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expired_pos(trade_id=4)
+        engine._close_roll_failures[4] = 3  # already failed 3 times
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade") as mock_close:
+            engine._cache.get_spot.return_value = 60_000.0
+            engine.monitor_tick()
+
+        # Position should have been closed via close_calendar_trade
+        mock_close.assert_called_once()
+        # On 4th failure, the counter should be cleared because the position
+        # gets marked as closed and is then removed from the failure tracking
+        assert 4 not in engine._close_roll_failures
+
+    def test_close_success_clears_counter(self):
+        """Successful close clears the failure counter."""
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.025  # success
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_expired_pos(trade_id=4)
+        engine._close_roll_failures[4] = 1  # had 1 failure
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 60_000.0
+            engine.monitor_tick()
+
+        # Counter should be cleared on success
+        assert engine._close_roll_failures.get(4) is None
+
+
 # ── Per-asset overrides in the liquidity gate ─────────────────────────────────
 
 class TestAssetOverridesLiquidityGate:
