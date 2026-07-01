@@ -652,9 +652,49 @@ class DecisionEngine:
         # Determine remaining days from today
         near_days_left, far_days_left = _days_left(pos)
         if near_days_left <= 0:
-            # Near leg has expired — close the full position
-            logger.info("trade_id=%d near leg expired, closing", trade_id)
-            return self._close_position(pos, spot, "Near leg expired"), 0.0
+            # Near leg has expired — close the full position.
+            # Apply retry limiting: cap at 3 failed attempts, then force-close to prevent stuck positions.
+            trade_id = pos["trade_id"]
+            failure_count = self._close_roll_failures.get(trade_id, 0)
+            if failure_count >= 3:
+                logger.error(
+                    "trade_id=%d near leg expired but close failed %d times — halting retries, force-closing",
+                    trade_id, failure_count,
+                )
+                # When a normal close fails due to expired near leg (Deribit rejects orders on
+                # expired instruments), bypass the executor and mark the position as closed
+                # in the DB with a force-close note. This breaks the retry loop.
+                near_instr = pos.get("near_instrument", "")
+                logger.warning(
+                    "trade_id=%d near leg (%s) is expired/untradeable; position marked as closed to prevent retry loop",
+                    trade_id, near_instr,
+                )
+                # Record force-close without calling executor (which would fail anyway)
+                try:
+                    close_calendar_trade(
+                        trade_id=trade_id,
+                        date_close=date.today(),
+                        spot_close=spot,
+                        pnl=0.0,  # unknown P&L; position is stuck
+                        result="Loss (Force Close)",
+                        notes="Near leg expired — force closed (Deribit untradeable)",
+                        close_fees=0.0,
+                        db_path=self._db_path,
+                    )
+                    self._close_roll_failures.pop(trade_id, None)
+                    return f"trade_id={trade_id} force closed (expired near leg)", 0.0
+                except Exception as exc:
+                    logger.error("Force close of trade_id=%d failed: %s", trade_id, exc)
+                    return f"trade_id={trade_id} force close FAILED: {exc}", 0.0
+
+            close_msg = self._close_position(pos, spot, "Near leg expired")
+            if "FAILED" in close_msg:
+                # Close failed; increment counter and retry next tick
+                self._close_roll_failures[trade_id] = failure_count + 1
+            else:
+                # Close succeeded; clear counter
+                self._close_roll_failures.pop(trade_id, None)
+            return close_msg, 0.0
 
         # Get current IV from cache (use the far instrument as representative)
         iv = self._get_iv(pos)
