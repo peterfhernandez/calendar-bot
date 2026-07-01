@@ -13,20 +13,24 @@ jobs:
 
       - name: Restart bot
         run: |
-          # Kill existing bot process if running
-          Get-Process -Name python -ErrorAction SilentlyContinue | 
-            Where-Object { $_.CommandLine -like '*bot.py*' } | 
-            Stop-Process -Force
+          # Kill existing bot processes — use Get-CimInstance instead of Get-Process
+          # (Get-Process doesn't expose CommandLine by default, so the filter silently fails)
+          Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*bot.py*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-          # Start test bot in background, output to log
-          Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --portfolio=10000" `
+          Start-Sleep -Seconds 2
+
+          # Start paper bot (default mode, reads .env)
+          Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py" `
+            -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_stdout.log" `
-            -RedirectStandardError "C:\Users\Peter\coderepo\logs\bot-paper_err.log"
+            -RedirectStandardError "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_err.log"
             
           # Start test bot in background, output to log
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log" `
             -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
             -WindowStyle Hidden `
             -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-test_stdout.log" `
-            -RedirectStandardError "C:\Users\Peter\coderepo\logs\bot-test_err.log"
+            -RedirectStandardError "C:\Users\Peter\coderepo\calendar-bot\logs\bot-test_err.log"

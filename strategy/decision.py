@@ -214,6 +214,7 @@ class DecisionEngine:
         self._fees_paid_today: float = 0.0  # cumulative fees paid today (entry + exit + roll)
         self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
         self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
+        self._close_roll_failures: dict[int, int] = {}  # trade_id → attempt count; prevents unbounded close/roll retry loops
         self._paused: bool = False
         self._start_time: datetime = datetime.now(timezone.utc)
 
@@ -415,6 +416,7 @@ class DecisionEngine:
             self._state = BotState.IDLE
             self._just_entered.clear()
             self._rolled_this_tick.clear()
+            self._close_roll_failures.clear()  # no open positions, clear all failure counters
             return self._status("Monitor: no open positions.", [])
 
         self._state = BotState.MONITOR
@@ -439,6 +441,12 @@ class DecisionEngine:
 
         # Refresh after actions
         open_positions = self._load_all_open_positions()
+
+        # Clean up stale failure counters for closed positions
+        open_trade_ids = {p.get("trade_id") for p in open_positions if p.get("trade_id")}
+        closed_trades = set(self._close_roll_failures.keys()) - open_trade_ids
+        for trade_id in closed_trades:
+            self._close_roll_failures.pop(trade_id, None)
         self._state = BotState.IDLE if not open_positions else BotState.MONITOR
 
         if skipped_no_iv and not actions:
@@ -685,10 +693,24 @@ class DecisionEngine:
                     trade_id, near_days_left,
                 )
                 return self._close_position(pos, spot, "Drain mode — closing instead of rolling"), 0.0
+
+            # Cap roll/close retry attempts per position — prevents unbounded retry loops
+            failure_count = self._close_roll_failures.get(trade_id, 0)
+            if failure_count >= 3:
+                logger.error(
+                    "trade_id=%d roll/close failed %d times — halting retries, closing position",
+                    trade_id, failure_count,
+                )
+                return self._close_position(pos, spot, "Roll/close retry limit exceeded — closing"), 0.0
+
             rolled = self._try_roll(pos, spot)
             if rolled:
+                # Clear failure counter on successful roll
+                self._close_roll_failures.pop(trade_id, None)
                 return f"trade_id={trade_id} rolled near leg", 0.0
-            # If roll fails, close cleanly
+
+            # If roll fails, increment counter and close cleanly
+            self._close_roll_failures[trade_id] = failure_count + 1
             return self._close_position(pos, spot, "Roll failed — closing"), 0.0
 
         # Position held — compute unrealized P&L vs entry cost (debit + open fees).
@@ -787,6 +809,9 @@ class DecisionEngine:
                     self._notifier.notify_close(trade_id, asset, strike, pnl, reason)
             except Exception as exc:
                 logger.warning("Notification failed on close: %s", exc)
+
+        # Clear any accumulated roll/close failure count for this position
+        self._close_roll_failures.pop(trade_id, None)
         return f"trade_id={trade_id} {result} pnl={pnl:+.2f} ({reason})"
 
     def _try_roll(self, pos: dict, spot: float) -> bool:

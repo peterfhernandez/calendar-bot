@@ -636,35 +636,106 @@ async def _async_close_spread(
 
         # Close near leg: buy back the short (we sold it at entry)
         near_close_price = near_mid * 1.02 if near_mid > 0 else 0.001  # pay a little to close
-        near_result = await client.place_order(
-            near_instr, "buy", amount, round(near_close_price, 4),
-            label=f"CLOSE-NEAR-{asset}",
-        )
-        near_close_id = near_result["order"]["order_id"]
-        order_manager.track(TrackedOrder(
-            order_id=near_close_id, instrument=near_instr,
-            direction="buy", amount=amount, limit_price=near_close_price,
-            label=f"CLOSE-NEAR-{asset}",
-        ))
+        near_close_id = None
+        try:
+            near_result = await client.place_order(
+                near_instr, "buy", amount, round(near_close_price, 4),
+                label=f"CLOSE-NEAR-{asset}",
+            )
+            near_close_id = near_result["order"]["order_id"]
+            order_manager.track(TrackedOrder(
+                order_id=near_close_id, instrument=near_instr,
+                direction="buy", amount=amount, limit_price=near_close_price,
+                label=f"CLOSE-NEAR-{asset}",
+            ))
+        except (OSError, websockets.exceptions.WebSocketException, RuntimeError, Exception) as exc:
+            logger.error("Failed to submit near close order: %s", exc)
+            return None
 
         # Close far leg: sell back the long (we bought it at entry)
         far_close_price = far_mid * 0.98 if far_mid > 0 else 0.001
-        far_result = await client.place_order(
-            far_instr, "sell", amount, round(far_close_price, 4),
-            label=f"CLOSE-FAR-{asset}",
-        )
-        far_close_id = far_result["order"]["order_id"]
-        order_manager.track(TrackedOrder(
-            order_id=far_close_id, instrument=far_instr,
-            direction="sell", amount=amount, limit_price=far_close_price,
-            label=f"CLOSE-FAR-{asset}",
-        ))
+        far_close_id = None
+        try:
+            far_result = await client.place_order(
+                far_instr, "sell", amount, round(far_close_price, 4),
+                label=f"CLOSE-FAR-{asset}",
+            )
+            far_close_id = far_result["order"]["order_id"]
+            order_manager.track(TrackedOrder(
+                order_id=far_close_id, instrument=far_instr,
+                direction="sell", amount=amount, limit_price=far_close_price,
+                label=f"CLOSE-FAR-{asset}",
+            ))
+        except (OSError, websockets.exceptions.WebSocketException, RuntimeError, Exception) as exc:
+            logger.error("Failed to submit far close order: %s", exc)
+            # Try to cancel near leg if it was submitted
+            if near_close_id:
+                try:
+                    await client.cancel_order(near_close_id)
+                except Exception:
+                    pass
+            return None
 
+        near_state = None
+        far_state = None
+        near_filled = False
+        far_filled = False
+
+        # Wait for near leg fill
         try:
             near_state = await _wait_for_fill(client, near_close_id, order_timeout)
-            far_state  = await _wait_for_fill(client, far_close_id,  order_timeout)
+            near_filled = True
         except (OrderTimeoutError, RuntimeError) as exc:
-            logger.error("Close failed: %s", exc)
+            logger.warning("Near leg close timed out: %s — will attempt to cancel", exc)
+            try:
+                await client.cancel_order(near_close_id)
+            except Exception as cancel_exc:
+                logger.warning("Failed to cancel near close order %s: %s", near_close_id, cancel_exc)
+
+        # Wait for far leg fill
+        try:
+            far_state = await _wait_for_fill(client, far_close_id, order_timeout)
+            far_filled = True
+        except (OrderTimeoutError, RuntimeError) as exc:
+            logger.warning("Far leg close timed out: %s", exc)
+            try:
+                await client.cancel_order(far_close_id)
+            except Exception as cancel_exc:
+                logger.warning("Failed to cancel far close order %s: %s", far_close_id, cancel_exc)
+
+        # If one leg filled but the other didn't, unwind the filled leg to avoid leg risk
+        if near_filled and not far_filled:
+            logger.error(
+                "Near leg close filled but far leg failed — unwinding near leg to avoid leg risk"
+            )
+            try:
+                unwind_price = near_mid * 0.98 if near_mid > 0 else 0.001
+                await client.place_order(
+                    near_instr, "sell", amount, round(unwind_price, 4),
+                    label=f"UNWIND-NEAR-{asset}",
+                )
+                logger.info("Unwound near leg")
+            except Exception as unwind_exc:
+                logger.critical("FAILED to unwind near leg after far close failure: %s", unwind_exc)
+            return None
+
+        if far_filled and not near_filled:
+            logger.error(
+                "Far leg close filled but near leg failed — unwinding far leg to avoid leg risk"
+            )
+            try:
+                unwind_price = far_mid * 1.02 if far_mid > 0 else 0.001
+                await client.place_order(
+                    far_instr, "buy", amount, round(unwind_price, 4),
+                    label=f"UNWIND-FAR-{asset}",
+                )
+                logger.info("Unwound far leg")
+            except Exception as unwind_exc:
+                logger.critical("FAILED to unwind far leg after near close failure: %s", unwind_exc)
+            return None
+
+        if not (near_filled and far_filled):
+            logger.error("Close failed: both legs timed out or were cancelled")
             return None
 
         order_manager.update(near_close_id, OrderState.FILLED, fill_price=near_state.get("average_price", near_close_price))

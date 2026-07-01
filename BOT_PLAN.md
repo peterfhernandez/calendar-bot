@@ -475,6 +475,8 @@ calendar-bot/
 | Risk | Mitigation |
 | --- | --- |
 | Leg risk on entry (one leg fills, other doesn't) | Use Deribit combo orders; individual-leg fallback only when both legs are liquid and cancels near leg immediately on far-leg failure |
+| Leg risk on close (one leg fills, other times out) | Close operations unwind partial fills: if near fills but far times out, reverse-sell near at market; if far fills but near times out, reverse-buy far at market. Deribit API errors on close are caught and retried up to 3 times; on 4th failure, position is force-closed to prevent naked leg accumulation |
+| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then force-close on 4th failure. Prevents incidents like trade_id=4 (4.5-min retry loop leading to margin call) and trade_id=27 (207 rolls in 3.5 hours) |
 | IV collapse after entry | Check IV term structure before entering; set max IV drop stop |
 | Liquidity gaps on crypto calendars | Two-stage liquidity filter: OI in scanner, bid/ask size + spread in decision gate |
 | Overfitting scanner to recent market | Backtest across at least 2 vol regimes |
