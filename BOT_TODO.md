@@ -492,6 +492,53 @@ Telegram `/positions` output now shows a reasonable spread value even during cac
 
 ---
 
+## Phase 16 — `/pnl` Equity Curve Chart
+
+New Telegram command that renders the bot's full trading history as an equity-curve image: cumulative realized P&L (all-time closed trades) as a black line, with current unrealized P&L from open positions appended as a dotted green line, delivered to the chat as a PNG.
+
+### Design
+
+- x-axis: `date_close` (chronological); y-axis: cumulative net P&L in USD
+- Black solid line: running sum of `pnl` over all closed trades ordered by `date_close`. `pnl` is already net of fees (Phase 13) and includes roll P&L (Phase 14), so no extra adjustment is needed — plot the raw column.
+- Dotted green line: a single segment from the last realized point `(last date_close, cumulative_realized)` to `(now, cumulative_realized + total_unrealized)`, where `total_unrealized` is the sum of `(spread_val − net_debit×qty − open_fees) + roll_pnl` across all open trades (same formula as `handle_portfolio`), using live mid prices from `ChainCache` with a `last_spread_value` fallback (same pattern as `/positions`, Phase 15)
+- Chart legend/caption states the open position count (e.g. "3 open trades") next to the unrealized line
+- Rendered with `matplotlib` using the non-interactive `Agg` backend (no display server on the bot host) and returned as an in-memory PNG (`io.BytesIO`), never written to disk in the live path
+- Empty states handled explicitly: no closed trades yet → chart shows a flat zero line with a caption note instead of erroring; no open trades → dotted segment and "open trades" note are omitted
+
+### `db/state.py`
+
+- [ ] Add `get_all_closed_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]` — all rows with `date_close IS NOT NULL`, ordered by `date_close ASC, id ASC`
+
+### `telegram_cmd/pnl_chart.py` (new module)
+
+- [ ] `matplotlib.use("Agg")` set at import time, before `pyplot` is imported
+- [ ] `build_cumulative_series(closed_trades) -> list[tuple[datetime, float]]` — pure function, running sum of `t.pnl` ordered by `date_close`
+- [ ] `compute_unrealized(open_trades, cache: ChainCache) -> tuple[float, int]` — returns `(total_unrealized_pnl, open_count)`; reuses the mid-price / `last_spread_value` fallback logic already in `telegram_cmd/handlers.py` (factor the shared bits out to a helper rather than duplicating, e.g. move `_mid()` and the stale-cache fallback into a shared `telegram_cmd/_pnl_common.py` or keep the calc in `handlers.py` and import it)
+- [ ] `render_pnl_chart(closed_trades, open_trades, cache) -> io.BytesIO` — builds the black realized-PnL line, appends the dotted green unrealized segment when `open_count > 0`, draws a y=0 reference line, formats the y-axis as `$X`, rotates/thins x-axis date labels for readability with many trades, returns a seeked-to-0 `BytesIO` containing PNG bytes
+
+### `telegram_cmd/handlers.py`
+
+- [ ] `handle_pnl(update, context, cache, db_path)` — fetches `get_all_closed_trades()` and `get_open_trades()`, calls `render_pnl_chart()`, sends via `update.message.reply_photo(photo=buf, caption=...)`; caption includes total realized PnL, total unrealized PnL, open trade count, and the combined total
+- [ ] Reply with a plain text message instead of a photo when there is no history at all (no closed trades and no open trades)
+
+### `telegram_cmd/listener.py`
+
+- [ ] Add `("pnl", "Equity curve: realized PnL (black) + unrealized PnL (dotted green), N open trades")` to `COMMAND_REGISTRY`
+- [ ] Wrap and register `cmd_pnl` the same way as `cmd_positions` (needs `cache` injected, no `engine` dependency)
+
+### `requirements.txt`
+
+- [x] Add `matplotlib>=3.8`
+
+### Tests and scratch
+
+- [ ] `tests/test_state.py` — `TestGetAllClosedTrades`: returns only closed trades, ordered by `date_close`, empty list when none closed
+- [ ] `tests/test_telegram_cmd.py` — `TestHandlePnl`: mocks `reply_photo`; verifies it is called with PNG bytes (`b"\x89PNG"` header) when history exists; verifies caption contains realized/unrealized/open-count figures; verifies the no-history case falls back to `reply_text`; verifies the dotted unrealized segment is omitted when there are no open positions
+- [ ] Unit tests for `build_cumulative_series` and `compute_unrealized` directly (no rendering involved) covering: single trade, multiple same-day closes, mixed win/loss sequence, zero open positions, stale-cache fallback
+- [ ] `scratch/scratch_pnl_chart.py` — loads real (or, if empty, synthetic) closed trades from the paper DB, renders the chart, and saves it to `scratch/pnl_chart_preview.png` for visual inspection. Aborts if `TRADING_MODE == "live"` (per project convention: scratch files never run against live trading). Run with `python -m scratch.scratch_pnl_chart` from the repo root.
+
+---
+
 ## Validation Phases
 
 ### Validation Phase 1 — Paper Trading Validation
@@ -532,6 +579,7 @@ Telegram `/positions` output now shows a reasonable spread value even during cac
 - `scratch/scratch_asset_overrides.py` — demonstrates per-asset threshold overrides: prints effective thresholds for BTC, ETH, and SOL side by side, then shows SOL candidates passing OI, spread, and entry-premium filters that BTC/ETH fail. Run with `python -m scratch.scratch_asset_overrides` from the repo root.
 - `scratch/scratch_fees.py` — demonstrates the Deribit fee model: entry fees with/without combo discount for BTC/ETH/SOL, delivery fees (daily/weekly exempt, monthly charged), roll fee vs theta gain break-even, and early-close gross vs net P&L. Aborts if TRADING_MODE is "live". Run with `python -m scratch.scratch_fees` from the repo root.
 - `scratch/scratch_telegram_cmd.py` — starts `TelegramCommandListener` with a real token and prints each received command and its reply. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_telegram_cmd` from the repo root.
+- `scratch/scratch_pnl_chart.py` — renders the `/pnl` equity-curve chart from the paper DB's real (or synthetic, if empty) trade history and saves it to `scratch/pnl_chart_preview.png`. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_pnl_chart` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
 ---

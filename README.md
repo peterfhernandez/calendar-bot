@@ -60,7 +60,7 @@ Key architectural components:
 - **Combo orders** (in `execution/executor.py`) — both legs submitted atomically via Deribit's combo order API, eliminating leg risk. Falls back to sequential individual legs only if the combo times out and both legs have sufficient liquidity; the fallback cancels the near leg immediately if the far leg fails. Close operations are hardened against partial fills (if near closes but far times out, a reverse sell is submitted; if far closes but near times out, a reverse buy unwinds the partial). API errors on close orders are caught and retried up to 3 times per position; on the 4th failure the position is force-closed to prevent accumulation of naked leg exposure.
 - **Roll P&L tracking** (`strategy/decision.py`, `db/state.py`) — when a near leg is rolled, the profit from closing the old near leg at a better price is calculated and recorded (`roll_pnl`), then included in the final position P&L when the trade closes. New near-leg candidates at roll time are validated with the same liquidity gate as entry, and EV is recalculated to ensure the new setup remains profitable. Both initial EV (at entry) and roll EV (if rolled) are displayed in position details.
 - **Notifications** (`alerts/notifier.py`, wired into `strategy/decision.py`) — every decision point (entry, stop, TP, roll, close, daily limit, error) fires an email and/or Telegram alert with deduplication.
-- **Fee model** (`core/fees.py`, wired into scanner, sizer, decision engine, executor, and backtest) — Deribit charges 0.03% of the underlying per leg per trade (minimum 0.0003 BTC/ETH/SOL per contract, capped at 12.5% of option value). Combo orders receive a 100% taker discount on the cheaper leg. Delivery fees of 0.015% apply at expiry for monthly and longer options (daily and weekly near legs are exempt). Fees are deducted from EV scores before entry, included in max-loss sizing, evaluated before each roll (rolls that cost more than the expected theta gain are skipped), and applied in paper mode so paper P&L reflects real economics. All PnL figures — Telegram commands (`/positions`, `/portfolio`, `/status`, `/closed_trades`), the DB `pnl` column, and internal accumulators — report **net** PnL after deducting entry and exit fees.
+- **Fee model** (`core/fees.py`, wired into scanner, sizer, decision engine, executor, and backtest) — Deribit charges 0.03% of the underlying per leg per trade (minimum 0.0003 BTC/ETH/SOL per contract, capped at 12.5% of option value). Combo orders receive a 100% taker discount on the cheaper leg. Delivery fees of 0.015% apply at expiry for monthly and longer options (daily and weekly near legs are exempt). Fees are deducted from EV scores before entry, included in max-loss sizing, evaluated before each roll (rolls that cost more than the expected theta gain are skipped), and applied in paper mode so paper P&L reflects real economics. All PnL figures — Telegram commands (`/positions`, `/portfolio`, `/status`, `/closed_trades`, `/pnl`), the DB `pnl` column, and internal accumulators — report **net** PnL after deducting entry and exit fees.
 - **Log hygiene and secret prevention** (`monitor/loop.py`, `portfolio/tracker.py`, `data/deribit_feed.py`) — `httpx`, `httpcore`, and `telegram` loggers are set to WARNING so the high-frequency `getUpdates` polling calls do not flood the log. A `_SecretRedactor` filter on the root logger replaces any occurrence of any `.env` secret (all Deribit API keys, SMTP credentials, and Telegram token/chat ID) in log output with `<redacted>`. Deribit authentication credentials are sent as a JSON POST body rather than URL query parameters so they cannot appear in HTTP error messages or exception tracebacks. Run `python -m scratch.scrub_logs` once to redact any secrets that may already be present in existing `logs/bot.log*` rotation files.
 - **Offline error tracking** (`data/deribit_feed.py`, `portfolio/tracker.py`) — repeated connectivity failures are logged only once at `WARNING` level when connectivity is first lost, then suppressed to `DEBUG` for subsequent retries. Recovery is logged at `INFO` with the retry count. This prevents log flooding during network outages or when running without internet access.
 
@@ -156,6 +156,7 @@ The bot accepts incoming commands from the same Telegram chat it uses for outgoi
 | `/new_trades [today\|session]` | New trades (default: today AEST) — per trade: id, asset, debit, ev, strike, type, expiry range |
 | `/closed_trades [today\|session]` | Closed trades (default: today AEST) — per trade: id, asset, debit, pnl, close reason — PnL is net of all fees |
 | `/status` | Trading mode, drain/drain-and-new mode, paused/running, uptime, open count, today AEST PnL (net of fees), session PnL since bot start, cumulative session fees paid |
+| `/pnl` | Equity-curve chart (PNG): cumulative realized PnL across all closed trades as a black line, plus current unrealized PnL from open positions as a dotted green line, captioned with realized/unrealized/total figures and open trade count |
 | `/help` | Lists every available command with a one-line description |
 | `/stop_bot` | Pauses scan and monitor ticks; the feed and listener remain alive; positions are not closed |
 | `/start_bot` | Resumes normal scanning and monitoring |
@@ -167,6 +168,8 @@ The bot accepts incoming commands from the same Telegram chat it uses for outgoi
 
 `/drain_and_new` differs from `/start_drain` in that new entries are still allowed — existing positions are closed outright at stop/TP/expiry rather than rolled, but the scanner continues to find and enter new setups. An optional `portfolio=N` argument overrides the live account cash used for position sizing.
 
+`/pnl` sends an image rather than text. The black line is the running total of realized PnL for every trade the bot has ever closed, in chronological order. If any positions are currently open, a dotted green line extends from the last realized point to the present, showing where total equity stands including unrealized gains/losses; the caption notes how many positions are open. With no trading history yet, it replies with text instead of an empty chart.
+
 Typing `/` in the Telegram chat will show a suggestion menu listing all commands — this is populated automatically when the bot starts via Telegram's `setMyCommands` API, with no manual BotFather setup required.
 
 The bot can also be started in drain mode from the command line with `python bot.py --drain`, which is equivalent to setting the `DRAIN_MODE` env var.
@@ -177,7 +180,7 @@ The bot can also be started in drain mode from the command line with `python bot
 
 - Python 3.11+
 - Deribit account (paper or live) with API key
-- Dependencies: `websockets`, `aiohttp`, `apscheduler`, `scipy`, `numpy`
+- Dependencies: `websockets`, `aiohttp`, `apscheduler`, `scipy`, `numpy`, `matplotlib` (chart rendering for `/pnl`)
 
 ---
 

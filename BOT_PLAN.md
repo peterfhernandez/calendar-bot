@@ -716,8 +716,9 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Secret leak prevention in logs (11)** | **< 0.5 day** | **Done** |
 | **Parallel mode isolation — --env/--db/--log/--config (12)** | **< 0.5 day** | **Done** |
 | **Fee-inclusive PnL display (13)** | **< 0.5 day** | **Done** |
+| **`/pnl` equity-curve chart (16)** | **1–1.5 days** | **Not started** |
 | Testing + paper trading validation | 3–5 days | Not started |
-| **Total remaining** | **~3–5 days** | |
+| **Total remaining** | **~4–6.5 days** | |
 
 ---
 
@@ -882,3 +883,65 @@ Previously `Fees: $3.11` appeared on the line above a PnL that ignored it; now t
 **`telegram_cmd/handlers.py` — `handle_status()`**
 
 Added a `Fees (session): $X.XX` line so the operator can see cumulative session fees alongside the net PnL figures.
+
+---
+
+## Phase 16 — `/pnl` Equity-Curve Chart
+
+Every existing Telegram command is text-only. `/pnl` is the first command that returns an image: a chart of the bot's entire trading history, so the operator can see the shape of the equity curve at a glance (drawdowns, streaks, overall trend) rather than scrolling `/closed_trades` output.
+
+### Requirements recap
+
+- All historical closed trades and their PnL
+- Accumulated realized gains/losses as a black line
+- Current unrealized PnL from open positions as a dotted green line, labelled with the open trade count
+- Delivered as an image inside Telegram, not a text message
+
+### Data flow
+
+```
+db/state.py: get_all_closed_trades()  ──▶  cumulative realized series (black line)
+db/state.py: get_open_trades()        ──┐
+data/chain_cache.py: ChainCache       ──┴─▶  total unrealized PnL + open count (dotted green segment)
+                                            │
+                                            ▼
+                              telegram_cmd/pnl_chart.py: render_pnl_chart()
+                                            │
+                                            ▼
+                          telegram_cmd/handlers.py: handle_pnl() → reply_photo()
+```
+
+No new database columns are needed. `pnl` on `calendar_trades` is already net of fees (Phase 13) and already includes roll P&L (Phase 14) by the time a trade is closed, so the black line is a straight running sum of an existing column — the only new query is `get_all_closed_trades()`, an unbounded version of the existing `get_trades_closed_since()` pattern, ordered by `date_close`.
+
+The unrealized figure reuses the exact formula already used by `/portfolio` and `/positions`: `(spread_val − net_debit×qty − open_fees) + roll_pnl` per open trade, where `spread_val` comes from live `ChainCache` mid prices with the `last_spread_value` stale-cache fallback added in Phase 15. Rather than duplicate that formula a third time, it's factored into a shared helper that both `handle_portfolio` and the new `compute_unrealized()` call.
+
+### Why matplotlib, why `Agg`, why in-memory
+
+- `matplotlib` is the natural choice for a two-series line chart with mixed line styles (solid black / dotted green) and is a mature, well-documented dependency — no new service or external API needed.
+- The bot runs headless (Windows service / background process, no display attached), so the backend must be set to the non-interactive `Agg` renderer **before** `pyplot` is imported anywhere in the process. This is set once at the top of the new `telegram_cmd/pnl_chart.py` module.
+- The chart is rendered straight to an `io.BytesIO` PNG buffer and handed to `update.message.reply_photo()` — nothing is written to disk in the live code path, keeping the command side-effect-free and avoiding any cleanup/temp-file logic. (The scratch script is the one place a PNG is saved to disk, for visual inspection during development.)
+
+### Chart construction
+
+- x-axis: `date_close` of each closed trade, chronological
+- y-axis: cumulative net PnL in USD, with a horizontal reference line at $0
+- Black solid line: running sum of `pnl` across `get_all_closed_trades()`
+- Dotted green line: a two-point segment `(last realized date, cumulative realized)` → `(now, cumulative realized + total unrealized)`, drawn only when `open_count > 0`
+- Legend/caption: realized total, unrealized total, combined total, and open trade count in plain text under the image (Telegram photo caption), so the headline numbers are readable without zooming into the image
+- No closed trades yet: `handle_pnl` skips the chart entirely and replies with text ("No closed trades yet." plus unrealized summary if any positions are open) — an empty chart with no data series is not a useful image
+
+### New/changed files
+
+| File | Change |
+| --- | --- |
+| `db/state.py` | + `get_all_closed_trades()` |
+| `telegram_cmd/pnl_chart.py` | new — `build_cumulative_series()`, `compute_unrealized()`, `render_pnl_chart()` |
+| `telegram_cmd/handlers.py` | + `handle_pnl()` |
+| `telegram_cmd/listener.py` | + `/pnl` entry in `COMMAND_REGISTRY`, `cmd_pnl` wiring |
+| `requirements.txt` | + `matplotlib>=3.8` |
+
+### Risks / open questions
+
+- **Trade volume vs. chart readability** — with hundreds of closed trades the x-axis will need date-tick thinning/rotation; not a blocker, just a rendering-polish detail to get right in implementation.
+- **Telegram photo size limits** — a single-figure PNG line chart is well within Telegram's 10 MB photo limit; no compression tuning expected to be necessary.
+- **Testing rendered images** — unit tests assert on the PNG header bytes and on the pure data-prep functions (`build_cumulative_series`, `compute_unrealized`) rather than pixel content, consistent with how the rest of the test suite avoids asserting on rendered output.
