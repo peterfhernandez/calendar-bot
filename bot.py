@@ -120,6 +120,15 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
     except Exception as exc:
         logger.warning("Startup notification failed (non-fatal): %s", exc)
 
+    # Verify Telegram is configured and working; log prominent warning if not
+    if config.TELEGRAM_TOKEN and config.TELEGRAM_CHAT:
+        logger.info("Telegram notifications enabled for chat %s", config.TELEGRAM_CHAT)
+    else:
+        logger.warning(
+            "⚠️  Telegram notifications DISABLED: TELEGRAM_TOKEN or TELEGRAM_CHAT not configured. "
+            "Position entries/closes will NOT send notifications. Check your .env file."
+        )
+
     cache = ChainCache(ttl=config.CHAIN_CACHE_TTL_SEC)
 
     # Include any asset with open positions so the feed subscribes to its

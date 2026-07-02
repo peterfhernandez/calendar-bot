@@ -47,6 +47,9 @@ class CalendarTrade:
     ev_score_at_roll: float = field(default=0.0)
     roll_pnl: float = field(default=0.0)
     last_spread_value: float = field(default=0.0)
+    close_status: str = field(default="open")  # "open", "closed", "close_stuck"
+    close_error_reason: Optional[str] = field(default=None)  # Why close failed
+    manual_close_spread: Optional[float] = field(default=None)  # User-entered close value
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -89,7 +92,10 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 ev_score_initial REAL    NOT NULL DEFAULT 0.0,
                 ev_score_at_roll REAL    NOT NULL DEFAULT 0.0,
                 roll_pnl         REAL    NOT NULL DEFAULT 0.0,
-                last_spread_value REAL   NOT NULL DEFAULT 0.0
+                last_spread_value REAL   NOT NULL DEFAULT 0.0,
+                close_status     TEXT    NOT NULL DEFAULT 'open',
+                close_error_reason TEXT,
+                manual_close_spread REAL
             )
         """)
         # Migrations: add new columns to existing databases
@@ -99,6 +105,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
             ("ev_score_at_roll", "REAL NOT NULL DEFAULT 0.0"),
             ("roll_pnl", "REAL NOT NULL DEFAULT 0.0"),
             ("last_spread_value", "REAL NOT NULL DEFAULT 0.0"),
+            ("close_status", "TEXT NOT NULL DEFAULT 'open'"),
+            ("close_error_reason", "TEXT"),
+            ("manual_close_spread", "REAL"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE calendar_trades ADD COLUMN {col_name} {col_type}")
@@ -138,6 +147,9 @@ def _row_to_trade(row: sqlite3.Row) -> CalendarTrade:
         ev_score_at_roll=row["ev_score_at_roll"] if row["ev_score_at_roll"] is not None else 0.0,
         roll_pnl=row["roll_pnl"] if row["roll_pnl"] is not None else 0.0,
         last_spread_value=row["last_spread_value"] if row["last_spread_value"] is not None else 0.0,
+        close_status=row["close_status"] if row["close_status"] is not None else "open",
+        close_error_reason=row["close_error_reason"],
+        manual_close_spread=row["manual_close_spread"],
     )
 
 
@@ -470,3 +482,132 @@ def get_calendar_stats(asset: Optional[str] = None, db_path: Path = DB_PATH) -> 
         "total_pnl": total_pnl,
         "avg_pnl":   total_pnl / len(pnls) if pnls else 0.0,
     }
+
+
+def mark_position_close_stuck(
+    trade_id: int,
+    error_reason: str,
+    intended_close_reason: str = "manual",
+    db_path: Path = DB_PATH,
+) -> CalendarTrade:
+    """
+    Mark a position as stuck (unable to close) due to an error.
+
+    Instead of force-closing the position in the DB, marks it as needing manual intervention.
+    The position remains open in Deribit but the DB tracks that a close was attempted.
+
+    Parameters
+    ----------
+    trade_id : int
+        ID of the position that failed to close
+    error_reason : str
+        Description of why the close failed (e.g., "Deribit API timeout", "Position not found")
+    intended_close_reason : str
+        Why the close was attempted (e.g., "stop-loss", "take-profit", "expiry", "manual")
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE calendar_trades
+            SET close_status = 'close_stuck', close_error_reason = ?
+            WHERE id = ?
+            """,
+            (error_reason, trade_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Calendar trade ID {trade_id} not found")
+    return _row_to_trade(row)
+
+
+def mark_position_manually_closed(
+    trade_id: int,
+    spread_value: float,
+    close_reason: str = "manual",
+    db_path: Path = DB_PATH,
+) -> CalendarTrade:
+    """
+    Mark a stuck position as manually closed by the user.
+
+    Updates the position with the user-provided spread value and calculates P&L accordingly.
+    This reconciles the DB with the actual Deribit state after manual close.
+
+    Parameters
+    ----------
+    trade_id : int
+        ID of the position being closed manually
+    spread_value : float
+        The actual spread value at close (far_mid - near_mid) * qty
+    close_reason : str
+        Why the position was closed (e.g., "manual", "stop-loss", "take-profit")
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        # Fetch the open position to calculate P&L
+        trade = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        if not trade:
+            raise ValueError(f"Calendar trade ID {trade_id} not found")
+
+        # Calculate P&L: spread_value - net_debit - open_fees - close_fees
+        # (close_fees would be estimated; we'll use 0 for manual close)
+        pnl = spread_value - (trade["net_debit"] * trade["qty"]) - trade["open_fees"]
+
+        # Update position as closed
+        conn.execute(
+            """
+            UPDATE calendar_trades
+            SET close_status = 'closed',
+                manual_close_spread = ?,
+                date_close = ?,
+                pnl = ?,
+                result = ?,
+                close_error_reason = NULL
+            WHERE id = ?
+            """,
+            (
+                spread_value,
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                pnl,
+                close_reason.title(),
+                trade_id,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+    return _row_to_trade(row)
+
+
+def get_stuck_positions(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """
+    Fetch all positions marked as close_stuck (failed close, awaiting manual intervention).
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM calendar_trades WHERE close_status = 'close_stuck' ORDER BY date_open DESC"
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def reset_close_stuck_position(trade_id: int, db_path: Path = DB_PATH) -> None:
+    """
+    Reset a stuck position so the bot can retry closing it.
+
+    Used when the user runs `/close trade_id=N` to tell the bot to try again.
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE calendar_trades
+            SET close_status = 'open', close_error_reason = NULL
+            WHERE id = ?
+            """,
+            (trade_id,),
+        )

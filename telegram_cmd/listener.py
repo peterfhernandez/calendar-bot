@@ -46,6 +46,9 @@ COMMAND_REGISTRY: list[tuple[str, str]] = [
     ("start_drain",       "Drain mode — no new entries or rolls; existing positions close at stop/TP/expiry"),
     ("start_with_assets", "Override asset list and resume: /start_with_assets BTC,ETH,SOL"),
     ("drain_and_new",     "Close existing positions (no rolls) but allow new entries: /drain_and_new portfolio=N assets=BTC,ETH"),
+    ("info",              "Check position status on Deribit: /info trade_id=N"),
+    ("close",             "Retry closing a stuck position: /close trade_id=N"),
+    ("close_manually",    "Manually close position with known spread: /close_manually trade_id=N spread=VALUE"),
     ("help",              "List all available commands with descriptions"),
 ]
 
@@ -157,6 +160,18 @@ class TelegramCommandListener:
             await handlers.handle_drain_and_new(update, context, engine)
 
         @_require_authorized_chat
+        async def cmd_info(update, context):
+            await handlers.handle_info(update, context, cache, db_path)
+
+        @_require_authorized_chat
+        async def cmd_close(update, context):
+            await handlers.handle_close(update, context, engine, db_path)
+
+        @_require_authorized_chat
+        async def cmd_close_manually(update, context):
+            await handlers.handle_close_manually(update, context, engine, db_path)
+
+        @_require_authorized_chat
         async def cmd_help(update, context):
             await handlers.handle_help(update, context)
 
@@ -170,6 +185,9 @@ class TelegramCommandListener:
         app.add_handler(CommandHandler("start_drain",       cmd_start_drain))
         app.add_handler(CommandHandler("start_with_assets", cmd_start_with_assets))
         app.add_handler(CommandHandler("drain_and_new",     cmd_drain_and_new))
+        app.add_handler(CommandHandler("info",              cmd_info))
+        app.add_handler(CommandHandler("close",             cmd_close))
+        app.add_handler(CommandHandler("close_manually",    cmd_close_manually))
         app.add_handler(CommandHandler("help",              cmd_help))
 
         return app

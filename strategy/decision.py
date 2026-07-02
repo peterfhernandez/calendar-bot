@@ -46,6 +46,7 @@ from db.state import (
     get_calendar_stats,
     list_assets_with_open_positions,
     load_calendar_state,
+    mark_position_close_stuck,
     update_last_spread_value,
     update_near_leg,
     DB_PATH,
@@ -216,6 +217,7 @@ class DecisionEngine:
         self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
         self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
         self._close_roll_failures: dict[int, int] = {}  # trade_id → attempt count; prevents unbounded close/roll retry loops
+        self._notified_stuck: set[int] = set()  # trade IDs already notified about being stuck; prevents spam
         self._paused: bool = False
         self._start_time: datetime = datetime.now(timezone.utc)
 
@@ -604,10 +606,14 @@ class DecisionEngine:
             trade.qty, trade.net_debit, open_fees_usd, candidate.ev_score,
         )
         if self._notifier:
-            self._notifier.notify_entry(
-                trade.id, trade.asset, trade.option_type,
-                trade.strike, trade.qty, trade.net_debit,
-            )
+            try:
+                self._notifier.notify_entry(
+                    trade.id, trade.asset, trade.option_type,
+                    trade.strike, trade.qty, trade.net_debit,
+                )
+                logger.info("Entry notification queued for trade_id=%s", trade.id)
+            except Exception as exc:
+                logger.error("⚠️  NOTIFICATION FAILED on entry of trade_id=%s: %s", trade.id, exc)
         return trade
 
     # ── Monitor logic ─────────────────────────────────────────────────────────
@@ -731,22 +737,33 @@ class DecisionEngine:
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= 3:
                 logger.error(
-                    "trade_id=%d stop-loss close failed %d times — halting retries, force-closing",
+                    "trade_id=%d stop-loss close failed %d times — marking as stuck for manual intervention",
                     trade_id, failure_count,
                 )
-                # Force-close without calling executor (it's been tried 3 times already)
-                close_calendar_trade(
+                # Mark as stuck instead of force-closing
+                mark_position_close_stuck(
                     trade_id=trade_id,
-                    date_close=date.today(),
-                    spot_close=spot,
-                    pnl=0.0,
-                    result="Loss (Stop retry limit exceeded)",
-                    notes="Stop-loss retry limit exceeded — force-closed",
-                    close_fees=0.0,
+                    error_reason=f"Stop-loss close failed after {failure_count} attempts — position needs manual close on Deribit",
+                    intended_close_reason="stop-loss",
                     db_path=self._db_path,
                 )
                 self._close_roll_failures.pop(trade_id, None)
-                return f"trade_id={trade_id} force-closed after 3 close failures", 0.0
+
+                # Notify user about stuck position (only once, not every monitor tick)
+                if trade_id not in self._notified_stuck and self._notifier:
+                    try:
+                        self._notifier.notify_close_stuck(
+                            trade_id=trade_id,
+                            asset=pos.get("asset", ""),
+                            strike=pos.get("strike", 0.0),
+                            reason="Stop-loss trigger",
+                            error=f"Close failed after {failure_count} attempts",
+                        )
+                        self._notified_stuck.add(trade_id)
+                    except Exception as exc:
+                        logger.error("Failed to notify about stuck position: %s", exc)
+
+                return f"trade_id={trade_id} marked as close_stuck (stop-loss)", 0.0
 
             result = self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv)
             if "FAILED" in result:
@@ -759,22 +776,33 @@ class DecisionEngine:
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= 3:
                 logger.error(
-                    "trade_id=%d take-profit close failed %d times — halting retries, force-closing",
+                    "trade_id=%d take-profit close failed %d times — marking as stuck for manual intervention",
                     trade_id, failure_count,
                 )
-                # Force-close without calling executor (it's been tried 3 times already)
-                close_calendar_trade(
+                # Mark as stuck instead of force-closing
+                mark_position_close_stuck(
                     trade_id=trade_id,
-                    date_close=date.today(),
-                    spot_close=spot,
-                    pnl=0.0,
-                    result="Win (TP retry limit exceeded)",
-                    notes="Take-profit retry limit exceeded — force-closed",
-                    close_fees=0.0,
+                    error_reason=f"Take-profit close failed after {failure_count} attempts — position needs manual close on Deribit",
+                    intended_close_reason="take-profit",
                     db_path=self._db_path,
                 )
                 self._close_roll_failures.pop(trade_id, None)
-                return f"trade_id={trade_id} force-closed after 3 close failures", 0.0
+
+                # Notify user about stuck position (only once, not every monitor tick)
+                if trade_id not in self._notified_stuck and self._notifier:
+                    try:
+                        self._notifier.notify_close_stuck(
+                            trade_id=trade_id,
+                            asset=pos.get("asset", ""),
+                            strike=pos.get("strike", 0.0),
+                            reason="Take-profit trigger",
+                            error=f"Close failed after {failure_count} attempts",
+                        )
+                        self._notified_stuck.add(trade_id)
+                    except Exception as exc:
+                        logger.error("Failed to notify about stuck position: %s", exc)
+
+                return f"trade_id={trade_id} marked as close_stuck (take-profit)", 0.0
 
             result = self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv)
             if "FAILED" in result:
@@ -902,14 +930,16 @@ class DecisionEngine:
             try:
                 asset  = pos.get("asset", "")
                 strike = pos.get("strike", 0.0)
+                notification_type = "take-profit" if "Take-profit" in reason else "stop-loss" if "Stop-loss" in reason else "close"
                 if "Take-profit" in reason:
                     self._notifier.notify_take_profit(trade_id, asset, strike, pnl)
                 elif "Stop-loss" in reason:
                     self._notifier.notify_stop(trade_id, asset, strike, pnl)
                 else:
                     self._notifier.notify_close(trade_id, asset, strike, pnl, reason)
+                logger.info("Notification queued for position close: type=%s trade_id=%s", notification_type, trade_id)
             except Exception as exc:
-                logger.warning("Notification failed on close: %s", exc)
+                logger.error("⚠️  NOTIFICATION FAILED on close of trade_id=%s: %s", trade_id, exc)
 
         # Clear any accumulated roll/close failure count for this position
         self._close_roll_failures.pop(trade_id, None)
@@ -1043,8 +1073,9 @@ class DecisionEngine:
                         trade_id, pos.get("asset", ""),
                         pos.get("strike", 0.0), new_near_instr,
                     )
+                    logger.info("Roll notification queued for trade_id=%s", trade_id)
                 except Exception as exc:
-                    logger.warning("notify_roll failed: %s", exc)
+                    logger.error("⚠️  NOTIFICATION FAILED on roll of trade_id=%s: %s", trade_id, exc)
         return success
 
     # ── Daily loss limit ──────────────────────────────────────────────────────

@@ -798,6 +798,7 @@ class TestSetMyCommands:
             "positions", "closed_trades", "new_trades", "status",
             "portfolio", "stop_bot", "start_bot", "start_drain",
             "start_with_assets", "drain_and_new", "help",
+            "info", "close", "close_manually",  # stuck position recovery commands
         }
         assert expected == command_names
 
@@ -894,3 +895,128 @@ class TestSetMyCommands:
         assert built_apps, "builder.build() was never called"
         assert built_apps[0]._conn_t <= 10.0, "connect timeout should be short"
         assert built_apps[0]._read_t <= 10.0, "read timeout should be short"
+
+
+# ── Stuck Position Handling ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_close_resets_close_stuck_flag():
+    """Test /close command resets close_stuck flag in database and clears notification flag."""
+    from db.state import mark_position_close_stuck
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        init_db(db_path)
+
+        # Create a trade using the test fixture
+        trade = _make_trade(trade_id=42, asset="BTC")
+
+        # Insert it into the database
+        from db.state import create_calendar_trade
+        db_trade = create_calendar_trade(
+            asset=trade.asset,
+            date_open=datetime.fromisoformat(trade.date_open).date(),
+            option_type=trade.option_type,
+            strike=trade.strike,
+            expiry_near=trade.expiry_near,
+            expiry_far=trade.expiry_far,
+            near_days=1,
+            far_days=7,
+            qty=trade.qty,
+            spot_open=100000.0,
+            near_prem=0.01,
+            far_prem=0.02,
+            net_debit=trade.net_debit,
+            open_fees=trade.open_fees,
+            near_instrument=trade.near_instrument,
+            far_instrument=trade.far_instrument,
+            ev_score=trade.ev_score,
+            db_path=db_path,
+        )
+
+        # Mark it as stuck
+        mark_position_close_stuck(
+            trade_id=db_trade.id,
+            error_reason="Test close failure",
+            intended_close_reason="stop-loss",
+            db_path=db_path,
+        )
+
+        # Create engine and add to notified_stuck
+        mock_cache = MagicMock()
+        engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
+        engine._notified_stuck.add(db_trade.id)
+
+        # Mock Telegram update and context
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+        context.args = ["trade_id=" + str(db_trade.id)]
+
+        # Call handler
+        await handlers.handle_close(update, context, engine, db_path)
+
+        # Verify notification flag was cleared
+        assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
+
+        # Verify DB was updated
+        trades = get_open_trades(db_path)
+        assert len(trades) == 1
+        assert trades[0].close_status == "open", "close_status should be reset to 'open'"
+
+
+@pytest.mark.asyncio
+async def test_handle_close_manually_clears_notification_flag():
+    """Test /close_manually command clears notification flag from engine."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        init_db(db_path)
+
+        from db.state import create_calendar_trade
+
+        # Create a trade using the test fixture
+        trade = _make_trade(trade_id=43, asset="BTC")
+
+        # Insert it into the database
+        db_trade = create_calendar_trade(
+            asset=trade.asset,
+            date_open=datetime.fromisoformat(trade.date_open).date(),
+            option_type=trade.option_type,
+            strike=trade.strike,
+            expiry_near=trade.expiry_near,
+            expiry_far=trade.expiry_far,
+            near_days=1,
+            far_days=7,
+            qty=trade.qty,
+            spot_open=100000.0,
+            near_prem=0.01,
+            far_prem=0.02,
+            net_debit=trade.net_debit,
+            open_fees=trade.open_fees,
+            near_instrument=trade.near_instrument,
+            far_instrument=trade.far_instrument,
+            ev_score=trade.ev_score,
+            db_path=db_path,
+        )
+
+        # Create engine and add to notified_stuck
+        mock_cache = MagicMock()
+        engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
+        engine._notified_stuck.add(db_trade.id)
+
+        # Mock Telegram update and context
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+        context.args = ["trade_id=" + str(db_trade.id), "spread=0.0050"]
+
+        # Call handler
+        await handlers.handle_close_manually(update, context, engine, db_path)
+
+        # Verify notification flag was cleared
+        assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
+
+        # Verify position was closed
+        trades = get_open_trades(db_path)
+        assert len(trades) == 0, "Trade should be closed"
