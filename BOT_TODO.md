@@ -746,7 +746,7 @@ The `net_pnl=+0.0011` correctly includes the roll profit of `+0.0008` that was l
 
 All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field) previously reported gross PnL — the pure spread price movement — without deducting fees. The `open_fees` and `close_fees` columns existed and were correctly populated, but were never subtracted from any PnL figure. At BTC spot $100k with ~$30–$60 per round-trip in fees, this materially overstated profitability: a position showing `PnL=$+0.60` was actually `PnL=$-2.94` after fees.
 
-### Root causes fixed
+### Root causes fixed (continued)
 
 **`strategy/decision.py` — `_close_position()`**
 
