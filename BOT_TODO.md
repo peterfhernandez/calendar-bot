@@ -831,6 +831,5 @@ All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field
 
 ### Automate pull after PR
 
-- after a Pull Request is done, the windows runner will pull changes locally and restart the bot (all bots)
+- after a Pull Request is merged to master, the windows runner will pull changes locally and restart the bot (all bots)
 - restarts paper and testnet bots
-- this is not working as far as I know
