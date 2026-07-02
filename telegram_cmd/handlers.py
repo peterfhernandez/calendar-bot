@@ -92,6 +92,17 @@ async def handle_positions(
             if t.roll_pnl != 0.0:
                 pnl_note += f"  [unr=${unr_pnl:+.2f}  roll=${t.roll_pnl:+.2f}]"
             val_note   = f"sv=${spread_val:.2f}  {pnl_note}"
+        elif t.last_spread_value > 0.0:
+            # Cache is stale, but we have a last known spread value from the previous monitor tick
+            cost_basis = t.net_debit * t.qty + t.open_fees
+            unr_pnl    = t.last_spread_value - cost_basis
+            total_pnl  = unr_pnl + t.roll_pnl
+            pnl_pct    = (total_pnl / cost_basis * 100) if cost_basis else 0.0
+
+            pnl_note = f"PnL=${total_pnl:+.2f} ({pnl_pct:+.1f}%)"
+            if t.roll_pnl != 0.0:
+                pnl_note += f"  [unr=${unr_pnl:+.2f}  roll=${t.roll_pnl:+.2f}]"
+            val_note   = f"sv=${t.last_spread_value:.2f}*  {pnl_note}"  # asterisk indicates cached value
         else:
             val_note = "sv=N/A (stale cache)"
 

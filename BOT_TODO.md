@@ -462,6 +462,36 @@ Updated existing commands and added new runtime-control commands.
 
 ---
 
+## Phase 15 — Stale Cache Fallback for Telegram Positions
+
+When the `/positions` Telegram command is executed, the cache may show "stale" data if more than 30 seconds have passed since the last WebSocket update for a particular strike (common during low-volume periods). Instead of showing `sv=N/A (stale cache)`, the bot now stores the last known spread value from the previous monitor tick and displays it as a fallback.
+
+### Implementation
+
+- [x] Add `last_spread_value REAL NOT NULL DEFAULT 0.0` column to `calendar_trades` table
+  - [x] New field in `CalendarTrade` dataclass (`db/state.py`)
+  - [x] Database schema update with backward-compatible migration
+  - [x] New `update_last_spread_value(trade_id, spread_value)` function in `db/state.py`
+
+- [x] Update `_monitor_position()` to store the spread value after each calculation
+  - [x] Call `update_last_spread_value()` after computing spread status in `strategy/decision.py`
+  - [x] Logged as DEBUG if update fails (non-blocking)
+
+- [x] Update `/positions` handler to use last_spread_value as fallback
+  - [x] When cache is stale (`near_snap` or `far_snap` is None), check `t.last_spread_value`
+  - [x] If last_spread_value > 0, display it with an asterisk suffix `sv=$X.XX*` to indicate cached value
+  - [x] Only fall back to `sv=N/A (stale cache)` if both cache and last_spread_value are unavailable
+
+- [x] Test coverage
+  - [x] Updated `_make_trade()` test helper with `last_spread_value` parameter
+  - [x] All 474 tests passing
+
+### Result
+
+Telegram `/positions` output now shows a reasonable spread value even during cache staleness periods, improving visibility and reducing "N/A" noise.
+
+---
+
 ## Validation Phases
 
 ### Validation Phase 1 — Paper Trading Validation

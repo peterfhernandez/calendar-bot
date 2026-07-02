@@ -46,6 +46,7 @@ class CalendarTrade:
     ev_score_initial: float = field(default=0.0)
     ev_score_at_roll: float = field(default=0.0)
     roll_pnl: float = field(default=0.0)
+    last_spread_value: float = field(default=0.0)
 
 
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -87,7 +88,8 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 ev_score         REAL    NOT NULL DEFAULT 0.0,
                 ev_score_initial REAL    NOT NULL DEFAULT 0.0,
                 ev_score_at_roll REAL    NOT NULL DEFAULT 0.0,
-                roll_pnl         REAL    NOT NULL DEFAULT 0.0
+                roll_pnl         REAL    NOT NULL DEFAULT 0.0,
+                last_spread_value REAL   NOT NULL DEFAULT 0.0
             )
         """)
         # Migrations: add new columns to existing databases
@@ -96,6 +98,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
             ("ev_score_initial", "REAL NOT NULL DEFAULT 0.0"),
             ("ev_score_at_roll", "REAL NOT NULL DEFAULT 0.0"),
             ("roll_pnl", "REAL NOT NULL DEFAULT 0.0"),
+            ("last_spread_value", "REAL NOT NULL DEFAULT 0.0"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE calendar_trades ADD COLUMN {col_name} {col_type}")
@@ -134,6 +137,7 @@ def _row_to_trade(row: sqlite3.Row) -> CalendarTrade:
         ev_score_initial=row["ev_score_initial"] if row["ev_score_initial"] is not None else 0.0,
         ev_score_at_roll=row["ev_score_at_roll"] if row["ev_score_at_roll"] is not None else 0.0,
         roll_pnl=row["roll_pnl"] if row["roll_pnl"] is not None else 0.0,
+        last_spread_value=row["last_spread_value"] if row["last_spread_value"] is not None else 0.0,
     )
 
 
@@ -327,6 +331,20 @@ def update_near_leg(
             "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
         ).fetchone()
     return _row_to_trade(row)
+
+
+def update_last_spread_value(
+    trade_id: int,
+    last_spread_value: float,
+    db_path: Path = DB_PATH,
+) -> None:
+    """Update the last known spread value for a trade (used as fallback when cache is stale)."""
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE calendar_trades SET last_spread_value = ? WHERE id = ?",
+            (last_spread_value, trade_id),
+        )
 
 
 def get_open_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]:

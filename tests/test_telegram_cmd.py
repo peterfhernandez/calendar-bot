@@ -53,6 +53,7 @@ def _make_trade(
     ev_score_initial: float | None = None,
     ev_score_at_roll: float = 0.0,
     roll_pnl: float = 0.0,
+    last_spread_value: float = 0.0,
 ) -> CalendarTrade:
     # If ev_score_initial not explicitly set, use ev_score for backward compatibility
     if ev_score_initial is None:
@@ -87,6 +88,7 @@ def _make_trade(
         ev_score_initial=ev_score_initial,
         ev_score_at_roll=ev_score_at_roll,
         roll_pnl=roll_pnl,
+        last_spread_value=last_spread_value,
     )
 
 

@@ -46,6 +46,7 @@ from db.state import (
     get_calendar_stats,
     list_assets_with_open_positions,
     load_calendar_state,
+    update_last_spread_value,
     update_near_leg,
     DB_PATH,
 )
@@ -718,6 +719,13 @@ class DecisionEngine:
             pos.get("expiry_far", "?"),
             "" if market_sv is not None else "  [B-S fallback]",
         )
+
+        # Store the last known spread value for fallback when cache is stale
+        if sv is not None:
+            try:
+                update_last_spread_value(trade_id, sv, db_path=self._db_path)
+            except Exception as exc:
+                logger.debug("Failed to update last_spread_value for trade_id=%d: %s", trade_id, exc)
 
         if status == "stop":
             failure_count = self._close_roll_failures.get(trade_id, 0)
