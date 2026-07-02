@@ -50,7 +50,14 @@ def _make_trade(
     date_close: str | None = None,
     notes: str | None = None,
     ev_score: float = 0.15,
+    ev_score_initial: float | None = None,
+    ev_score_at_roll: float = 0.0,
+    roll_pnl: float = 0.0,
+    last_spread_value: float = 0.0,
 ) -> CalendarTrade:
+    # If ev_score_initial not explicitly set, use ev_score for backward compatibility
+    if ev_score_initial is None:
+        ev_score_initial = ev_score
     return CalendarTrade(
         id=trade_id,
         asset=asset,
@@ -78,6 +85,10 @@ def _make_trade(
         spot_close=None,
         pnl=pnl,
         ev_score=ev_score,
+        ev_score_initial=ev_score_initial,
+        ev_score_at_roll=ev_score_at_roll,
+        roll_pnl=roll_pnl,
+        last_spread_value=last_spread_value,
     )
 
 
@@ -196,26 +207,26 @@ class TestHandlePositions:
         text = update.message.reply_text.call_args[0][0]
         assert "BTC" in text
         assert "90000" in text
-        assert "ev=0.25" in text          # ev at end of line
-        assert text.index("ev=") > text.index("entry=")  # ev comes after entry
+        assert "ev_init=0.25" in text          # ev_init at end of line
+        assert text.index("ev_init=") > text.index("entry=")  # ev_init comes after entry
         assert "→" in text                # expiry range separator
         assert "Call" in text             # full type name
         assert "\n" not in text           # single line per trade
 
     @pytest.mark.asyncio
     async def test_positions_ev_na_for_untracked(self):
-        """Trades with ev_score=0.0 (pre-tracking default) show ev=N/A."""
+        """Trades with ev_score_initial=0.0 (pre-tracking default) show ev_init=N/A."""
         update  = _make_update()
         context = _make_context()
         cache   = _make_cache()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        trade = _make_trade(ev_score=0.0)
+        trade = _make_trade(ev_score_initial=0.0)
         with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
-        assert "ev=N/A" in text
+        assert "ev_init=N/A" in text
 
     @pytest.mark.asyncio
     async def test_positions_shows_full_option_type(self):

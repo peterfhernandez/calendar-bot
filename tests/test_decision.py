@@ -1465,11 +1465,17 @@ class TestRollFixes:
             mock_scan.return_value = [new_candidate]
             engine._try_roll(pos, spot=90_000.0)
 
-            # Fix 1: DB update called with new near details
-            mock_update.assert_called_once_with(
-                pos["trade_id"], new_near_instr, new_near_label,
-                db_path=engine._db_path,
-            )
+            # Fix 1: DB update called with new near details, roll_pnl, and new EV
+            # Note: roll_pnl will be calculated during the roll; we just verify the call was made
+            assert mock_update.call_count == 1
+            call_args = mock_update.call_args
+            assert call_args[0][0] == pos["trade_id"]  # trade_id
+            assert call_args[0][1] == new_near_instr   # new_near_instr
+            assert call_args[0][2] == new_near_label   # new_expiry_near
+            assert "roll_pnl" in call_args[1]           # roll_pnl kwarg
+            assert "ev_score_at_roll" in call_args[1]   # ev_score_at_roll kwarg
+            assert call_args[1]["db_path"] == engine._db_path
+
             # Fix 2: in-memory dict updated
             assert pos["near_instrument"] == new_near_instr
             assert pos["expiry_near"] == new_near_label
@@ -1666,6 +1672,129 @@ class TestCloseAfterExpiryRetryLimit:
 
         # Counter should be cleared on success
         assert engine._close_roll_failures.get(4) is None
+
+
+# ── Stop-loss / Take-profit close retry limit ────────────────────────────────
+
+class TestStopTpCloseRetryLimit:
+    """
+    When stop-loss or take-profit is triggered and close_spread fails repeatedly,
+    retries should be capped at 3 attempts. On the 4th failure, the position
+    should be force-closed without retrying.
+
+    This mirrors the expiry close retry logic but for triggered stop/TP conditions.
+    """
+
+    def _make_stopped_pos(self, trade_id: int = 5, asset: str = "BTC") -> dict:
+        """Create a position that will trigger stop-loss (30% of debit)."""
+        return {
+            "trade_id": trade_id,
+            "asset": asset,
+            "strike": 50_000.0,
+            "option_type": "Call",
+            "near_instrument": "BTC-3JUL26-50000-C",
+            "far_instrument": "BTC-31JUL26-50000-C",
+            "expiry_near": "3JUL26",
+            "expiry_far": "31JUL26",
+            "net_debit": 0.0086,
+            "qty": 1.0,
+            "open_fees": 0.00012,
+            "roll_pnl": 0.0,
+            "ev_score_initial": 0.0385,
+            "near_prem": 0.01,
+            "far_prem": 0.025,
+        }
+
+    def test_first_stop_close_failure_increments_counter(self):
+        """First failed stop-loss close increments counter to 1."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # close fails
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_stopped_pos(trade_id=5)
+
+        # Mock cache to return IV data for both legs via get_chain
+        near_snap = _make_snap(pos["near_instrument"], mark_iv=0.85)
+        far_snap = _make_snap(pos["far_instrument"], mark_iv=0.75)
+        chain = [near_snap, far_snap]
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 100_000.0
+            engine._cache.get_chain.return_value = chain
+            # Mock check_calendar_status to return "stop" status
+            with patch("strategy.decision.check_calendar_status", return_value=("stop", 0.00258, 0.30, "STOP")):
+                engine.monitor_tick()
+
+        assert engine._close_roll_failures.get(5) == 1
+
+    def test_third_stop_close_failure_increments_counter(self):
+        """Third failed stop-loss close increments counter to 3."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # close fails
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_stopped_pos(trade_id=5)
+        engine._close_roll_failures[5] = 2  # already failed twice
+
+        near_snap = _make_snap(pos["near_instrument"], mark_iv=0.85)
+        far_snap = _make_snap(pos["far_instrument"], mark_iv=0.75)
+        chain = [near_snap, far_snap]
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade"):
+            engine._cache.get_spot.return_value = 100_000.0
+            engine._cache.get_chain.return_value = chain
+            with patch("strategy.decision.check_calendar_status", return_value=("stop", 0.00258, 0.30, "STOP")):
+                engine.monitor_tick()
+
+        assert engine._close_roll_failures.get(5) == 3
+
+    def test_fourth_stop_close_failure_force_closes(self):
+        """On 4th failed stop-loss close, position is force-closed."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # close fails
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_stopped_pos(trade_id=5)
+        engine._close_roll_failures[5] = 3  # already failed 3 times
+
+        near_snap = _make_snap(pos["near_instrument"], mark_iv=0.85)
+        far_snap = _make_snap(pos["far_instrument"], mark_iv=0.75)
+        chain = [near_snap, far_snap]
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade") as mock_close:
+            engine._cache.get_spot.return_value = 100_000.0
+            engine._cache.get_chain.return_value = chain
+            with patch("strategy.decision.check_calendar_status", return_value=("stop", 0.00258, 0.30, "STOP")):
+                engine.monitor_tick()
+
+        # Position should have been force-closed
+        mock_close.assert_called_once()
+        # Counter should be cleared after force-close
+        assert 5 not in engine._close_roll_failures
+
+    def test_tp_close_retry_limit(self):
+        """Take-profit close also respects the 3-retry limit."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # close fails
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_stopped_pos(trade_id=6)
+        engine._close_roll_failures[6] = 3  # already failed 3 times
+
+        near_snap = _make_snap(pos["near_instrument"], mark_iv=0.85)
+        far_snap = _make_snap(pos["far_instrument"], mark_iv=0.75)
+        chain = [near_snap, far_snap]
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.close_calendar_trade") as mock_close:
+            engine._cache.get_spot.return_value = 100_000.0
+            engine._cache.get_chain.return_value = chain
+            # Mock TP status (150% of debit)
+            with patch("strategy.decision.check_calendar_status", return_value=("tp", 0.01290, 1.50, "TP")):
+                engine.monitor_tick()
+
+        # Position should be force-closed after 3 failures
+        mock_close.assert_called_once()
+        assert 6 not in engine._close_roll_failures
 
 
 # ── Per-asset overrides in the liquidity gate ─────────────────────────────────
