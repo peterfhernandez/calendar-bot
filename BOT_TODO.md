@@ -462,6 +462,36 @@ Updated existing commands and added new runtime-control commands.
 
 ---
 
+## Phase 15 — Stale Cache Fallback for Telegram Positions
+
+When the `/positions` Telegram command is executed, the cache may show "stale" data if more than 30 seconds have passed since the last WebSocket update for a particular strike (common during low-volume periods). Instead of showing `sv=N/A (stale cache)`, the bot now stores the last known spread value from the previous monitor tick and displays it as a fallback.
+
+### Implementation
+
+- [x] Add `last_spread_value REAL NOT NULL DEFAULT 0.0` column to `calendar_trades` table
+  - [x] New field in `CalendarTrade` dataclass (`db/state.py`)
+  - [x] Database schema update with backward-compatible migration
+  - [x] New `update_last_spread_value(trade_id, spread_value)` function in `db/state.py`
+
+- [x] Update `_monitor_position()` to store the spread value after each calculation
+  - [x] Call `update_last_spread_value()` after computing spread status in `strategy/decision.py`
+  - [x] Logged as DEBUG if update fails (non-blocking)
+
+- [x] Update `/positions` handler to use last_spread_value as fallback
+  - [x] When cache is stale (`near_snap` or `far_snap` is None), check `t.last_spread_value`
+  - [x] If last_spread_value > 0, display it with an asterisk suffix `sv=$X.XX*` to indicate cached value
+  - [x] Only fall back to `sv=N/A (stale cache)` if both cache and last_spread_value are unavailable
+
+- [x] Test coverage
+  - [x] Updated `_make_trade()` test helper with `last_spread_value` parameter
+  - [x] All 474 tests passing
+
+### Result
+
+Telegram `/positions` output now shows a reasonable spread value even during cache staleness periods, improving visibility and reducing "N/A" noise.
+
+---
+
 ## Validation Phases
 
 ### Validation Phase 1 — Paper Trading Validation
@@ -685,6 +715,7 @@ MAX_LOSS_PCT  = 0.005     # 0.5% max loss per trade (half the paper default)
 - [x] **`_async_close_spread` crashes on Deribit API error and leaves legs unclosed** — the near and far leg close orders at `execution/executor.py` lines 639 and 652 were not wrapped in try-except, so any API error (e.g. `-32602 Invalid params`) crashed the function and returned `None`. Worse, a partial fill (near closed but far timed out) left a naked position open. Three fixes: (1) Wrapped both `place_order()` calls in try-except to catch `RuntimeError` from Deribit API errors; (2) If the near leg fills but far times out, immediately submit a reverse sell to unwind the near leg; (3) If the far leg fills but near times out, immediately submit a reverse buy to unwind the far leg. This prevents naked leg exposure that can trigger unintended margin calls. Tests: `TestAsyncCloseSpreadPartialFill` (6 tests) in `tests/test_executor.py`.
 - [x] **Deploy workflow does not kill stale bot processes** — the GitHub Actions PowerShell script in `.github/workflows/deploy.yml` used `Get-Process -Name python` to find bot processes, but `Get-Process` does not populate the `CommandLine` property by default so the filter `$_.CommandLine -like '*bot.py*'` always failed silently. Result: new bot process started while stale process still held the port, causing errors. Three fixes: (1) Changed to `Get-CimInstance Win32_Process -Filter "Name='python.exe'"` which exposes `CommandLine` correctly; (2) Fixed path typos: `coderepoo` → `coderepo`, `bot_paper` → `bot-paper`; (3) Added `-WorkingDirectory` and `Start-Sleep -Seconds 2` between kill and restart for clean process shutdown. Tests: none (PowerShell workflow manual validation required).
 - [x] **Expired near leg close stuck in retry loop (issue #3, trade_id=4)** — when a near leg expires on Deribit (e.g. 3JUL26 as of 2026-07-01), the bot attempts to close but Deribit rejects with `-32602 Invalid params` (cannot trade expired instruments). The close-on-expiry path in `_monitor_position()` was not using the retry-limit logic that the roll path had; it would retry every monitor tick forever. Fixed by: (1) applying `_close_roll_failures` tracking to the expiry-close path; (2) capping failed attempts at 3 retries; (3) on 4th failure, force-closing the position by marking it as closed in the DB without calling the executor (which would fail anyway), breaking the infinite retry loop. This prevents naked leg accumulation and margin call risk from stuck positions. Tests: `TestCloseAfterExpiryRetryLimit` (5 tests) in `tests/test_decision.py`. Scratch: `scratch/scratch_expired_near_retry_limit.py`.
+- [x] **Stop-loss and take-profit close stuck in retry loop (trade_id=5 incident)** — when a stop-loss or take-profit close failed (e.g. error 10019 locked_by_admin), the stop/TP close paths in `_monitor_position()` did not use the retry-limit logic, causing 69+ consecutive close attempts over 1+ hours. Unlike expiry closes which used `_try_close()` (which had retry tracking), stop and TP closes called `_close_position()` directly without retry limiting. Fixed by: (1) adding `_close_roll_failures` tracking to both `if status == "stop":` and `if status == "tp":` blocks in `_monitor_position()`; (2) capping failed attempts at 3 retries; (3) on 4th failure, force-closing the position by calling `close_calendar_trade()` directly without executor retry. Tests: `TestStopTpCloseRetryLimit` (4 tests) in `tests/test_decision.py`.
 
 ---
 
