@@ -717,8 +717,9 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Parallel mode isolation — --env/--db/--log/--config (12)** | **< 0.5 day** | **Done** |
 | **Fee-inclusive PnL display (13)** | **< 0.5 day** | **Done** |
 | **`/pnl` equity-curve chart (16)** | **1–1.5 days** | **Not started** |
+| **Cross Portfolio Margin entry gate (17)** | **2–3.5 days** | **Not started** |
 | Testing + paper trading validation | 3–5 days | Not started |
-| **Total remaining** | **~4–6.5 days** | |
+| **Total remaining** | **~6–8.5 days** | |
 
 ---
 
@@ -986,3 +987,75 @@ The notification logic in `_monitor_position()` checked if the failure count rea
 Users receive exactly **one notification** when a position becomes stuck in a retry loop, preventing message spam. The notification flag is cleared when the user intervenes via `/close` or `/close_manually`, allowing them to be notified again if it gets stuck after reset.
 
 This directly addresses the critical feedback: **"I do not want a message to be sent every minute. When a position is marked as stuck, no further notifications should be sent"**
+## Phase 17 — Cross Portfolio Margin (X:PM) Entry Gate
+
+Two incidents already in this file's Bug Fixes section (the 2026-06-22 absurd-quantity halt and the 2026-07-01 close-after-roll margin call) happened despite `MAX_LOSS_PCT` and `MAX_TOTAL_RISK_PCT` being respected. That is because those sizing checks bound *capital paid* for a position, not the *margin Deribit actually requires to hold it*. On a Cross Portfolio Margin (X:PM) account the two numbers are different in kind, not just in magnitude — this phase adds a gate that checks the number Deribit actually uses to decide whether to liquidate the account.
+
+### What Deribit's Cross Portfolio Margin actually computes
+
+Per Deribit's own documentation (`support.deribit.com/hc/en-us/articles/25944756247837-Portfolio-Margin`, and the Portfolio Margin Engine whitepaper at `statics.deribit.com/files/DeribitPortfolioMarginModel.pdf`), X:PM does not margin positions individually. It:
+
+1. Treats the whole account — every currency, every instrument, and equity itself — as one portfolio in a single risk matrix.
+2. Stress-tests that portfolio against a grid of underlying price moves (9 buckets spanning a per-currency-pair Price Range, e.g. ±16% for BTC in 4 steps each side of zero) crossed with volatility-up / same / down scenarios.
+3. Adds an Extended Table for tail risk on far-OTM short option exposure (moves like -66%, +500%, with a per-bucket dampener and margin multiplier so only large short-option books are affected).
+4. Adds a Delta Shock (large uncorrelated directional exposure) and a Roll Shock (near-dated exposure that would need to be "rolled" through an adverse move), both computed per currency pair / base currency in USD.
+5. Takes the worst simulated scenario as Initial Margin; Maintenance Margin = Initial Margin × a factor (default 0.80). Breaching the Maintenance Margin ratio triggers liquidation.
+
+The critical implication for this bot: **the margin cost of a new calendar spread depends on what else is already in the portfolio**, because price-move and vol-shock P&L nets across positions in the same bucket before the worst-case is taken. A candidate that looks fine as an isolated debit can still be the one that tips an already-stressed portfolio over the Maintenance Margin line — and, conversely, a portfolio-margin-aware system could sometimes approve slightly more than a naive debit-sum check would allow, when the new position is genuinely offsetting. This bot only needs the *reject dangerous entries* half of that, not the optimization half.
+
+### Decision: query the exchange, don't reimplement the model
+
+The parameters behind every scenario above (Price Range per currency pair, Volatility Range Up/Down, Extended Dampener, Min Expiry Delta Shock / Annualised % Move Risk, Delta Total Liquidity Shock Threshold, Max Delta Shock) are live exchange settings, fetchable via `public/pme/get_params`, and can be changed by Deribit without notice. A local reimplementation of the risk matrix would need to track all of them, reproduce the exact bucket/dampener/haircut arithmetic, and would still silently drift the moment Deribit tunes a parameter — for a gate whose entire purpose is preventing forced liquidation, that drift risk is unacceptable. The gate instead asks Deribit's own API for the account's projected margin including the hypothetical new position, and only falls back to a local approximation when that call is unavailable.
+
+**Open item carried into BOT_TODO:** `docs.deribit.com/api-reference` renders via client-side JavaScript and could not be scraped during this planning session, so the exact "what-if margin" endpoint and its request/response schema (most likely `private/get_margins`, taking `instrument_name`/`amount`/`price`) is not yet confirmed. Implementation starts with a scratch probe against `test.deribit.com` to nail down the real schema before `PortfolioTracker.simulate_margin()` is written against it — this is called out explicitly as the first task in Phase 17 rather than assumed.
+
+### Fallback proxy, when the live simulation call isn't available
+
+```
+current_utilization   = maintenance_margin / equity
+projected_utilization = (maintenance_margin + candidate.net_debit × qty) / equity
+
+reject if current_utilization   > MAX_MARGIN_UTILIZATION_PCT
+reject if projected_utilization > MAX_MARGIN_UTILIZATION_PCT
+```
+
+This adds the candidate's own max loss (a purchased calendar spread's loss is bounded at the debit paid) as a floor on its margin contribution. It is deliberately a *safety backstop*, not a stand-in for the real PM number — it can be more conservative than Deribit's actual requirement (no correlation offset credit) in some cases and less conservative in others (it doesn't capture delta/roll shock contributions from a new leg), which is exactly why the primary path always tries the live simulation call first.
+
+`MAX_MARGIN_UTILIZATION_PCT` defaults to `0.80` — the same ratio Deribit uses as its own default Maintenance Margin Factor — so the bot's self-imposed ceiling matches the exchange's own headroom assumption rather than an arbitrary number.
+
+### Fail-open vs fail-closed
+
+The gate's behaviour when margin data can't be obtained depends on whether real money is at risk:
+
+| Mode | No `PortfolioTracker` / API failure |
+| --- | --- |
+| `paper` | Gate no-ops (there is no real account to liquidate) unless `MARGIN_GATE_ENABLED` is forced |
+| `test` / `live` | Gate fails **closed** — reject the candidate, log a warning |
+
+This mirrors the project's existing convention (`DERIBIT_PAPER`/`TRADING_MODE` gating on every scratch script) that paper mode is where experimentation is safe and test/live mode is where the bot must default to caution.
+
+### A wiring gap this phase must close first
+
+`DecisionEngine` already accepts an optional `portfolio: PortfolioTracker` (Phase 8b) and calls `portfolio.refresh()` at the top of `scan_tick()` when one is attached; `BotLoop` already forwards a `portfolio` constructor argument through to it. But `bot.py`'s `_run()` never actually constructs a `PortfolioTracker` or passes it to `BotLoop(...)` — the live account-linking code has existed since Phase 8b and has simply never been turned on. This gate is the first feature that actually needs it, so wiring `PortfolioTracker` into `bot.py` is listed as a prerequisite step in Phase 17 rather than a separate phase.
+
+### Where the gate is enforced
+
+`strategy/decision.py` gets a new `_check_margin_gate(candidate)`, deliberately mirroring the existing `_check_liquidity_gate(candidate)` — same `str | None` rejection-reason return, same call site pattern. It is invoked in two places:
+
+- `scan_tick()`'s RANK loop, immediately after `_check_liquidity_gate()` — a rejected candidate is skipped, not fatal to the scan pass.
+- `_try_roll()`, alongside the existing `_check_liquidity_gate()` reuse there — because a roll changes portfolio composition just as much as a fresh entry does, and the 2026-07-01 incident was specifically a post-roll margin call.
+
+### New/changed files
+
+| File | Change |
+| --- | --- |
+| `portfolio/tracker.py` | + `maintenance_margin_usd`, `margin_utilization_pct`, `simulate_margin()`, `MarginImpact` |
+| `bot.py` | instantiate `PortfolioTracker`, pass `portfolio=` to `BotLoop` |
+| `config.py` | + `MAX_MARGIN_UTILIZATION_PCT`, `MARGIN_GATE_ENABLED`, `MARGIN_GATE_REQUIRED_LIVE` |
+| `strategy/decision.py` | + `_check_margin_gate()`, called from `scan_tick()` and `_try_roll()` |
+
+### Risks / open questions
+
+- **Unconfirmed API schema** — the primary "what-if margin" call must be verified against the live test-exchange API before the gate can be built with confidence; treated as the first implementation task, not an afterthought.
+- **Rate limits** — a live margin-simulation call per candidate per scan cycle adds REST calls beyond what `PortfolioTracker.refresh()` already makes; may need caching or batching if the candidate list is large per scan.
+- **Proxy accuracy** — the fallback formula is a safety backstop, not a faithful PM simulation; it should be treated as deliberately conservative rather than precise, and the primary live-simulation path should be preferred whenever available.
