@@ -881,3 +881,49 @@ All PnL metrics (Telegram commands, internal engine accumulators, DB `pnl` field
 
 - after a Pull Request is merged to master, the windows runner will pull changes locally and restart the bot (all bots)
 - restarts paper and testnet bots
+
+## Phase 17 — Telegram Notification Reliability Improvements
+
+**Problem:** Notifications for position entries/closes were not being reliably delivered, especially overnight. Fire-and-forget async tasks had no error tracking or retry logic.
+
+**Fixes Implemented:**
+
+- [x] **Retry logic** — Telegram sends now retry up to 2 times with 1-second delays on transient failures (timeouts, rate limits)
+- [x] **Better error tracking** — Added callback-based task result tracking; failed sends now log ERROR level messages
+- [x] **Startup verification** — Prominent warning logged if TELEGRAM_TOKEN or TELEGRAM_CHAT is missing/unconfigured
+- [x] **Enhanced logging** — Entry/close/roll notifications now log success (INFO) and failure (ERROR) with trade_id
+- [x] **Diagnostic tools**
+  - [x] `scratch/diagnose_telegram_notifications.py` — automated checks for configuration, API connectivity, message delivery
+  - [x] `TELEGRAM_DEBUGGING_GUIDE.md` — comprehensive troubleshooting guide with common failure modes and solutions
+
+**Why notifications were missing overnight:**
+
+1. No retry on transient failures (network timeouts)
+2. Fire-and-forget async tasks had no way to report failures
+3. Missing startup verification meant credential issues went unnoticed
+4. Weak error logging made failures hard to diagnose
+5. Possible `.env` file missing or misconfigured
+
+**Testing notification delivery:**
+
+```bash
+# 1. Run diagnostic to verify setup
+python3 scratch/diagnose_telegram_notifications.py
+
+# 2. Start bot and watch logs
+python bot.py
+tail -f logs/bot.log | grep -E "(notification|Telegram|ERROR)"
+
+# 3. Check that startup shows:
+# INFO Telegram notifications enabled for chat 123456789
+
+# 4. Trigger a position close and verify:
+# INFO Notification queued for position close: type=close trade_id=42
+# INFO Telegram message sent to chat 123456789 (subject: ...)
+```
+
+If notifications still fail to arrive:
+1. Run `python3 scratch/diagnose_telegram_notifications.py` for automated diagnosis
+2. Check `logs/bot.log` for ERROR messages with ⚠️ prefix
+3. Verify `.env` has valid TELEGRAM_TOKEN and TELEGRAM_CHAT
+4. See TELEGRAM_DEBUGGING_GUIDE.md for detailed solutions
