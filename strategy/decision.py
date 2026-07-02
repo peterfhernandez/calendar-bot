@@ -217,6 +217,7 @@ class DecisionEngine:
         self._just_entered: set[int] = set()    # trade IDs entered in the current scan tick; skipped by the immediately-following monitor tick
         self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
         self._close_roll_failures: dict[int, int] = {}  # trade_id → attempt count; prevents unbounded close/roll retry loops
+        self._notified_stuck: set[int] = set()  # trade IDs already notified about being stuck; prevents spam
         self._paused: bool = False
         self._start_time: datetime = datetime.now(timezone.utc)
 
@@ -748,8 +749,8 @@ class DecisionEngine:
                 )
                 self._close_roll_failures.pop(trade_id, None)
 
-                # Notify user about stuck position
-                if self._notifier:
+                # Notify user about stuck position (only once, not every monitor tick)
+                if trade_id not in self._notified_stuck and self._notifier:
                     try:
                         self._notifier.notify_close_stuck(
                             trade_id=trade_id,
@@ -758,6 +759,7 @@ class DecisionEngine:
                             reason="Stop-loss trigger",
                             error=f"Close failed after {failure_count} attempts",
                         )
+                        self._notified_stuck.add(trade_id)
                     except Exception as exc:
                         logger.error("Failed to notify about stuck position: %s", exc)
 
@@ -786,8 +788,8 @@ class DecisionEngine:
                 )
                 self._close_roll_failures.pop(trade_id, None)
 
-                # Notify user about stuck position
-                if self._notifier:
+                # Notify user about stuck position (only once, not every monitor tick)
+                if trade_id not in self._notified_stuck and self._notifier:
                     try:
                         self._notifier.notify_close_stuck(
                             trade_id=trade_id,
@@ -796,6 +798,7 @@ class DecisionEngine:
                             reason="Take-profit trigger",
                             error=f"Close failed after {failure_count} attempts",
                         )
+                        self._notified_stuck.add(trade_id)
                     except Exception as exc:
                         logger.error("Failed to notify about stuck position: %s", exc)
 

@@ -1749,7 +1749,7 @@ class TestStopTpCloseRetryLimit:
         assert engine._close_roll_failures.get(5) == 3
 
     def test_fourth_stop_close_failure_force_closes(self):
-        """On 4th failed stop-loss close, position is force-closed."""
+        """On 4th failed stop-loss close, position is marked as stuck."""
         executor = MagicMock()
         executor.close_spread.return_value = None  # close fails
         engine, _ = _make_engine(executor=executor)
@@ -1761,16 +1761,18 @@ class TestStopTpCloseRetryLimit:
         chain = [near_snap, far_snap]
 
         with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
-             patch("strategy.decision.close_calendar_trade") as mock_close:
+             patch("strategy.decision.mark_position_close_stuck") as mock_stuck:
             engine._cache.get_spot.return_value = 100_000.0
             engine._cache.get_chain.return_value = chain
             with patch("strategy.decision.check_calendar_status", return_value=("stop", 0.00258, 0.30, "STOP")):
                 engine.monitor_tick()
 
-        # Position should have been force-closed
-        mock_close.assert_called_once()
-        # Counter should be cleared after force-close
+        # Position should have been marked as stuck
+        mock_stuck.assert_called_once()
+        # Counter should be cleared
         assert 5 not in engine._close_roll_failures
+        # Position not in notified_stuck since no notifier is configured
+        # (but would be added if notifier existed)
 
     def test_tp_close_retry_limit(self):
         """Take-profit close also respects the 3-retry limit."""
@@ -1785,16 +1787,18 @@ class TestStopTpCloseRetryLimit:
         chain = [near_snap, far_snap]
 
         with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
-             patch("strategy.decision.close_calendar_trade") as mock_close:
+             patch("strategy.decision.mark_position_close_stuck") as mock_stuck:
             engine._cache.get_spot.return_value = 100_000.0
             engine._cache.get_chain.return_value = chain
             # Mock TP status (150% of debit)
             with patch("strategy.decision.check_calendar_status", return_value=("tp", 0.01290, 1.50, "TP")):
                 engine.monitor_tick()
 
-        # Position should be force-closed after 3 failures
-        mock_close.assert_called_once()
+        # Position should be marked as stuck after 3 failures
+        mock_stuck.assert_called_once()
         assert 6 not in engine._close_roll_failures
+        # Position not in notified_stuck since no notifier is configured
+        # (but would be added if notifier existed)
 
 
 # ── Per-asset overrides in the liquidity gate ─────────────────────────────────

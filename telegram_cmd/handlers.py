@@ -524,6 +524,8 @@ async def handle_close(
 
     try:
         reset_close_stuck_position(trade_id, db_path)
+        # Clear the notification flag so user gets notified again if it gets stuck again
+        engine._notified_stuck.discard(trade_id)
         await update.message.reply_text(
             f"✓ Trade #{trade_id} reset for retry.\n"
             f"Bot will attempt to close on next monitor tick (~1 minute)."
@@ -581,6 +583,8 @@ async def handle_close_manually(
     try:
         trade = mark_position_manually_closed(trade_id, spread_value, "manual", db_path)
         pnl = trade.pnl or 0.0
+        # Clear the notification flag since position is now resolved
+        engine._notified_stuck.discard(trade_id)
 
         await update.message.reply_text(
             f"✓ Trade #{trade_id} manually closed\n"
