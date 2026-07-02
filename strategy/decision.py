@@ -720,10 +720,60 @@ class DecisionEngine:
         )
 
         if status == "stop":
-            return self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv), 0.0
+            failure_count = self._close_roll_failures.get(trade_id, 0)
+            if failure_count >= 3:
+                logger.error(
+                    "trade_id=%d stop-loss close failed %d times — halting retries, force-closing",
+                    trade_id, failure_count,
+                )
+                # Force-close without calling executor (it's been tried 3 times already)
+                close_calendar_trade(
+                    trade_id=trade_id,
+                    date_close=date.today(),
+                    spot_close=spot,
+                    pnl=0.0,
+                    result="Loss (Stop retry limit exceeded)",
+                    notes="Stop-loss retry limit exceeded — force-closed",
+                    close_fees=0.0,
+                    db_path=self._db_path,
+                )
+                self._close_roll_failures.pop(trade_id, None)
+                return f"trade_id={trade_id} force-closed after 3 close failures", 0.0
+
+            result = self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv)
+            if "FAILED" in result:
+                self._close_roll_failures[trade_id] = failure_count + 1
+            else:
+                self._close_roll_failures.pop(trade_id, None)
+            return result, 0.0
 
         if status == "tp":
-            return self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv), 0.0
+            failure_count = self._close_roll_failures.get(trade_id, 0)
+            if failure_count >= 3:
+                logger.error(
+                    "trade_id=%d take-profit close failed %d times — halting retries, force-closing",
+                    trade_id, failure_count,
+                )
+                # Force-close without calling executor (it's been tried 3 times already)
+                close_calendar_trade(
+                    trade_id=trade_id,
+                    date_close=date.today(),
+                    spot_close=spot,
+                    pnl=0.0,
+                    result="Win (TP retry limit exceeded)",
+                    notes="Take-profit retry limit exceeded — force-closed",
+                    close_fees=0.0,
+                    db_path=self._db_path,
+                )
+                self._close_roll_failures.pop(trade_id, None)
+                return f"trade_id={trade_id} force-closed after 3 close failures", 0.0
+
+            result = self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv)
+            if "FAILED" in result:
+                self._close_roll_failures[trade_id] = failure_count + 1
+            else:
+                self._close_roll_failures.pop(trade_id, None)
+            return result, 0.0
 
         # Roll trigger: near leg approaching expiry and no exit signal yet.
         # In drain mode, skip rolling and close instead.
