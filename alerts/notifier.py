@@ -304,6 +304,7 @@ class Notifier:
         token = getattr(config, "TELEGRAM_TOKEN", "")
         chat  = getattr(config, "TELEGRAM_CHAT",  "")
         if not token or not chat:
+            logger.debug("Telegram alert skipped: token or chat not configured")
             return
 
         text = f"*[CalendarBot]* {subject}\n\n{body}"
@@ -312,24 +313,75 @@ class Notifier:
         # in a background thread if none is available.
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._post_telegram(token, chat, text))
+            # Create task with error handling callback
+            task = loop.create_task(self._post_telegram(token, chat, text, subject))
+            task.add_done_callback(lambda t: self._log_telegram_result(t, subject))
         except RuntimeError:
+            # No running event loop — create one in a background thread
             threading.Thread(
-                target=lambda: asyncio.run(self._post_telegram(token, chat, text)),
+                target=lambda: asyncio.run(self._post_telegram(token, chat, text, subject)),
                 daemon=True,
             ).start()
 
+    def _log_telegram_result(self, task, subject: str) -> None:
+        """Log the result of an async Telegram send task."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass  # task was cancelled, not an error
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Telegram notification for '%s' failed: %s", subject, exc)
+
     @staticmethod
-    async def _post_telegram(token: str, chat: str, text: str) -> None:
+    async def _post_telegram(token: str, chat: str, text: str, subject: str = "") -> bool:
+        """
+        Send a message to Telegram.
+
+        Returns True on success, raises an exception on failure.
+        Retries once on network errors.
+        """
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {"chat_id": chat, "text": text, "parse_mode": "Markdown"}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error("Telegram API error %d: %s", resp.status, body)
-                    else:
-                        logger.info("Telegram message sent to chat %s", chat)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to send Telegram alert: %s", exc)
+
+        # Retry logic: try twice
+        for attempt in range(2):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("ok"):
+                                logger.info("Telegram message sent to chat %s (subject: %s)", chat, subject)
+                                return True
+                            else:
+                                error_msg = data.get("description", "unknown error")
+                                if attempt == 0:
+                                    logger.warning("Telegram API error (retrying): %s", error_msg)
+                                    await asyncio.sleep(1)
+                                    continue
+                                else:
+                                    raise RuntimeError(f"Telegram API error: {error_msg}")
+                        else:
+                            body = await resp.text()
+                            if attempt == 0:
+                                logger.warning("Telegram HTTP %d (retrying): %s", resp.status, body[:200])
+                                await asyncio.sleep(1)
+                                continue
+                            else:
+                                raise RuntimeError(f"Telegram HTTP {resp.status}: {body[:200]}")
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    logger.warning("Telegram timeout (retrying)...")
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    raise RuntimeError("Telegram API timeout (both attempts)")
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 0:
+                    logger.warning("Telegram network error (retrying): %s", exc)
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    raise
+
+        raise RuntimeError("Telegram send failed after 2 attempts")

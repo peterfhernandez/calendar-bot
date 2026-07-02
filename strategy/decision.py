@@ -604,10 +604,14 @@ class DecisionEngine:
             trade.qty, trade.net_debit, open_fees_usd, candidate.ev_score,
         )
         if self._notifier:
-            self._notifier.notify_entry(
-                trade.id, trade.asset, trade.option_type,
-                trade.strike, trade.qty, trade.net_debit,
-            )
+            try:
+                self._notifier.notify_entry(
+                    trade.id, trade.asset, trade.option_type,
+                    trade.strike, trade.qty, trade.net_debit,
+                )
+                logger.info("Entry notification queued for trade_id=%s", trade.id)
+            except Exception as exc:
+                logger.error("⚠️  NOTIFICATION FAILED on entry of trade_id=%s: %s", trade.id, exc)
         return trade
 
     # ── Monitor logic ─────────────────────────────────────────────────────────
@@ -902,14 +906,16 @@ class DecisionEngine:
             try:
                 asset  = pos.get("asset", "")
                 strike = pos.get("strike", 0.0)
+                notification_type = "take-profit" if "Take-profit" in reason else "stop-loss" if "Stop-loss" in reason else "close"
                 if "Take-profit" in reason:
                     self._notifier.notify_take_profit(trade_id, asset, strike, pnl)
                 elif "Stop-loss" in reason:
                     self._notifier.notify_stop(trade_id, asset, strike, pnl)
                 else:
                     self._notifier.notify_close(trade_id, asset, strike, pnl, reason)
+                logger.info("Notification queued for position close: type=%s trade_id=%s", notification_type, trade_id)
             except Exception as exc:
-                logger.warning("Notification failed on close: %s", exc)
+                logger.error("⚠️  NOTIFICATION FAILED on close of trade_id=%s: %s", trade_id, exc)
 
         # Clear any accumulated roll/close failure count for this position
         self._close_roll_failures.pop(trade_id, None)
@@ -1043,8 +1049,9 @@ class DecisionEngine:
                         trade_id, pos.get("asset", ""),
                         pos.get("strike", 0.0), new_near_instr,
                     )
+                    logger.info("Roll notification queued for trade_id=%s", trade_id)
                 except Exception as exc:
-                    logger.warning("notify_roll failed: %s", exc)
+                    logger.error("⚠️  NOTIFICATION FAILED on roll of trade_id=%s: %s", trade_id, exc)
         return success
 
     # ── Daily loss limit ──────────────────────────────────────────────────────
