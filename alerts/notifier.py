@@ -150,6 +150,32 @@ class Notifier:
             ),
         )
 
+    def notify_close_stuck(
+        self,
+        trade_id: int,
+        asset: str,
+        strike: float,
+        reason: str,
+        error: str,
+    ) -> None:
+        """Alert when a position close fails repeatedly and needs manual intervention."""
+        instrument = f"{asset} strike={strike:.0f}"
+        self.send(
+            event_type="close_stuck",
+            subject=f"⚠️  MANUAL ACTION REQUIRED: Position close failed (trade #{trade_id})",
+            body=(
+                f"Trade #{trade_id} close failed after multiple attempts.\n\n"
+                f"  Instrument:   {instrument}\n"
+                f"  Close reason: {reason}\n"
+                f"  Error:        {error}\n\n"
+                f"The position is still open on Deribit and needs manual intervention.\n\n"
+                f"Use one of these commands:\n"
+                f"  • `/info trade_id={trade_id}` — Check current position status on Deribit\n"
+                f"  • `/close trade_id={trade_id}` — Retry automatic close\n"
+                f"  • `/close_manually trade_id={trade_id} spread=VALUE` — Manually close with known spread value"
+            ),
+        )
+
     def notify_daily_limit(self, daily_pnl: float) -> None:
         """Alert when the daily loss limit is breached and the bot halts."""
         self.send(

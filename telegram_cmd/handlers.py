@@ -21,6 +21,9 @@ from db.state import (
     get_trades_closed_since,
     get_trades_opened_today_aest,
     get_trades_opened_since,
+    get_stuck_positions,
+    mark_position_manually_closed,
+    reset_close_stuck_position,
     DB_PATH,
 )
 
@@ -405,3 +408,189 @@ async def handle_drain_and_new(
         parts.append(f"  • Assets: {', '.join(new_assets)}")
 
     await update.message.reply_text("\n".join(parts))
+
+
+async def handle_info(
+    update: Update,
+    context: CallbackContext,
+    cache: ChainCache,
+    db_path: Path = DB_PATH,
+) -> None:
+    """
+    Check current position status on Deribit.
+
+    Shows live bid/ask, mark price, and current position P&L from cache.
+    Usage: /info trade_id=42
+    """
+    if not context.args:
+        await update.message.reply_text("Usage: /info trade_id=N")
+        return
+
+    trade_id = None
+    for arg in context.args:
+        if arg.lower().startswith("trade_id="):
+            try:
+                trade_id = int(arg.split("=", 1)[1])
+            except ValueError:
+                await update.message.reply_text(f"Invalid trade_id: {arg}")
+                return
+
+    if trade_id is None:
+        await update.message.reply_text("Usage: /info trade_id=42")
+        return
+
+    # Fetch trade from DB
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        await update.message.reply_text(f"Trade #{trade_id} not found in database")
+        return
+
+    # Fetch live prices from cache
+    near_snap = cache.get(row["near_instrument"])
+    far_snap = cache.get(row["far_instrument"])
+
+    parts = [f"*Trade #{trade_id} Status*"]
+    parts.append(f"{row['asset']} {row['option_type']} strike={row['strike']:.0f}")
+    parts.append(f"Expiry: {row['expiry_near']} → {row['expiry_far']}")
+    parts.append(f"Qty: {row['qty']}")
+    parts.append(f"Entry debit: ${row['net_debit'] * row['qty']:.4f}")
+    parts.append("")
+    parts.append("*Current Market Prices (from Deribit):*")
+
+    if near_snap:
+        near_mid = _mid(near_snap.bid, near_snap.ask)
+        parts.append(f"Near leg: bid={near_snap.bid:.4f} ask={near_snap.ask:.4f} mid={near_mid:.4f if near_mid else 'N/A'}")
+    else:
+        parts.append(f"Near leg: NOT IN CACHE (stale or not subscribed)")
+
+    if far_snap:
+        far_mid = _mid(far_snap.bid, far_snap.ask)
+        parts.append(f"Far leg:  bid={far_snap.bid:.4f} ask={far_snap.ask:.4f} mid={far_mid:.4f if far_mid else 'N/A'}")
+    else:
+        parts.append(f"Far leg: NOT IN CACHE (stale or not subscribed)")
+
+    if near_snap and far_snap and _mid(near_snap.bid, near_snap.ask) and _mid(far_snap.bid, far_snap.ask):
+        sv = (_mid(far_snap.bid, far_snap.ask) - _mid(near_snap.bid, near_snap.ask)) * row['qty']
+        cost_basis = row['net_debit'] * row['qty'] + row['open_fees']
+        unrealized = sv - cost_basis
+        parts.append("")
+        parts.append(f"*Unrealized P&L:* ${unrealized:+.4f} ({unrealized/cost_basis*100:+.1f}%)")
+    else:
+        parts.append("")
+        parts.append("⚠️  Cannot calculate current P&L — cache data incomplete")
+
+    parts.append(f"\nDB Status: {row['close_status']}")
+    if row['close_error_reason']:
+        parts.append(f"Error: {row['close_error_reason']}")
+
+    await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+
+
+async def handle_close(
+    update: Update,
+    context: CallbackContext,
+    engine: DecisionEngine,
+    db_path: Path = DB_PATH,
+) -> None:
+    """
+    Retry closing a stuck position (tell bot to try again).
+
+    Resets the close_stuck flag so the bot will attempt close on next monitor tick.
+    Usage: /close trade_id=42
+    """
+    if not context.args:
+        await update.message.reply_text("Usage: /close trade_id=N")
+        return
+
+    trade_id = None
+    for arg in context.args:
+        if arg.lower().startswith("trade_id="):
+            try:
+                trade_id = int(arg.split("=", 1)[1])
+            except ValueError:
+                await update.message.reply_text(f"Invalid trade_id: {arg}")
+                return
+
+    if trade_id is None:
+        await update.message.reply_text("Usage: /close trade_id=42")
+        return
+
+    try:
+        reset_close_stuck_position(trade_id, db_path)
+        await update.message.reply_text(
+            f"✓ Trade #{trade_id} reset for retry.\n"
+            f"Bot will attempt to close on next monitor tick (~1 minute)."
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Error resetting trade: {exc}")
+        logger.error("Failed to reset close_stuck for trade_id=%d: %s", trade_id, exc)
+
+
+async def handle_close_manually(
+    update: Update,
+    context: CallbackContext,
+    engine: DecisionEngine,
+    db_path: Path = DB_PATH,
+) -> None:
+    """
+    Manually close a stuck position with a user-provided spread value.
+
+    Marks the position as closed in the database with the given spread value.
+    P&L is calculated as: spread_value - net_debit*qty - open_fees
+
+    Usage: /close_manually trade_id=42 spread=0.0050
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /close_manually trade_id=N spread=VALUE\n"
+            "Example: /close_manually trade_id=42 spread=0.0050"
+        )
+        return
+
+    trade_id = None
+    spread_value = None
+
+    for arg in context.args:
+        if arg.lower().startswith("trade_id="):
+            try:
+                trade_id = int(arg.split("=", 1)[1])
+            except ValueError:
+                await update.message.reply_text(f"Invalid trade_id: {arg}")
+                return
+        elif arg.lower().startswith("spread="):
+            try:
+                spread_value = float(arg.split("=", 1)[1])
+            except ValueError:
+                await update.message.reply_text(f"Invalid spread value: {arg}")
+                return
+
+    if trade_id is None or spread_value is None:
+        await update.message.reply_text(
+            "Usage: /close_manually trade_id=N spread=VALUE\n"
+            "Example: /close_manually trade_id=42 spread=0.0050"
+        )
+        return
+
+    try:
+        trade = mark_position_manually_closed(trade_id, spread_value, "manual", db_path)
+        pnl = trade.pnl or 0.0
+
+        await update.message.reply_text(
+            f"✓ Trade #{trade_id} manually closed\n"
+            f"{trade.asset} {trade.option_type} strike={trade.strike:.0f}\n"
+            f"Spread value: ${spread_value:.4f}\n"
+            f"Realised P&L: ${pnl:+.4f}"
+        )
+        logger.info("Trade #%d manually closed by user: spread=%.4f, pnl=%.4f", trade_id, spread_value, pnl)
+    except ValueError as exc:
+        await update.message.reply_text(f"Trade not found: {exc}")
+    except Exception as exc:
+        await update.message.reply_text(f"Error closing trade: {exc}")
+        logger.error("Failed to manually close trade_id=%d: %s", trade_id, exc)
