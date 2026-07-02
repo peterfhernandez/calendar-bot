@@ -927,3 +927,13 @@ If notifications still fail to arrive:
 2. Check `logs/bot.log` for ERROR messages with ⚠️ prefix
 3. Verify `.env` has valid TELEGRAM_TOKEN and TELEGRAM_CHAT
 4. See TELEGRAM_DEBUGGING_GUIDE.md for detailed solutions
+
+**Phase 17b — Notification Spam Prevention for Stuck Positions:**
+
+- [x] **Notification deduplication** — Add `_notified_stuck: set[int]` to track positions already notified
+- [x] **Stop-loss guard** — Only send `notify_close_stuck()` once per stuck position, not every monitor tick
+- [x] **Take-profit guard** — Same deduplication applied to TP close retry limit path
+- [x] **Reset on user intervention** — Clear notification flag when user runs `/close` or `/close_manually` commands
+- [x] **Test coverage** — Added `test_handle_close_resets_close_stuck_flag` and `test_handle_close_manually_clears_notification_flag`
+
+**Result:** Users receive exactly one notification when a position becomes stuck, preventing message spam during long retry loops. They can be notified again if the position gets stuck after manual reset.

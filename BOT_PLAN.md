@@ -945,3 +945,44 @@ The unrealized figure reuses the exact formula already used by `/portfolio` and 
 - **Trade volume vs. chart readability** — with hundreds of closed trades the x-axis will need date-tick thinning/rotation; not a blocker, just a rendering-polish detail to get right in implementation.
 - **Telegram photo size limits** — a single-figure PNG line chart is well within Telegram's 10 MB photo limit; no compression tuning expected to be necessary.
 - **Testing rendered images** — unit tests assert on the PNG header bytes and on the pure data-prep functions (`build_cumulative_series`, `compute_unrealized`) rather than pixel content, consistent with how the rest of the test suite avoids asserting on rendered output.
+
+---
+
+## Phase 17 — Notification Spam Prevention for Stuck Positions
+
+### Problem
+
+When a position failed to close after reaching the 4th retry attempt, it was marked as stuck and a notification was sent. However, on every subsequent monitor tick (~1 minute), the position would still be stuck, and the notification code would fire again, sending the same alert repeatedly. This resulted in dozens of identical notifications over hours, overwhelming the user with spam and making it impossible to respond in a timely manner.
+
+### Root Cause
+
+The notification logic in `_monitor_position()` checked if the failure count reached 3 (indicating 4th attempt) and sent `notify_close_stuck()` without tracking whether that position had already been notified. Since the failure counter persisted across ticks, the same notification would fire on every monitor cycle.
+
+### Solution: Set-Based Deduplication
+
+**`strategy/decision.py` — `_notified_stuck` tracking**
+
+- Added `self._notified_stuck: set[int] = set()` to `DecisionEngine.__init__()`
+- Before sending `notify_close_stuck()` in stop-loss retry limit path: check `if trade_id not in self._notified_stuck and self._notifier:`
+- Before sending `notify_close_stuck()` in take-profit retry limit path: same guard
+- After successful notification, add `trade_id` to the set: `self._notified_stuck.add(trade_id)`
+- Result: notification sent exactly once per position, on the monitor tick where it first becomes stuck
+
+**`telegram_cmd/handlers.py` — Reset flag on user intervention**
+
+- `/close` handler: call `engine._notified_stuck.discard(trade_id)` after resetting the close_stuck flag
+  - Allows user to be notified again if the position gets stuck again after the retry attempt
+- `/close_manually` handler: same cleanup, since position is now resolved
+  - User can be notified again if they run the command and it still fails
+
+### Test Coverage
+
+- `test_handle_close_resets_close_stuck_flag()` — verifies `/close` clears the notification flag
+- `test_handle_close_manually_clears_notification_flag()` — verifies `/close_manually` clears the flag
+- Updated `TestStopTpCloseRetryLimit` tests to verify the new behavior with `mark_position_close_stuck` mocking
+
+### Result
+
+Users receive exactly **one notification** when a position becomes stuck in a retry loop, preventing message spam. The notification flag is cleared when the user intervenes via `/close` or `/close_manually`, allowing them to be notified again if it gets stuck after reset.
+
+This directly addresses the critical feedback: **"I do not want a message to be sent every minute. When a position is marked as stuck, no further notifications should be sent"**
