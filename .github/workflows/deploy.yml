@@ -4,12 +4,15 @@ on:
   push:
     branches: [master]
 
+defaults:
+  run:
+    shell: powershell -ExecutionPolicy Bypass -Command "& '{0}'"
 jobs:
   deploy:
     runs-on: self-hosted
     steps:
       - name: Pull latest
-        run: git -C C:\Users\Peter\coderepo\calendar-bot pull origin main
+        run: git -C C:\Users\Peter\coderepo\calendar-bot pull origin master
 
       - name: Restart bot
         run: |
