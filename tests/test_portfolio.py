@@ -632,3 +632,53 @@ class TestDecisionEngineIntegration:
         )
         engine.scan_tick()
         assert engine.portfolio_value == pytest.approx(25_000.0)
+
+
+# ── Margin utilities (Phase 17) ──────────────────────────────────────────────
+
+class TestMaintenanceMargin:
+    """Tracking and calculating margin utilization."""
+
+    def test_maintenance_margin_property(self):
+        """maintenance_margin_usd property returns cached value."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(db_path=Path(db))
+        tracker._maintenance_margin_usd = 5_000.0
+        assert tracker.maintenance_margin_usd == 5_000.0
+
+    def test_margin_utilization_pct(self):
+        """margin_utilization_pct = maintenance_margin / equity."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(db_path=Path(db))
+        tracker._equity_usd = 100_000.0
+        tracker._maintenance_margin_usd = 25_000.0
+        assert tracker.margin_utilization_pct == pytest.approx(0.25)
+
+    def test_margin_utilization_pct_zero_equity(self):
+        """margin_utilization_pct returns 0.0 when equity is zero."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(db_path=Path(db))
+        tracker._equity_usd = 0.0
+        tracker._maintenance_margin_usd = 1_000.0
+        assert tracker.margin_utilization_pct == 0.0
+
+    def test_simulate_margin_placeholder(self):
+        """simulate_margin returns None (placeholder for Phase 17)."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(
+            db_path=Path(db),
+            client_id="test_id",
+            client_secret="test_secret",
+        )
+        legs = [("BTC-1JAN26-100000-C", 1.0, 0.05)]
+        result = tracker.simulate_margin(legs)
+        assert result is None  # Placeholder returns None
+
+    def test_simulate_margin_no_credentials(self):
+        """simulate_margin returns None when credentials are not configured."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(db_path=Path(db))
+        # tracker has no credentials
+        legs = [("BTC-1JAN26-100000-C", 1.0, 0.05)]
+        result = tracker.simulate_margin(legs)
+        assert result is None

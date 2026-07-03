@@ -156,6 +156,18 @@ DRAIN_AND_NEW_MODE: bool = False
 # Set back to None to resume using the live tracker value.
 PORTFOLIO_OVERRIDE: float | None = None
 
+# Cross Portfolio Margin (X:PM) entry gate — Phase 17
+# Before entering a new position, check Deribit's actual margin requirement
+# and reject the trade if it would push the account past this utilization ceiling.
+# The gate's primary path asks Deribit for a live margin simulation; if that
+# fails, it falls back to a conservative local proxy (maintenance_margin / equity).
+MAX_MARGIN_UTILIZATION_PCT = 0.80  # ceiling on maintenance_margin / equity (Deribit's default is same)
+MARGIN_GATE_ENABLED = True  # kill switch — set False to disable the gate entirely
+MARGIN_GATE_REQUIRED_LIVE = True  # in test/live mode, missing/failed margin data blocks entry (fail closed)
+# In paper mode, the gate is a no-op by default so paper trading is not blocked
+# by the absence of a funded test account; set MARGIN_GATE_ENABLED=True in
+# config_test.py to force it on for testing.
+
 # Alerts
 # All alert settings are read from env vars (set in .env, never commit).
 # Email — set ALERT_EMAIL to enable; SMTP defaults to Gmail on port 587.

@@ -2262,6 +2262,123 @@ class TestFeeIntegration:
         assert status.daily_pnl == pytest.approx(0.002)
 
 
+# ── Margin gate (Phase 17) ────────────────────────────────────────────────────
+
+class TestMarginGate:
+    """
+    _check_margin_gate rejects candidates that would push account margin
+    utilization past MAX_MARGIN_UTILIZATION_PCT.
+    """
+
+    def test_margin_gate_disabled_when_flag_false(self):
+        """Gate is a no-op when MARGIN_GATE_ENABLED is False."""
+        with patch("config.MARGIN_GATE_ENABLED", False):
+            engine, _ = _make_engine()
+            candidate = _make_candidate()
+            reason = engine._check_margin_gate(candidate)
+            assert reason is None
+
+    def test_margin_gate_noop_in_paper_mode(self):
+        """Gate is a no-op in paper mode by default (no funded account needed)."""
+        with patch("config.TRADING_MODE", "paper"):
+            with patch("config.MARGIN_GATE_ENABLED", True):
+                engine, _ = _make_engine()
+                candidate = _make_candidate()
+                reason = engine._check_margin_gate(candidate)
+                assert reason is None
+
+    def test_margin_gate_no_portfolio_tracker(self):
+        """Gate returns None if portfolio tracker is not configured."""
+        engine = DecisionEngine(
+            cache=MagicMock(),
+            portfolio_value=10_000,
+            executor=DryRunExecutor(),
+            db_path=Path(tempfile.mktemp(suffix=".db")),
+            portfolio=None,  # no tracker
+        )
+        with patch("config.MARGIN_GATE_ENABLED", True):
+            with patch("config.TRADING_MODE", "paper"):
+                candidate = _make_candidate()
+                reason = engine._check_margin_gate(candidate)
+                assert reason is None
+
+    def test_margin_gate_rejects_when_current_utilization_high(self):
+        """Gate rejects entry when current margin utilization already exceeds ceiling."""
+        portfolio_mock = MagicMock()
+        portfolio_mock.margin_utilization_pct = 0.85  # above the 0.80 default
+
+        engine = DecisionEngine(
+            cache=MagicMock(),
+            portfolio_value=10_000,
+            executor=DryRunExecutor(),
+            db_path=Path(tempfile.mktemp(suffix=".db")),
+            portfolio=portfolio_mock,
+        )
+
+        with patch("config.MARGIN_GATE_ENABLED", True):
+            with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
+                candidate = _make_candidate()
+                reason = engine._check_margin_gate(candidate)
+                assert reason is not None
+                assert "current margin utilization" in reason
+
+    def test_margin_gate_accepts_when_utilization_low(self):
+        """Gate passes when projected utilization stays below ceiling."""
+        portfolio_mock = MagicMock()
+        portfolio_mock.margin_utilization_pct = 0.50  # well below ceiling
+        portfolio_mock.simulate_margin.return_value = None  # API not available
+        portfolio_mock.equity_usd = 100_000.0
+        portfolio_mock.maintenance_margin_usd = 50_000.0
+
+        engine = DecisionEngine(
+            cache=MagicMock(),
+            portfolio_value=10_000,
+            executor=DryRunExecutor(),
+            db_path=Path(tempfile.mktemp(suffix=".db")),
+            portfolio=portfolio_mock,
+        )
+
+        with patch("config.MARGIN_GATE_ENABLED", True):
+            with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
+                candidate = _make_candidate()
+                candidate.net_debit = 0.01
+                candidate.qty = 1.0
+                # Projected: (50000 + 0.01*1.0) / 100000 = 0.5000001, well below 0.80
+                reason = engine._check_margin_gate(candidate)
+                assert reason is None
+
+    def test_margin_gate_uses_live_simulation_when_available(self):
+        """Gate prefers live margin-simulation result over local proxy."""
+        portfolio_mock = MagicMock()
+        portfolio_mock.margin_utilization_pct = 0.50
+        portfolio_mock.equity_usd = 100_000.0
+        portfolio_mock.maintenance_margin_usd = 50_000.0
+
+        # Simulate API returning a high projected margin
+        from portfolio.tracker import MarginImpact
+        portfolio_mock.simulate_margin.return_value = MarginImpact(
+            projected_initial_margin_usd=85_000.0,
+            projected_maintenance_margin_usd=85_000.0,
+        )
+
+        engine = DecisionEngine(
+            cache=MagicMock(),
+            portfolio_value=10_000,
+            executor=DryRunExecutor(),
+            db_path=Path(tempfile.mktemp(suffix=".db")),
+            portfolio=portfolio_mock,
+        )
+
+        with patch("config.MARGIN_GATE_ENABLED", True):
+            with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
+                candidate = _make_candidate()
+                reason = engine._check_margin_gate(candidate)
+                # 85000 / 100000 = 0.85 > 0.80, so rejected
+                assert reason is not None
+                assert "projected margin utilization" in reason
+                portfolio_mock.simulate_margin.assert_called_once()
+
+
 # ── Pause / resume ────────────────────────────────────────────────────────────
 
 class TestPauseResume:
