@@ -989,6 +989,7 @@ tail -f logs/bot.log | grep -E "(notification|Telegram|ERROR)"
 ```
 
 If notifications still fail to arrive:
+
 1. Run `python3 scratch/diagnose_telegram_notifications.py` for automated diagnosis
 2. Check `logs/bot.log` for ERROR messages with ⚠️ prefix
 3. Verify `.env` has valid TELEGRAM_TOKEN and TELEGRAM_CHAT

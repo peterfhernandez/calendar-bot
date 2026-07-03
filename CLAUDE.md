@@ -38,3 +38,4 @@ Each time you complete a task from BOT_TODO, make sure to update progress.
 - when asked to commit, the comment must not contain your name, the name of any model, or any reference to AI
 - when asked to commit and you have been working on a separate branch, asking if that branch should be merged into the main branch
 - do not sign commits with <noreply@anthropic.com> credentials, any reference yourself or any email address at all
+- PR comments must not include references to Claude, AI, Anthropic or anything of that nature
