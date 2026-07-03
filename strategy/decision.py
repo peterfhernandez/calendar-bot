@@ -367,6 +367,14 @@ class DecisionEngine:
                 )
                 continue
 
+            margin_gate_reason = self._check_margin_gate(candidate)
+            if margin_gate_reason:
+                logger.info(
+                    "MARGIN GATE skip: %s for %s %s strike=%.0f",
+                    margin_gate_reason, candidate.asset, candidate.option_type, candidate.strike,
+                )
+                continue
+
             logger.info(
                 "RANK approved: %s %s strike=%.0f  qty=%.1f  ev=%.4f",
                 candidate.asset, candidate.option_type, candidate.strike,
@@ -541,6 +549,81 @@ class DecisionEngine:
                     f"far-leg ask_size {far_snap.ask_size:.1f} < MIN_LEG_ASK_SIZE "
                     f"{config.MIN_LEG_ASK_SIZE}"
                 )
+
+        return None
+
+    def _check_margin_gate(self, candidate: CalendarCandidate) -> str | None:
+        """
+        Cross Portfolio Margin (X:PM) entry gate (Phase 17).
+
+        Checks whether adding this position would push the account's margin
+        utilization (maintenance_margin / equity) past MAX_MARGIN_UTILIZATION_PCT.
+
+        Primary path: ask Deribit's API for the actual margin impact.
+        Fallback: conservative local proxy using current margin + candidate debit.
+        Fail-closed in test/live mode (reject on API failure); no-op in paper mode.
+
+        Returns a rejection reason string, or None if the candidate passes.
+        """
+        if not config.MARGIN_GATE_ENABLED:
+            return None
+
+        # Margin gate is only enforced in test/live mode by default; paper mode
+        # is a no-op so paper trading isn't blocked by lack of a funded test account.
+        force_gate_in_paper = False
+        if config.TRADING_MODE == "paper" and not force_gate_in_paper:
+            return None
+
+        # No portfolio tracker = fall back to conservative proxy or reject
+        if self._portfolio is None:
+            if config.TRADING_MODE in ("test", "live") and config.MARGIN_GATE_REQUIRED_LIVE:
+                return "margin gate unavailable (no portfolio tracker)"
+            return None
+
+        # Current utilization: if already stressed, reject new entry
+        current_util = self._portfolio.margin_utilization_pct
+        if current_util > config.MAX_MARGIN_UTILIZATION_PCT:
+            return (
+                f"current margin utilization {current_util:.2%} "
+                f"> MAX_MARGIN_UTILIZATION_PCT {config.MAX_MARGIN_UTILIZATION_PCT:.2%}"
+            )
+
+        # Try the live margin-simulation API first
+        legs = [
+            (candidate.near_instrument, candidate.qty, candidate.near_ask),
+            (candidate.far_instrument, candidate.qty, candidate.far_bid),
+        ]
+        margin_impact = self._portfolio.simulate_margin(legs)
+        if margin_impact is not None:
+            # Live simulation succeeded — use those numbers
+            equity = self._portfolio.equity_usd
+            if equity > 0:
+                projected_util = margin_impact.projected_maintenance_margin_usd / equity
+                if projected_util > config.MAX_MARGIN_UTILIZATION_PCT:
+                    return (
+                        f"projected margin utilization {projected_util:.2%} "
+                        f"> MAX_MARGIN_UTILIZATION_PCT {config.MAX_MARGIN_UTILIZATION_PCT:.2%}"
+                    )
+            return None  # Simulation passed
+
+        # Fallback: conservative local proxy when simulation unavailable
+        # Add the candidate's own max loss (the net debit paid) as a floor on
+        # its margin contribution; this is deliberately conservative.
+        equity = self._portfolio.equity_usd
+        if equity <= 0:
+            if config.TRADING_MODE in ("test", "live") and config.MARGIN_GATE_REQUIRED_LIVE:
+                return "cannot estimate margin impact (equity unavailable)"
+            return None
+
+        candidate_margin_estimate = candidate.net_debit * candidate.qty
+        projected_maintenance = self._portfolio.maintenance_margin_usd + candidate_margin_estimate
+        projected_util = projected_maintenance / equity
+
+        if projected_util > config.MAX_MARGIN_UTILIZATION_PCT:
+            return (
+                f"projected margin utilization (proxy) {projected_util:.2%} "
+                f"> MAX_MARGIN_UTILIZATION_PCT {config.MAX_MARGIN_UTILIZATION_PCT:.2%}"
+            )
 
         return None
 
@@ -985,6 +1068,15 @@ class DecisionEngine:
             logger.info(
                 "Roll: candidate rejected by liquidity gate — %s (trade_id=%d)",
                 rejection_reason, pos.get("trade_id"),
+            )
+            return False
+
+        # Check margin gate: rolling changes portfolio composition and can trigger a margin call
+        margin_gate_reason = self._check_margin_gate(new_candidate)
+        if margin_gate_reason:
+            logger.info(
+                "Roll: candidate rejected by margin gate — %s (trade_id=%d)",
+                margin_gate_reason, pos.get("trade_id"),
             )
             return False
 

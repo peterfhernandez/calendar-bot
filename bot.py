@@ -61,6 +61,7 @@ from data.deribit_feed import DeribitFeed
 from db.state import list_assets_with_open_positions
 from execution.executor import CalendarExecutor
 from monitor.loop import BotLoop, configure_logging
+from portfolio.tracker import PortfolioTracker
 
 logger = logging.getLogger("bot")
 
@@ -155,11 +156,20 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
         )
         await _cancel_open_orders(config.DERIBIT_CLIENT_ID, config.DERIBIT_CLIENT_SECRET)
 
+    # Instantiate portfolio tracker to provide live margin data for the margin gate (Phase 17)
+    portfolio = None
+    if config.DERIBIT_CLIENT_ID and config.DERIBIT_CLIENT_SECRET:
+        portfolio = PortfolioTracker(
+            client_id=config.DERIBIT_CLIENT_ID,
+            client_secret=config.DERIBIT_CLIENT_SECRET,
+        )
+
     loop = BotLoop(
         cache=cache,
         portfolio_value=portfolio_value,
         executor=executor,
         notifier=notifier,
+        portfolio=portfolio,
     )
 
     logger.info(
