@@ -27,7 +27,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import Optional, NamedTuple
 
 import config
 from db.state import DB_PATH, get_connection
@@ -43,19 +43,26 @@ _RECONCILE_THRESHOLD = 0.10  # 10%
 _STABLECOIN_CURRENCIES = {"USDC", "USDT", "USD"}
 
 
+class MarginImpact(NamedTuple):
+    """Impact of a hypothetical position on account margin."""
+    projected_initial_margin_usd: float
+    projected_maintenance_margin_usd: float
+
+
 @dataclass
 class PortfolioState:
     """Point-in-time snapshot of the portfolio."""
-    equity_usd:          float
-    available_cash:      float   # available_funds from Deribit, converted to USD
-    used_margin:         float   # SQLite: sum(net_debit * qty) for open positions
-    unrealized_pnl:      float   # floating P&L from Deribit positions, converted to USD
-    realized_pnl_today:  float   # SQLite: closed-trade P&L since midnight UTC
-    open_position_count: int
-    deribit_margin_usd:  float   # initial_margin from Deribit REST, converted to USD
-    last_refresh:        Optional[float]  # epoch seconds of last successful refresh
-    fees_paid_today:     float = 0.0   # sum of open_fees + close_fees for trades today
-    fees_paid_total:     float = 0.0   # sum of all open_fees + close_fees across all trades
+    equity_usd:              float
+    available_cash:          float   # available_funds from Deribit, converted to USD
+    used_margin:             float   # SQLite: sum(net_debit * qty) for open positions
+    unrealized_pnl:          float   # floating P&L from Deribit positions, converted to USD
+    realized_pnl_today:      float   # SQLite: closed-trade P&L since midnight UTC
+    open_position_count:     int
+    deribit_margin_usd:      float   # initial_margin from Deribit REST, converted to USD
+    maintenance_margin_usd:  float   # maintenance_margin from Deribit REST, converted to USD
+    last_refresh:            Optional[float]  # epoch seconds of last successful refresh
+    fees_paid_today:         float = 0.0   # sum of open_fees + close_fees for trades today
+    fees_paid_total:         float = 0.0   # sum of all open_fees + close_fees across all trades
 
 
 class PortfolioTracker:
@@ -99,16 +106,17 @@ class PortfolioTracker:
         self._rest_url      = rest_url or config.DERIBIT_REST_URL
 
         # Cached state — updated by refresh()
-        self._equity_usd:          float = 0.0
-        self._available_cash:      float = 0.0
-        self._used_margin:         float = 0.0
-        self._unrealized_pnl:      float = 0.0
-        self._realized_pnl_today:  float = 0.0
-        self._deribit_margin_usd:  float = 0.0
-        self._open_position_count: int   = 0
-        self._last_refresh:        float | None = None
-        self._fees_paid_today:     float = 0.0
-        self._fees_paid_total:     float = 0.0
+        self._equity_usd:             float = 0.0
+        self._available_cash:         float = 0.0
+        self._used_margin:            float = 0.0
+        self._unrealized_pnl:         float = 0.0
+        self._realized_pnl_today:     float = 0.0
+        self._deribit_margin_usd:     float = 0.0
+        self._maintenance_margin_usd: float = 0.0
+        self._open_position_count:    int   = 0
+        self._last_refresh:           float | None = None
+        self._fees_paid_today:        float = 0.0
+        self._fees_paid_total:        float = 0.0
         # Offline tracking — log once on first failure, once on recovery
         self._api_offline:     bool = False
         self._api_fail_count:  int  = 0
@@ -139,6 +147,21 @@ class PortfolioTracker:
     def realized_pnl_today(self) -> float:
         """Realized P&L from trades closed today (UTC), from SQLite."""
         return self._realized_pnl_today
+
+    @property
+    def maintenance_margin_usd(self) -> float:
+        """Maintenance margin from Deribit REST API, in USD."""
+        return self._maintenance_margin_usd
+
+    @property
+    def margin_utilization_pct(self) -> float:
+        """Current margin utilization: maintenance_margin / equity.
+
+        Returns 0.0 if equity is zero or unavailable.
+        """
+        if self._equity_usd <= 0:
+            return 0.0
+        return self._maintenance_margin_usd / self._equity_usd
 
     # ── Main refresh ──────────────────────────────────────────────────────────
 
@@ -202,16 +225,17 @@ class PortfolioTracker:
             self._reconcile()
 
         return PortfolioState(
-            equity_usd          = self._equity_usd,
-            available_cash      = self._available_cash,
-            used_margin         = self._used_margin,
-            unrealized_pnl      = self._unrealized_pnl,
-            realized_pnl_today  = self._realized_pnl_today,
-            open_position_count = self._open_position_count,
-            deribit_margin_usd  = self._deribit_margin_usd,
-            last_refresh        = self._last_refresh,
-            fees_paid_today     = self._fees_paid_today,
-            fees_paid_total     = self._fees_paid_total,
+            equity_usd              = self._equity_usd,
+            available_cash          = self._available_cash,
+            used_margin             = self._used_margin,
+            unrealized_pnl          = self._unrealized_pnl,
+            realized_pnl_today      = self._realized_pnl_today,
+            open_position_count     = self._open_position_count,
+            deribit_margin_usd      = self._deribit_margin_usd,
+            maintenance_margin_usd  = self._maintenance_margin_usd,
+            last_refresh            = self._last_refresh,
+            fees_paid_today         = self._fees_paid_today,
+            fees_paid_total         = self._fees_paid_total,
         )
 
     # ── Portfolio view ────────────────────────────────────────────────────────
@@ -240,10 +264,11 @@ class PortfolioTracker:
         """Fetch account summaries and position P&L from Deribit REST."""
         token = self._authenticate()
 
-        total_equity_usd    = 0.0
-        total_available_usd = 0.0
-        total_margin_usd    = 0.0
-        total_unrealized    = 0.0
+        total_equity_usd         = 0.0
+        total_available_usd      = 0.0
+        total_margin_usd         = 0.0
+        total_maintenance_usd    = 0.0
+        total_unrealized         = 0.0
 
         currencies = _assets_to_currencies(config.ASSETS)
 
@@ -253,34 +278,37 @@ class PortfolioTracker:
                 spot      = _resolve_spot(currency, spot_prices, self._rest_url)
                 positions = self._get_positions(token, currency)
 
-                equity_usd    = summary.get("equity",          0.0) * spot
-                available_usd = summary.get("available_funds", 0.0) * spot
-                margin_usd    = summary.get("initial_margin",  0.0) * spot
-                float_pnl_usd = sum(
+                equity_usd      = summary.get("equity",              0.0) * spot
+                available_usd   = summary.get("available_funds",     0.0) * spot
+                margin_usd      = summary.get("initial_margin",      0.0) * spot
+                maintenance_usd = summary.get("maintenance_margin",  0.0) * spot
+                float_pnl_usd   = sum(
                     p.get("floating_profit_loss", 0.0) * spot for p in positions
                 )
 
-                total_equity_usd    += equity_usd
-                total_available_usd += available_usd
-                total_margin_usd    += margin_usd
-                total_unrealized    += float_pnl_usd
+                total_equity_usd         += equity_usd
+                total_available_usd      += available_usd
+                total_margin_usd         += margin_usd
+                total_maintenance_usd    += maintenance_usd
+                total_unrealized         += float_pnl_usd
 
                 logger.debug(
                     "Portfolio %s: equity=%.4f spot=%.2f → $%.2f "
-                    "avail=$%.2f margin=$%.2f float_pnl=$%.2f",
+                    "avail=$%.2f margin=$%.2f maint=$%.2f float_pnl=$%.2f",
                     currency,
                     summary.get("equity", 0.0), spot,
-                    equity_usd, available_usd, margin_usd, float_pnl_usd,
+                    equity_usd, available_usd, margin_usd, maintenance_usd, float_pnl_usd,
                 )
 
             except Exception as exc:
                 logger.debug("Could not fetch %s summary: %s", currency, exc)
                 raise
 
-        self._equity_usd         = total_equity_usd
-        self._available_cash     = max(0.0, total_available_usd)
-        self._deribit_margin_usd = total_margin_usd
-        self._unrealized_pnl     = total_unrealized
+        self._equity_usd             = total_equity_usd
+        self._available_cash         = max(0.0, total_available_usd)
+        self._deribit_margin_usd     = total_margin_usd
+        self._maintenance_margin_usd = total_maintenance_usd
+        self._unrealized_pnl         = total_unrealized
 
     def _authenticate(self) -> str:
         """Obtain a short-lived Deribit access token via client_credentials.
@@ -312,6 +340,48 @@ class PortfolioTracker:
         url    = f"{self._rest_url}/api/v2/private/get_positions?{params}"
         data   = _rest_get(url, bearer_token=token)
         return data.get("result", [])
+
+    def simulate_margin(
+        self,
+        legs: list[tuple[str, float, float]],  # [(instrument_name, amount, price), ...]
+    ) -> MarginImpact | None:
+        """Simulate the impact of a hypothetical position on account margin.
+
+        Parameters
+        ----------
+        legs
+            List of (instrument_name, amount, price) tuples for each leg.
+
+        Returns
+        -------
+        MarginImpact | None
+            Projected initial and maintenance margin in USD if simulation succeeds,
+            or None if the API call fails or is unavailable (caller falls back to local proxy).
+
+        Note: This is a placeholder for Phase 17. The real implementation will call
+        Deribit's private/get_margins endpoint (schema TBD). For now, returns None
+        to indicate the feature is not yet implemented.
+        """
+        if not self._client_id or not self._client_secret:
+            logger.debug("simulate_margin: no credentials configured")
+            return None
+
+        try:
+            # Placeholder: schema to be confirmed via scratch_margin_probe.py
+            # Once confirmed, uncomment and implement:
+            # token = self._authenticate()
+            # params = {"legs": [{"instrument": i, "amount": a, "price": p} for i, a, p in legs]}
+            # url = f"{self._rest_url}/api/v2/private/get_margins"
+            # result = _rest_post(url, params, bearer_token=token)
+            # return MarginImpact(
+            #     projected_initial_margin_usd=...,
+            #     projected_maintenance_margin_usd=...,
+            # )
+            logger.debug("simulate_margin: placeholder not yet implemented")
+            return None
+        except Exception as exc:
+            logger.debug("simulate_margin failed: %s", exc)
+            return None
 
     # ── SQLite helpers ────────────────────────────────────────────────────────
 
