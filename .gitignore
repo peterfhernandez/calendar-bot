@@ -12,4 +12,5 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+scratch/pnl_chart_preview.png
 
