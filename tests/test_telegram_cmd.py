@@ -799,6 +799,7 @@ class TestSetMyCommands:
             "portfolio", "stop_bot", "start_bot", "start_drain",
             "start_with_assets", "drain_and_new", "help",
             "info", "close", "close_manually",  # stuck position recovery commands
+            "pnl",  # equity curve chart
         }
         assert expected == command_names
 
@@ -1020,3 +1021,187 @@ async def test_handle_close_manually_clears_notification_flag():
         # Verify position was closed
         trades = get_open_trades(db_path)
         assert len(trades) == 0, "Trade should be closed"
+
+
+class TestHandlePnl:
+    @pytest.mark.asyncio
+    async def test_pnl_with_no_history(self, tmp_path):
+        """No trades at all → reply with text, not image."""
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+        cache = MagicMock()
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        await handlers.handle_pnl(update, context, cache, db_path)
+
+        # Should reply with text, not photo
+        update.message.reply_text.assert_called_once()
+        update.message.reply_photo.assert_not_called()
+        assert "No trading history" in update.message.reply_text.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_pnl_with_closed_trades_only(self, tmp_path):
+        """Closed trades only → render chart as PNG with realized totals."""
+        from datetime import date
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        # Create and close two trades
+        from db.state import create_calendar_trade, close_calendar_trade
+        t1 = create_calendar_trade(
+            asset="BTC", date_open=date(2026, 6, 1),
+            option_type="Call", strike=100000.0,
+            expiry_near="2026-06-07", expiry_far="2026-07-04",
+            near_days=7, far_days=30, qty=1.0, spot_open=99000.0,
+            near_prem=500.0, far_prem=800.0, net_debit=300.0,
+            near_instrument="BTC-7JUN26-100000-C",
+            far_instrument="BTC-4JUL26-100000-C",
+            db_path=db_path,
+        )
+        close_calendar_trade(
+            t1.id, date_close=date(2026, 6, 7),
+            spot_close=101000.0, pnl=100.0, result="Win", db_path=db_path,
+        )
+
+        cache = MagicMock()
+        await handlers.handle_pnl(update, context, cache, db_path)
+
+        # Should reply with photo
+        update.message.reply_photo.assert_called_once()
+        call_args = update.message.reply_photo.call_args
+        photo_buf = call_args.kwargs["photo"]
+        caption = call_args.kwargs["caption"]
+
+        # Verify PNG magic bytes
+        photo_buf.seek(0)
+        assert photo_buf.read(4) == b"\x89PNG", "Should be valid PNG"
+
+        # Verify caption contains totals
+        assert "Realized" in caption
+        assert "Total" in caption
+
+    @pytest.mark.asyncio
+    async def test_pnl_with_open_trades_only(self, tmp_path):
+        """Open trades only (no closed) → render chart showing unrealized segment."""
+        from datetime import date
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        from db.state import create_calendar_trade
+        create_calendar_trade(
+            asset="BTC", date_open=date(2026, 6, 1),
+            option_type="Call", strike=100000.0,
+            expiry_near="2026-06-07", expiry_far="2026-07-04",
+            near_days=7, far_days=30, qty=1.0, spot_open=99000.0,
+            near_prem=500.0, far_prem=800.0, net_debit=300.0,
+            near_instrument="BTC-7JUN26-100000-C",
+            far_instrument="BTC-4JUL26-100000-C",
+            open_fees=5.0,
+            db_path=db_path,
+        )
+
+        # Mock cache to return valid mid prices
+        cache = MagicMock()
+        near_snap = MagicMock()
+        near_snap.bid = 500.0
+        near_snap.ask = 510.0
+        far_snap = MagicMock()
+        far_snap.bid = 800.0
+        far_snap.ask = 810.0
+        cache.get.side_effect = lambda inst: near_snap if "near" in inst.lower() else far_snap
+
+        await handlers.handle_pnl(update, context, cache, db_path)
+
+        # Should reply with photo
+        update.message.reply_photo.assert_called_once()
+        call_args = update.message.reply_photo.call_args
+        photo_buf = call_args.kwargs["photo"]
+        caption = call_args.kwargs["caption"]
+
+        # Verify PNG
+        photo_buf.seek(0)
+        assert photo_buf.read(4) == b"\x89PNG"
+
+        # Verify caption mentions open trades
+        assert "open" in caption.lower()
+
+    @pytest.mark.asyncio
+    async def test_pnl_with_mixed_trades(self, tmp_path):
+        """Both closed and open trades → render full chart."""
+        from datetime import date
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+
+        from db.state import create_calendar_trade, close_calendar_trade
+
+        # Create closed trade
+        t1 = create_calendar_trade(
+            asset="BTC", date_open=date(2026, 6, 1),
+            option_type="Call", strike=100000.0,
+            expiry_near="2026-06-07", expiry_far="2026-07-04",
+            near_days=7, far_days=30, qty=1.0, spot_open=99000.0,
+            near_prem=500.0, far_prem=800.0, net_debit=300.0,
+            near_instrument="BTC-7JUN26-100000-C",
+            far_instrument="BTC-4JUL26-100000-C",
+            db_path=db_path,
+        )
+        close_calendar_trade(
+            t1.id, date_close=date(2026, 6, 7),
+            spot_close=101000.0, pnl=100.0, result="Win", db_path=db_path,
+        )
+
+        # Create open trade
+        create_calendar_trade(
+            asset="BTC", date_open=date(2026, 6, 5),
+            option_type="Put", strike=95000.0,
+            expiry_near="2026-06-10", expiry_far="2026-07-05",
+            near_days=5, far_days=30, qty=1.0, spot_open=99000.0,
+            near_prem=400.0, far_prem=700.0, net_debit=300.0,
+            near_instrument="BTC-10JUN26-95000-P",
+            far_instrument="BTC-5JUL26-95000-P",
+            open_fees=5.0,
+            db_path=db_path,
+        )
+
+        # Mock cache
+        cache = MagicMock()
+        near_snap = MagicMock()
+        near_snap.bid = 400.0
+        near_snap.ask = 410.0
+        far_snap = MagicMock()
+        far_snap.bid = 700.0
+        far_snap.ask = 710.0
+        cache.get.side_effect = lambda inst: near_snap if "near" in inst.lower() else far_snap
+
+        await handlers.handle_pnl(update, context, cache, db_path)
+
+        # Should reply with photo
+        update.message.reply_photo.assert_called_once()
+        call_args = update.message.reply_photo.call_args
+        photo_buf = call_args.kwargs["photo"]
+        caption = call_args.kwargs["caption"]
+
+        # Verify PNG
+        photo_buf.seek(0)
+        assert photo_buf.read(4) == b"\x89PNG"
+
+        # Verify caption contains all three totals
+        assert "Realized" in caption
+        assert "Unrealized" in caption
+        assert "Total" in caption
+        assert "1 open" in caption
