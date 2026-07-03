@@ -313,16 +313,16 @@ class PortfolioTracker:
     def _authenticate(self) -> str:
         """Obtain a short-lived Deribit access token via client_credentials.
 
-        Credentials are sent as a JSON POST body, not as URL query parameters,
-        so they never appear in exception messages or log output.
+        Credentials are sent as URL query parameters (required by Deribit API).
+        The _SecretRedactor filter on the root logger redacts them from output.
         """
-        url  = f"{self._rest_url}/api/v2/public/auth"
-        body = {
+        params = urllib.parse.urlencode({
             "grant_type":    "client_credentials",
             "client_id":     self._client_id,
             "client_secret": self._client_secret,
-        }
-        data  = _rest_post(url, body)
+        })
+        url  = f"{self._rest_url}/api/v2/public/auth?{params}"
+        data = _rest_get(url)
         token: str = data["result"]["access_token"]
         logger.debug("Deribit REST authentication successful")
         return token
