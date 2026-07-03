@@ -49,6 +49,7 @@ COMMAND_REGISTRY: list[tuple[str, str]] = [
     ("info",              "Check position status on Deribit: /info trade_id=N"),
     ("close",             "Retry closing a stuck position: /close trade_id=N"),
     ("close_manually",    "Manually close position with known spread: /close_manually trade_id=N spread=VALUE"),
+    ("pnl",               "Equity curve: realized P&L (black) + unrealized PnL (dotted green)"),
     ("help",              "List all available commands with descriptions"),
 ]
 
@@ -172,6 +173,10 @@ class TelegramCommandListener:
             await handlers.handle_close_manually(update, context, engine, db_path)
 
         @_require_authorized_chat
+        async def cmd_pnl(update, context):
+            await handlers.handle_pnl(update, context, cache, db_path)
+
+        @_require_authorized_chat
         async def cmd_help(update, context):
             await handlers.handle_help(update, context)
 
@@ -188,6 +193,7 @@ class TelegramCommandListener:
         app.add_handler(CommandHandler("info",              cmd_info))
         app.add_handler(CommandHandler("close",             cmd_close))
         app.add_handler(CommandHandler("close_manually",    cmd_close_manually))
+        app.add_handler(CommandHandler("pnl",               cmd_pnl))
         app.add_handler(CommandHandler("help",              cmd_help))
 
         return app

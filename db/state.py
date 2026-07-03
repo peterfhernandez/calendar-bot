@@ -611,3 +611,17 @@ def reset_close_stuck_position(trade_id: int, db_path: Path = DB_PATH) -> None:
             """,
             (trade_id,),
         )
+
+
+def get_all_closed_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """
+    Return all closed trades (those with date_close IS NOT NULL) ordered chronologically.
+
+    Used for equity curve chart rendering: all realized P&L across all time.
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM calendar_trades WHERE date_close IS NOT NULL ORDER BY date_close ASC, id ASC"
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]

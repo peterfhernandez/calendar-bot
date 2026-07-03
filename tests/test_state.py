@@ -11,6 +11,7 @@ from db.state import (
     load_calendar_state,
     get_calendar_stats,
     update_near_leg,
+    get_all_closed_trades,
 )
 
 
@@ -302,3 +303,79 @@ class TestListAssetsWithOpenPositions:
         _open_trade(db, asset="BTC", strike=100_000.0)
         _open_trade(db, asset="BTC", strike=105_000.0)
         assert list_assets_with_open_positions(db_path=db) == ["BTC"]
+
+
+class TestGetAllClosedTrades:
+    def test_empty_when_no_trades(self, db):
+        trades = get_all_closed_trades(db_path=db)
+        assert trades == []
+
+    def test_returns_only_closed_trades(self, db):
+        t1 = _open_trade(db)
+        _open_trade(db)  # stays open
+        close_calendar_trade(
+            t1.id, date_close=date(2026, 6, 7),
+            spot_close=101_000.0, pnl=100.0, result="Win", db_path=db,
+        )
+        trades = get_all_closed_trades(db_path=db)
+        assert len(trades) == 1
+        assert trades[0].id == t1.id
+
+    def test_ordered_chronologically(self, db):
+        # Create trades on different dates
+        t1 = _open_trade(db)
+        t2 = create_calendar_trade(
+            asset="BTC", date_open=date(2026, 6, 5),
+            option_type="Put", strike=100_000.0,
+            expiry_near="2026-06-10", expiry_far="2026-07-05",
+            near_days=5, far_days=30, qty=1.0, spot_open=99_000.0,
+            near_prem=400.0, far_prem=700.0, net_debit=300.0,
+            near_instrument="BTC-10JUN26-100000-P",
+            far_instrument="BTC-5JUL26-100000-P", db_path=db,
+        )
+
+        # Close both but in reverse order
+        close_calendar_trade(
+            t1.id, date_close=date(2026, 6, 10),
+            spot_close=101_000.0, pnl=100.0, result="Win", db_path=db,
+        )
+        close_calendar_trade(
+            t2.id, date_close=date(2026, 6, 8),
+            spot_close=99_500.0, pnl=50.0, result="Win", db_path=db,
+        )
+
+        trades = get_all_closed_trades(db_path=db)
+        assert len(trades) == 2
+        # Should be ordered by date_close, not by creation order
+        assert trades[0].id == t2.id  # closed 2026-06-08
+        assert trades[1].id == t1.id  # closed 2026-06-10
+
+    def test_includes_pnl_and_fees(self, db):
+        t = _open_trade(db)
+        close_calendar_trade(
+            t.id, date_close=date(2026, 6, 7),
+            spot_close=101_000.0, pnl=100.5, result="Win",
+            close_fees=2.0, db_path=db,
+        )
+        trades = get_all_closed_trades(db_path=db)
+        assert len(trades) == 1
+        assert trades[0].pnl == pytest.approx(100.5)
+        assert trades[0].close_fees == pytest.approx(2.0)
+
+    def test_multiple_closed_trades_mix_of_wins_losses(self, db):
+        trades_created = []
+        for i in range(5):
+            t = _open_trade(db, strike=100_000.0 + i * 1000)
+            trades_created.append(t)
+            pnl = 100.0 if i % 2 == 0 else -50.0
+            close_calendar_trade(
+                t.id, date_close=date(2026, 6, 1 + i),
+                spot_close=101_000.0, pnl=pnl, result="Win" if pnl > 0 else "Loss",
+                db_path=db,
+            )
+
+        trades = get_all_closed_trades(db_path=db)
+        assert len(trades) == 5
+        # Check chronological order
+        for i in range(len(trades) - 1):
+            assert trades[i].date_close <= trades[i + 1].date_close

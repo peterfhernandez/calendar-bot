@@ -24,6 +24,7 @@ from db.state import (
     get_stuck_positions,
     mark_position_manually_closed,
     reset_close_stuck_position,
+    get_all_closed_trades,
     DB_PATH,
 )
 
@@ -598,3 +599,60 @@ async def handle_close_manually(
     except Exception as exc:
         await update.message.reply_text(f"Error closing trade: {exc}")
         logger.error("Failed to manually close trade_id=%d: %s", trade_id, exc)
+
+
+async def handle_pnl(
+    update: Update,
+    context: CallbackContext,
+    cache: ChainCache,
+    db_path: Path = DB_PATH,
+) -> None:
+    """
+    Send an equity curve chart: realized P&L (black line) + unrealized P&L (dotted green).
+
+    Returns a PNG image with cumulative realized P&L from all closed trades, plus the
+    projected total including unrealized P&L from open positions.
+
+    If no trading history exists, replies with text instead.
+    """
+    from telegram_cmd.pnl_chart import render_pnl_chart
+
+    try:
+        closed_trades = get_all_closed_trades(db_path)
+        open_trades = get_open_trades(db_path)
+
+        # If no history at all, reply with text
+        if not closed_trades and not open_trades:
+            await update.message.reply_text("No trading history yet.")
+            return
+
+        # If only open trades (no closed trades), still render chart
+        if not closed_trades:
+            buf = render_pnl_chart([], open_trades, cache)
+            caption = "No closed trades yet. Showing unrealized P&L from open positions."
+            await update.message.reply_photo(photo=buf, caption=caption)
+            return
+
+        # Normal case: render chart with history
+        buf = render_pnl_chart(closed_trades, open_trades, cache)
+
+        # Compute realized and unrealized totals for caption
+        from telegram_cmd.pnl_chart import build_cumulative_series, compute_unrealized
+        realized_series = build_cumulative_series(closed_trades)
+        total_realized = realized_series[-1][1] if realized_series else 0.0
+        total_unrealized, open_count = compute_unrealized(open_trades, cache)
+        total_combined = total_realized + total_unrealized
+
+        caption_parts = [
+            f"Realized: ${total_realized:+.2f}",
+            f"Unrealized: ${total_unrealized:+.2f} ({open_count} open)",
+            f"Total: ${total_combined:+.2f}",
+        ]
+        caption = "\n".join(caption_parts)
+
+        await update.message.reply_photo(photo=buf, caption=caption)
+        logger.info("Sent /pnl chart to Telegram (closed=%d, open=%d)", len(closed_trades), open_count)
+
+    except Exception as exc:
+        await update.message.reply_text(f"Error rendering chart: {exc}")
+        logger.error("Failed to render /pnl chart: %s", exc)
