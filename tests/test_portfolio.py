@@ -211,6 +211,9 @@ class TestAvailableCashCalculation:
         positions = positions or {}
 
         def fake_rest_get(url: str, bearer_token: str | None = None, timeout: int = 10) -> dict:
+            # Handle authentication endpoint (public/auth with query params)
+            if "public/auth" in url:
+                return _fake_auth_response()
             if "get_account_summary" in url:
                 for currency, summary in summaries.items():
                     if f"currency={currency}" in url:
@@ -350,6 +353,8 @@ class TestOfflineTracking:
 
     def _fake_rest_get(self, url, **kwargs):
         """Return a minimal valid API response based on the URL path."""
+        if "public/auth" in url:
+            return _fake_auth_response()
         if "get_account_summary" in url:
             return {"result": {"equity": 1.0, "available_funds": 0.9,
                                "initial_margin": 0.0, "floating_profit_loss": 0.0}}
@@ -362,17 +367,21 @@ class TestOfflineTracking:
         db = _make_db()
         tracker = self._make_tracker(db)
 
-        # First go offline
-        with patch("portfolio.tracker._rest_post", side_effect=OSError("gone")):
+        # First go offline — make _rest_get fail on auth
+        def fail_on_auth(url: str, *args, **kwargs):
+            if "public/auth" in url:
+                raise OSError("network error")
+            return {"result": {}}
+
+        with patch("portfolio.tracker._rest_get", side_effect=fail_on_auth):
             with patch("config.ASSETS", ["BTC"]):
                 tracker.refresh()
         assert tracker._api_offline
 
         # Then recover
-        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post):
-            with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
-                with patch("config.ASSETS", ["BTC"]):
-                    tracker.refresh(spot_prices={"BTC": 100_000.0})
+        with patch("portfolio.tracker._rest_get", side_effect=self._fake_rest_get):
+            with patch("config.ASSETS", ["BTC"]):
+                tracker.refresh(spot_prices={"BTC": 100_000.0})
 
         assert not tracker._api_offline
         assert tracker._api_fail_count == 0
@@ -413,6 +422,8 @@ class TestReconciliation:
         }
 
         def fake_rest_get(url, bearer_token=None, timeout=10):
+            if "public/auth" in url:
+                return _fake_auth_response()
             if "get_account_summary" in url:
                 return {"result": summaries["BTC"]}
             return {"result": []}
