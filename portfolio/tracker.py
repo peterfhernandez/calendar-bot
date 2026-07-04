@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional, NamedTuple
 
 import config
+from data.chain_cache import ChainCache
 from db.state import DB_PATH, get_connection
 
 logger = logging.getLogger(__name__)
@@ -69,19 +70,22 @@ class PortfolioTracker:
     """
     Tracks account equity, available cash, and position P&L for the bot.
 
-    On each call to refresh():
-    1. Authenticates to the Deribit REST API and fetches account summaries
-       for each currency in config.ASSETS.
-    2. Converts equity, available_funds, and initial_margin to USD using
-       the current index price for each currency.
-    3. Reads open positions from SQLite to compute used_margin and
-       realized P&L today.
-    4. Logs a WARNING if Deribit-reported margin and SQLite-computed margin
-       diverge by more than 10%.
+    Behavior depends on TRADING_MODE:
 
-    If API credentials are not configured, refresh() falls back to DB-only
-    mode: equity_usd=0 and available_cash=0 are returned, so the engine
-    continues to use the portfolio_value it was constructed with.
+    **Paper mode (TRADING_MODE == "paper"):**
+    - Zero Deribit REST API calls (completely isolated from exchange)
+    - Equity calculated as: initial_capital + realized_pnl_today + unrealized_pnl_from_cache
+    - Unrealized P&L from live ChainCache mid-prices on open positions
+    - Available cash calculated from DB metrics only
+    - No reconciliation warnings
+    - Result: portfolio view based purely on SQLite + live cache
+
+    **Test/live modes (TRADING_MODE in ["test", "live"]):**
+    - Full Deribit REST API integration (Phase 8b)
+    - Fetches account summaries, positions, and margin data
+    - Reconciles Deribit-reported margin against SQLite
+    - Margin simulation API for Cross Portfolio Margin gate (Phase 17)
+    - Result: portfolio synchronized with actual Deribit account state
 
     Parameters
     ----------
@@ -90,7 +94,10 @@ class PortfolioTracker:
     client_id / client_secret
         Deribit API credentials.  Default: from config.
     rest_url
-        Deribit REST base URL.  Default: derived from config.DERIBIT_PAPER.
+        Deribit REST base URL.  Default: derived from config.DERIBIT_REST_URL.
+    cache
+        Optional ChainCache for live option pricing data.
+        Used in paper mode to compute unrealized P&L from live prices.
     """
 
     def __init__(
@@ -99,11 +106,13 @@ class PortfolioTracker:
         client_id:     str  | None = None,
         client_secret: str  | None = None,
         rest_url:      str  | None = None,
+        cache:         ChainCache | None = None,
     ) -> None:
         self._db_path       = db_path or DB_PATH
         self._client_id     = client_id     if client_id     is not None else config.DERIBIT_CLIENT_ID
         self._client_secret = client_secret if client_secret is not None else config.DERIBIT_CLIENT_SECRET
         self._rest_url      = rest_url or config.DERIBIT_REST_URL
+        self._cache         = cache
 
         # Cached state — updated by refresh()
         self._equity_usd:             float = 0.0
@@ -167,7 +176,18 @@ class PortfolioTracker:
 
     def refresh(self, spot_prices: dict[str, float] | None = None) -> PortfolioState:
         """
-        Refresh portfolio state from the Deribit REST API and SQLite.
+        Refresh portfolio state from Deribit REST API and/or SQLite.
+
+        Behavior depends on TRADING_MODE:
+
+        **Paper mode (TRADING_MODE == "paper"):**
+        - Skips all Deribit REST API calls (no network access)
+        - Calculates equity/available_cash from SQLite + live ChainCache only
+        - No reconciliation warnings
+
+        **Test/live modes (TRADING_MODE in ["test", "live"]):**
+        - Calls Deribit REST API for account summaries and position data
+        - Reconciles DB margin against Deribit-reported margin
 
         Parameters
         ----------
@@ -187,7 +207,32 @@ class PortfolioTracker:
         self._fees_paid_today     = self._calc_fees_paid_today()
         self._fees_paid_total     = self._calc_fees_paid_total()
 
-        # ── Deribit REST API ──────────────────────────────────────────────────
+        # ── Paper mode: DB-only portfolio calculation (no Deribit API) ──────────
+        if config.TRADING_MODE == "paper":
+            self._unrealized_pnl = self._calculate_unrealized_pnl_from_cache()
+            db_only_state = self._calculate_db_only_portfolio()
+            self._equity_usd = db_only_state.get("equity_usd", 0.0)
+            self._available_cash = db_only_state.get("available_cash", 0.0)
+            # Leave Deribit-specific fields at zero (no API call)
+            self._deribit_margin_usd = 0.0
+            self._maintenance_margin_usd = 0.0
+            self._last_refresh = time.time()
+            # Skip reconciliation in paper mode
+            return PortfolioState(
+                equity_usd              = self._equity_usd,
+                available_cash          = self._available_cash,
+                used_margin             = self._used_margin,
+                unrealized_pnl          = self._unrealized_pnl,
+                realized_pnl_today      = self._realized_pnl_today,
+                open_position_count     = self._open_position_count,
+                deribit_margin_usd      = self._deribit_margin_usd,
+                maintenance_margin_usd  = self._maintenance_margin_usd,
+                last_refresh            = self._last_refresh,
+                fees_paid_today         = self._fees_paid_today,
+                fees_paid_total         = self._fees_paid_total,
+            )
+
+        # ── Test/live mode: Deribit REST API ──────────────────────────────────
         has_credentials = bool(self._client_id and self._client_secret)
 
         if has_credentials:
@@ -220,7 +265,7 @@ class PortfolioTracker:
 
         self._last_refresh = time.time()
 
-        # ── Reconciliation ────────────────────────────────────────────────────
+        # ── Reconciliation (test/live only) ───────────────────────────────────
         if self._deribit_margin_usd > 0:
             self._reconcile()
 
@@ -261,7 +306,14 @@ class PortfolioTracker:
     # ── Deribit REST helpers ──────────────────────────────────────────────────
 
     def _refresh_from_api(self, spot_prices: dict[str, float] | None) -> None:
-        """Fetch account summaries and position P&L from Deribit REST."""
+        """Fetch account summaries and position P&L from Deribit REST.
+
+        This method is only called in test/live modes; paper mode skips it entirely.
+        """
+        if config.TRADING_MODE == "paper":
+            logger.debug("_refresh_from_api: skipped in paper mode")
+            return
+
         token = self._authenticate()
 
         total_equity_usd         = 0.0
@@ -362,14 +414,17 @@ class PortfolioTracker:
         -------
         MarginImpact | None
             Projected initial and maintenance margin in USD if simulation succeeds,
-            or None if the API call fails or is unavailable (caller falls back to local proxy).
+            or None if the API call fails, is unavailable, or in paper mode (caller falls back to local proxy).
 
         Note
         ----
-        In paper mode (dry-run execution), this is never called because the
-        margin gate no-ops for paper mode in DecisionEngine._check_margin_gate().
-        The API call is only made in test/live modes where real margin matters.
+        This method is only called in test/live modes. In paper mode, the margin gate
+        no-ops in DecisionEngine._check_margin_gate() so this is never called.
         """
+        if config.TRADING_MODE == "paper":
+            logger.debug("simulate_margin: skipped in paper mode")
+            return None
+
         if not self._client_id or not self._client_secret:
             logger.debug("simulate_margin: no credentials configured")
             return None
@@ -485,6 +540,104 @@ class PortfolioTracker:
                 "FROM calendar_trades"
             ).fetchone()
         return float(row["total"])
+
+    # ── Paper mode portfolio calculation (DB + cache only) ────────────────────
+
+    def _calculate_unrealized_pnl_from_cache(self) -> float:
+        """Calculate unrealized P&L from live ChainCache mid-prices on open positions.
+
+        Queries SQLite for all open positions, fetches their current spread values
+        from ChainCache, and sums the unrealized P&L across all positions.
+
+        Used in paper mode when Deribit API is not called (completely isolated mode).
+
+        Returns
+        -------
+        float
+            Total unrealized P&L in USD across all open positions.
+            Falls back to 0.0 if cache is unavailable.
+        """
+        if not self._cache:
+            logger.debug("_calculate_unrealized_pnl_from_cache: no cache available, returning 0.0")
+            return 0.0
+
+        try:
+            total_unrealized = 0.0
+            with get_connection(self._db_path) as conn:
+                rows = conn.execute(
+                    "SELECT id, near_instrument, far_instrument, qty, net_debit "
+                    "FROM calendar_trades WHERE result = 'Open'"
+                ).fetchall()
+
+            for row in rows:
+                trade_id = row["id"]
+                near_instr = row["near_instrument"]
+                far_instr = row["far_instrument"]
+                qty = row["qty"]
+                net_debit = row["net_debit"]
+
+                try:
+                    # Fetch live mid prices from cache
+                    near_snap = self._cache.get_ticker(near_instr)
+                    far_snap = self._cache.get_ticker(far_instr)
+
+                    if near_snap and far_snap:
+                        near_mid = (near_snap.bid + near_snap.ask) / 2.0 if (near_snap.bid + near_snap.ask) > 0 else 0.0
+                        far_mid = (far_snap.bid + far_snap.ask) / 2.0 if (far_snap.bid + far_snap.ask) > 0 else 0.0
+                        spread_value = max(0.0, far_mid - near_mid) * qty
+                        unrealized = spread_value - net_debit * qty
+                        total_unrealized += unrealized
+                        logger.debug(
+                            "Position %d: spread_value=$%.2f, net_debit=%.4f, qty=%.1f, "
+                            "unrealized=$%.2f",
+                            trade_id, spread_value, net_debit, qty, unrealized,
+                        )
+                    else:
+                        logger.debug(
+                            "Position %d: cache stale or missing (near=%s, far=%s)",
+                            trade_id,
+                            "present" if near_snap else "missing",
+                            "present" if far_snap else "missing",
+                        )
+                except Exception as e:
+                    logger.debug("Error calculating unrealized for position %d: %s", trade_id, e)
+
+            return total_unrealized
+
+        except Exception as exc:
+            logger.debug("_calculate_unrealized_pnl_from_cache failed: %s", exc)
+            return 0.0
+
+    def _calculate_db_only_portfolio(self) -> dict:
+        """Calculate portfolio equity and available cash from DB metrics and cache.
+
+        Used in paper mode to compute portfolio state without any Deribit API calls.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - equity_usd: Total account equity (calculated from capital + realized + unrealized)
+            - available_cash: Cash available for new positions
+            - unrealized_pnl: Current unrealized P&L (populated separately in refresh())
+        """
+        # In paper mode, we estimate starting equity from the initial capital
+        # If not explicitly set, we can derive it from DB + realized/unrealized
+        initial_capital = getattr(config, "INITIAL_CAPITAL", 10000.0)  # Default fallback
+        unrealized = self._unrealized_pnl
+
+        # Equity = initial capital + realized today + unrealized (from cache)
+        equity_usd = initial_capital + self._realized_pnl_today + unrealized
+
+        # Available cash = equity - amount locked in open positions
+        # (locked = sum of net_debit * qty for all open positions)
+        available_cash = max(0.0, equity_usd - self._used_margin)
+
+        return {
+            "equity_usd": equity_usd,
+            "available_cash": available_cash,
+            "unrealized_pnl": unrealized,
+        }
 
     # ── Reconciliation ────────────────────────────────────────────────────────
 

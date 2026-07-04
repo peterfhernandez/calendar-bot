@@ -995,7 +995,72 @@ If notifications still fail to arrive:
 3. Verify `.env` has valid TELEGRAM_TOKEN and TELEGRAM_CHAT
 4. See TELEGRAM_DEBUGGING_GUIDE.md for detailed solutions
 
-**Phase 17b — Notification Spam Prevention for Stuck Positions:**
+---
+
+## Phase 17b — Paper Mode Portfolio Isolation
+
+In paper mode, the bot should be completely isolated from Deribit. All portfolio metrics (equity, available cash, unrealized P&L, margin) should be calculated from the SQLite database and live cache prices, with zero REST API calls to Deribit.
+
+**Root Cause:** `portfolio/tracker.py` unconditionally calls Deribit REST APIs when credentials are configured, regardless of trading mode. This causes:
+1. Unnecessary API overhead in paper mode
+2. Reconciliation warnings comparing Deribit margin with DB margin (confusing when paper mode shouldn't touch Deribit)
+3. Portfolio snapshots showing zero equity/available_cash in DB-only fallback mode
+4. "RECONCILE MISMATCH" warnings that are not actionable in paper mode
+
+### Implementation
+
+- [ ] **Item 1: Import TRADING_MODE** — Add `TRADING_MODE` from config to `portfolio/tracker.py`
+  - [ ] Import statement at top of file
+  - [ ] Use in trading-mode checks
+
+- [ ] **Item 2: Skip API in paper mode** — Modify `refresh()` to return early if `TRADING_MODE == "paper"`, after calculating SQLite values but before any Deribit API calls
+  - [ ] Check `TRADING_MODE == "paper"` before calling `_refresh_from_api()`
+  - [ ] Ensure SQLite calculations (`_used_margin`, `_realized_pnl_today`, `_open_position_count`, `_fees_paid_today`, `_fees_paid_total`) always run
+  - [ ] Skip reconciliation entirely in paper mode
+
+- [ ] **Item 3: Calculate unrealized P&L from cache in paper mode** — Implement `_calculate_unrealized_pnl_from_cache()` that:
+  - [ ] Queries open positions from SQLite
+  - [ ] Fetches live spread values from `ChainCache` for each position
+  - [ ] Sums `(spread_value - net_debit * qty)` per position
+  - [ ] Falls back to 0.0 if cache unavailable (consistent with current behavior)
+  - [ ] Called in paper mode when Deribit API is skipped
+
+- [ ] **Item 4: Implement DB-only portfolio calculation** — Create `_calculate_db_only_portfolio()` that:
+  - [ ] Computes `equity_usd` from: initial capital + realized P&L today + unrealized P&L from cache
+  - [ ] Computes `available_cash` from DB-only metrics (no Deribit API call)
+  - [ ] Returns dict with equity, available_cash, and unrealized_pnl
+  - [ ] Called in paper mode after skipping API calls
+
+- [ ] **Item 5: Add safety guards and docstrings** 
+  - [ ] Add explicit `if TRADING_MODE != "paper"` check at start of `_refresh_from_api()` as belt-and-suspenders
+  - [ ] Add explicit `if TRADING_MODE != "paper"` guard in `simulate_margin()` for clarity
+  - [ ] Update class docstring to document paper vs test/live behavior
+  - [ ] Update method docstrings noting which are test/live only
+
+### Test Coverage
+
+- [ ] `TestPaperModePortfolioIsolation::test_no_deribit_api_calls_in_paper_mode` — verify zero REST API calls to Deribit in paper mode
+- [ ] `TestPaperModePortfolioIsolation::test_no_reconciliation_warning_in_paper_mode` — verify no RECONCILE MISMATCH warnings logged
+- [ ] `TestPaperModePortfolioIsolation::test_equity_calculated_from_db_in_paper_mode` — verify non-zero equity from DB calculation
+- [ ] `TestPaperModePortfolioIsolation::test_unrealized_pnl_from_cache_in_paper_mode` — verify unrealized P&L calculated from live cache prices
+- [ ] `TestPaperModePortfolioIsolation::test_test_mode_still_uses_deribit_api` — regression: verify test/live modes still call Deribit API
+
+### Expected Results
+
+In **paper mode**:
+- ✅ Zero Deribit REST API calls in `portfolio/tracker.py`
+- ✅ Portfolio snapshot shows realistic equity and unrealized P&L (calculated from DB + cache)
+- ✅ No reconciliation warnings or mismatches
+- ✅ All values come from SQLite + live cache, never from Deribit
+
+In **test/live mode**:
+- ✅ Behavior unchanged — full Deribit API integration continues
+- ✅ Reconciliation still runs to verify DB matches Deribit
+- ✅ Margin simulation API calls proceed normally
+
+---
+
+## Phase 17c — Notification Spam Prevention for Stuck Positions
 
 - [x] **Notification deduplication** — Add `_notified_stuck: set[int]` to track positions already notified
 - [x] **Stop-loss guard** — Only send `notify_close_stuck()` once per stuck position, not every monitor tick

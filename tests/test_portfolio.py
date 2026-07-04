@@ -25,6 +25,15 @@ from portfolio.tracker import (
 )
 
 
+# Fixture: Default TRADING_MODE to "test" for all tests except paper mode tests
+# Paper mode tests will explicitly override this
+@pytest.fixture(autouse=True)
+def _default_trading_mode_to_test():
+    """Default TRADING_MODE to 'test' for all tests, ensuring API path is taken."""
+    with patch("config.TRADING_MODE", "test"):
+        yield
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_db() -> Path:
@@ -752,3 +761,167 @@ class TestMaintenanceMargin:
             result = tracker.simulate_margin(legs)
             # Should gracefully handle the error and return None
             assert result is None
+
+
+# ── Paper mode portfolio isolation (Phase 17b) ─────────────────────────────────
+
+class TestPaperModePortfolioIsolation:
+    """Verify that paper mode makes zero Deribit API calls and uses DB+cache only."""
+
+    def test_no_deribit_api_calls_in_paper_mode(self):
+        """In paper mode, refresh() should not call Deribit REST APIs."""
+        db = _make_db()
+        _seed_open_trade(db, net_debit=10.0, qty=2.0)
+
+        tracker = PortfolioTracker(
+            db_path=db,
+            client_id="test_id",
+            client_secret="test_secret",
+        )
+
+        # Mock both _rest_get and _rest_post to fail if called
+        with patch("portfolio.tracker._rest_get") as mock_get, \
+             patch("portfolio.tracker._rest_post") as mock_post, \
+             patch("config.TRADING_MODE", "paper"):
+            # Set up mocks to fail if they are called
+            mock_get.side_effect = RuntimeError("REST GET should not be called in paper mode")
+            mock_post.side_effect = RuntimeError("REST POST should not be called in paper mode")
+
+            # Refresh should succeed without calling REST APIs
+            state = tracker.refresh()
+
+            # Verify refresh succeeded (returned a state)
+            assert state is not None
+            # Verify the REST methods were NOT called
+            mock_get.assert_not_called()
+            mock_post.assert_not_called()
+
+    def test_no_reconciliation_warning_in_paper_mode(self):
+        """In paper mode, refresh() should not emit reconciliation warnings."""
+        db = _make_db()
+        _seed_open_trade(db, net_debit=10.0, qty=2.0)
+
+        tracker = PortfolioTracker(db_path=db)
+
+        with patch("config.TRADING_MODE", "paper"), \
+             patch("portfolio.tracker.logger") as mock_logger:
+            state = tracker.refresh()
+
+            # Verify no WARNING logs for reconciliation
+            warning_calls = [
+                call for call in mock_logger.warning.call_args_list
+                if "RECONCILE" in str(call)
+            ]
+            assert len(warning_calls) == 0, "Paper mode should not emit reconciliation warnings"
+
+    def test_equity_calculated_from_db_in_paper_mode(self):
+        """In paper mode, equity should be non-zero and calculated from DB."""
+        db = _make_db()
+        _seed_open_trade(db, net_debit=10.0, qty=2.0)
+
+        tracker = PortfolioTracker(db_path=db)
+
+        # Mock config.INITIAL_CAPITAL if it exists, otherwise use default
+        with patch("config.TRADING_MODE", "paper"), \
+             patch("config.INITIAL_CAPITAL", 50_000.0, create=True):
+            state = tracker.refresh()
+
+            # Equity should be non-zero and calculated from DB
+            assert state.equity_usd > 0, "Paper mode should calculate non-zero equity"
+            # Since no realized PnL and unrealized from cache (0 without real cache),
+            # equity should be initial capital (or close to it due to rounding)
+            assert state.equity_usd >= 10_000.0  # At least the default if INITIAL_CAPITAL not found
+
+    def test_unrealized_pnl_from_cache_in_paper_mode(self):
+        """In paper mode, unrealized P&L should come from live cache prices."""
+        db = _make_db()
+        # Seed with a known instrument pair
+        with get_connection(db) as conn:
+            conn.execute(
+                """
+                INSERT INTO calendar_trades
+                (asset, date_open, option_type, strike, expiry_near, expiry_far,
+                 near_days, far_days, qty, spot_open, net_debit, near_prem, far_prem,
+                 near_instrument, far_instrument, result)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("BTC", date.today().isoformat(), "Call", 90_000.0,
+                 "27JUN25", "25JUL25", 3, 31, 2.0, 90_000.0, 10.0,
+                 9.0, 11.0, "BTC-27JUN25-90000-C", "BTC-25JUL25-90000-C", "Open"),
+            )
+            conn.commit()
+
+        # Create a mock cache that returns ticker snapshots
+        mock_cache = MagicMock()
+        mock_near_snap = MagicMock()
+        mock_near_snap.bid = 9.0
+        mock_near_snap.ask = 9.2
+        mock_far_snap = MagicMock()
+        mock_far_snap.bid = 11.0
+        mock_far_snap.ask = 11.2
+
+        # Set up the cache to return these snapshots
+        def get_ticker_side_effect(instr):
+            if "27JUN" in instr or "near" in instr.lower():
+                return mock_near_snap
+            else:
+                return mock_far_snap
+
+        mock_cache.get_ticker.side_effect = get_ticker_side_effect
+
+        tracker = PortfolioTracker(db_path=db, cache=mock_cache)
+
+        with patch("config.TRADING_MODE", "paper"):
+            state = tracker.refresh()
+
+            # Unrealized should be calculated from cache (spread_value - net_debit*qty)
+            # spread_value ≈ (11.1 - 9.1) * 2.0 = 4.0
+            # net_debit*qty = 10.0 * 2.0 = 20.0
+            # unrealized ≈ 4.0 - 20.0 = -16.0
+            assert state.unrealized_pnl < 0, "Negative unrealized should come from cache calculation"
+
+    def test_test_mode_still_uses_deribit_api(self):
+        """Regression test: test/live modes should still call Deribit API."""
+        db = _make_db()
+        _seed_open_trade(db, net_debit=10.0, qty=2.0)
+
+        tracker = PortfolioTracker(
+            db_path=db,
+            client_id="test_id",
+            client_secret="test_secret",
+        )
+
+        # Mock Deribit responses
+        auth_response = {"result": {"access_token": "fake_token"}}
+        summary_response = {
+            "result": {
+                "equity": 100.0,
+                "available_funds": 90.0,
+                "initial_margin": 5.0,
+                "maintenance_margin": 4.0,
+            }
+        }
+        positions_response = {"result": []}
+
+        with patch("portfolio.tracker._rest_get") as mock_get, \
+             patch("portfolio.tracker._resolve_spot") as mock_spot, \
+             patch("config.TRADING_MODE", "test"):
+            def get_side_effect(url, **kwargs):
+                if "auth" in url:
+                    return auth_response
+                elif "get_account_summary" in url:
+                    return summary_response
+                elif "get_positions" in url:
+                    return positions_response
+                else:
+                    return {}
+
+            mock_get.side_effect = get_side_effect
+            mock_spot.return_value = 100_000.0  # BTC spot price
+
+            state = tracker.refresh()
+
+            # In test mode, API calls should be made
+            assert mock_get.called, "Test mode should call Deribit REST API"
+            # Equity should come from API (100.0 BTC * 100,000 spot = $10M)
+            assert state.equity_usd > 0

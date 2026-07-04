@@ -1100,3 +1100,92 @@ This mirrors the project's existing convention (`DERIBIT_PAPER`/`TRADING_MODE` g
 - **API rate limits** — Deribit may rate-limit frequent margin simulation calls; monitor logs for failures and adjust scan frequency if needed
 - **Spot price resolution** — Margin API response uses base currency (BTC/ETH/SOL), requiring live spot price to convert to USD; relies on `_resolve_spot()` function which fetches from public API
 - **Proxy accuracy** — Fallback formula is deliberately conservative; live simulation API provides more accurate X:PM numbers and is always preferred when available
+
+---
+
+## Phase 17b — Paper Mode Portfolio Isolation
+
+### Problem
+
+In paper mode, the bot should be **completely isolated from Deribit's test exchange**. All portfolio metrics (equity, available cash, unrealized P&L, margin utilization) should be calculated from the SQLite database and live cache prices, with zero REST API calls to Deribit.
+
+Currently, `portfolio/tracker.py` unconditionally calls Deribit REST APIs when credentials are configured, regardless of trading mode. This causes:
+
+1. **Unnecessary API overhead** — paper mode makes REST calls even though it doesn't need live account data
+2. **Reconciliation confusion** — warnings comparing Deribit margin with DB-calculated margin appear in paper mode logs, despite paper mode being purely simulated
+3. **False portfolio snapshots** — equity and available_cash show zero or stale values from fallback mode instead of calculated values
+4. **Non-actionable warnings** — "RECONCILE MISMATCH" alerts are printed even though paper mode should never trust Deribit's numbers anyway
+
+### Architecture
+
+**Paper mode (TRADING_MODE == "paper"):**
+
+- `portfolio/tracker.py` skips all Deribit REST API calls (`_refresh_from_api()` returns early)
+- Equity is calculated as: `initial_capital + realized_pnl_today + unrealized_pnl_from_cache`
+- Unrealized P&L comes from live `ChainCache` mid-prices: `sum((spread_value - net_debit*qty) for each open position)`
+- Available cash = equity − sum of net debits on open positions (from SQLite)
+- No reconciliation warnings are emitted
+- `simulate_margin()` is no-op (paper has no margin)
+- Result: bot sees a realistic portfolio view based purely on DB + cache, never touching Deribit
+
+**Test/live modes (TRADING_MODE == "test" | "live"):**
+
+- Behavior unchanged — full Deribit REST API integration continues
+- Reconciliation runs to verify DB margin matches Deribit's reported margin
+- Margin simulation API calls proceed normally (Phase 17 functionality)
+- Initial capital still comes from Deribit's reported equity on startup
+- Result: DB is synchronized with Deribit's actual account state
+
+### Why this matters
+
+**During paper trading validation**, logs should not be cluttered with Deribit API calls or reconciliation warnings — the whole point of paper mode is to prove the bot's logic in isolation before going live. Paper mode logs should be clean and focused on decision logic, not account reconciliation.
+
+**For operators switching between modes**, it's immediately obvious from the absence of API noise that paper mode is truly isolated. Absence of reconciliation warnings signals "this is pure simulation, not touching the live/test account."
+
+### Implementation
+
+**`portfolio/tracker.py` changes:**
+
+1. **Item 1:** Import `TRADING_MODE` from `config` at module top
+2. **Item 2:** In `refresh()`, add early return after SQLite calculations if `TRADING_MODE == "paper"`:
+   - `_used_margin`, `_realized_pnl_today`, `_open_position_count`, `_fees_paid_today`, `_fees_paid_total` always calculated
+   - `_refresh_from_api()` skipped entirely
+   - Reconciliation skipped entirely
+3. **Item 3:** Implement `_calculate_unrealized_pnl_from_cache()`:
+   - Query open positions from SQLite
+   - For each position, fetch live spread value from `ChainCache`
+   - Sum `(spread_value - net_debit*qty)` across all positions
+   - Fall back to 0.0 if cache unavailable
+4. **Item 4:** Implement `_calculate_db_only_portfolio()`:
+   - Compute `equity_usd = initial_capital + realized_pnl_today + unrealized_pnl_from_cache`
+   - Compute `available_cash = equity_usd - sum(net_debit*qty for each open position)`
+   - Return dict with `equity_usd`, `available_cash`, `unrealized_pnl`
+5. **Item 5:** Add safety guards and docstrings:
+   - Guard at start of `_refresh_from_api()`: `if TRADING_MODE != "paper": ...` (belt-and-suspenders)
+   - Guard in `simulate_margin()`: `if TRADING_MODE != "paper": ...` with early return
+   - Update class docstring documenting paper vs test/live behavior
+   - Update method docstrings noting which paths are test/live only
+
+### Test coverage
+
+New test class `TestPaperModePortfolioIsolation` in `tests/test_portfolio.py`:
+
+- `test_no_deribit_api_calls_in_paper_mode` — mock `_rest_get` and `_rest_post` to verify zero calls when `TRADING_MODE=="paper"`
+- `test_no_reconciliation_warning_in_paper_mode` — verify no log records at WARNING level for "RECONCILE MISMATCH"
+- `test_equity_calculated_from_db_in_paper_mode` — verify non-zero equity computed from DB + cache
+- `test_unrealized_pnl_from_cache_in_paper_mode` — verify unrealized P&L calculated from live cache prices
+- `test_test_mode_still_uses_deribit_api` — regression test: verify test/live modes still call Deribit API
+
+### Expected results
+
+**Paper mode:**
+- ✅ Zero Deribit REST API calls in `portfolio/tracker.py`
+- ✅ Portfolio snapshot shows realistic equity and available cash
+- ✅ Unrealized P&L reflects current spread values from cache
+- ✅ No reconciliation warnings
+- ✅ All metrics come from SQLite + cache only
+
+**Test/live mode:**
+- ✅ Behavior unchanged — full Deribit API integration continues
+- ✅ Reconciliation runs as before
+- ✅ Margin simulation proceeds normally
