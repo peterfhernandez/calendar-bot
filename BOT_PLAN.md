@@ -1054,8 +1054,49 @@ This mirrors the project's existing convention (`DERIBIT_PAPER`/`TRADING_MODE` g
 | `config.py` | + `MAX_MARGIN_UTILIZATION_PCT`, `MARGIN_GATE_ENABLED`, `MARGIN_GATE_REQUIRED_LIVE` |
 | `strategy/decision.py` | + `_check_margin_gate()`, called from `scan_tick()` and `_try_roll()` |
 
-### Risks / open questions
+### Implementation (Completed)
 
-- **Unconfirmed API schema** — the primary "what-if margin" call must be verified against the live test-exchange API before the gate can be built with confidence; treated as the first implementation task, not an afterthought.
-- **Rate limits** — a live margin-simulation call per candidate per scan cycle adds REST calls beyond what `PortfolioTracker.refresh()` already makes; may need caching or batching if the candidate list is large per scan.
-- **Proxy accuracy** — the fallback formula is a safety backstop, not a faithful PM simulation; it should be treated as deliberately conservative rather than precise, and the primary live-simulation path should be preferred whenever available.
+**API schema confirmed:** The Deribit `private/get_margins` endpoint takes a `legs` parameter with a list of objects containing `instrument_name`, `amount`, and `price`. The response includes `initial_margin` and `maintenance_margin` in the base currency (BTC, ETH, SOL), which are then converted to USD using current spot prices.
+
+**Key changes made:**
+
+1. **`portfolio/tracker.py`**
+   - Enhanced `_rest_post()` to support optional `bearer_token` parameter for authenticated REST calls
+   - Implemented `simulate_margin(legs)` to call Deribit's margin simulation API
+   - Extracts `initial_margin` and `maintenance_margin` from response and converts to USD
+   - Gracefully returns `None` on any API failure so callers fall back to local proxy
+   - Logs simulation results at DEBUG level for troubleshooting
+
+2. **`bot.py`**
+   - Now instantiates `PortfolioTracker` when credentials are configured
+   - Passes `portfolio=tracker` to `BotLoop()` so margin gate can access margin data
+
+3. **`strategy/decision.py`**
+   - Implemented `_check_margin_gate(candidate)` mirroring `_check_liquidity_gate()` pattern
+   - Paper mode: returns `None` immediately (no-op, no real account to protect)
+   - Test/live mode: checks both current and projected margin utilization
+   - Tries live simulation API first, falls back to conservative proxy formula
+   - Called in `scan_tick()` RANK loop after liquidity gate
+   - Called in `_try_roll()` to prevent rolls that breach margin ceiling
+   - Logs rejections at INFO level for operator visibility
+
+4. **Tests added**
+   - `test_simulate_margin_success`: Verifies margin API call and USD conversion
+   - `test_simulate_margin_no_credentials`: Verifies graceful handling without credentials
+   - `test_simulate_margin_empty_legs`: Verifies behavior with no legs provided
+   - `test_simulate_margin_api_failure`: Verifies API error handling and None return
+   - `TestMarginGate` (6 tests): Comprehensive testing of gate behavior in all scenarios
+     - Gate disabled/enabled via config
+     - Paper mode no-op
+     - No portfolio tracker fallback
+     - Current utilization checks
+     - Projected utilization (proxy formula)
+     - Live simulation API precedence
+
+**Status:** ✅ Phase 17 complete. All margin gate functionality implemented and tested. Gate is now active and prevents entries/rolls that would breach Cross Portfolio Margin utilization ceiling.
+
+### Risks / considerations
+
+- **API rate limits** — Deribit may rate-limit frequent margin simulation calls; monitor logs for failures and adjust scan frequency if needed
+- **Spot price resolution** — Margin API response uses base currency (BTC/ETH/SOL), requiring live spot price to convert to USD; relies on `_resolve_spot()` function which fetches from public API
+- **Proxy accuracy** — Fallback formula is deliberately conservative; live simulation API provides more accurate X:PM numbers and is always preferred when available
