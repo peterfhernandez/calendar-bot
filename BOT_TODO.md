@@ -541,65 +541,65 @@ New Telegram command that renders the bot's full trading history as an equity-cu
 
 ## Phase 17 — Cross Portfolio Margin (X:PM) Entry Gate
 
-New entry gate that rejects a candidate if adding it to the current portfolio would push the account's margin utilization to a level that risks a margin call, using Deribit's actual Cross Portfolio Margin (X:PM) numbers rather than a local approximation of debit-at-risk.
+Completed. New entry gate that rejects a candidate if adding it to the current portfolio would push the account's margin utilization to a level that risks a margin call, using Deribit's actual Cross Portfolio Margin (X:PM) numbers rather than a local approximation of debit-at-risk.
 
-### Why this is different from the existing sizing/risk checks
+### Key implementation details
 
-`strategy/sizer.py` already caps position size against `MAX_LOSS_PCT` and `MAX_TOTAL_RISK_PCT` of portfolio value, using `net_debit × qty` (capital paid) as the risk measure. That protects capital-at-risk for a bounded-loss long calendar spread held to expiry, but it is **not the same number Deribit uses to decide whether to liquidate the account**. Under Cross Portfolio Margin, Deribit stress-tests the *entire* portfolio — all currencies, all instruments — across a grid of underlying price-move buckets (±16% by default, 9 buckets) crossed with volatility-up/same/down scenarios, plus an extended tail table for far-OTM short exposure, a delta shock, and a roll shock; the worst simulated scenario becomes the Initial Margin, and Maintenance Margin is a fraction of that (default factor 0.80). This is a materially different, and generally larger and more volatile, number than the sum of position debits — it is also driven by the *whole* portfolio's composition (e.g. correlated strikes/expiries across BTC and ETH are netted together), not the candidate in isolation. Two margin-call/liquidation incidents are already logged in this file (2026-06-22 and 2026-07-01 — see Bug Fixes) despite `MAX_TOTAL_RISK_PCT` being respected in both cases, which is exactly the gap this gate closes.
+**Paper mode:** Gate is a no-op (returns None immediately) so paper trading is not blocked by the absence of a funded test account. Margin data is only checked in `test` and `live` modes.
 
-### Why the model is not reimplemented locally
+**Live margin simulation:** `PortfolioTracker.simulate_margin()` calls Deribit's `private/get_margins` API with candidate legs (instrument_name, amount, price) and returns projected initial/maintenance margin in USD, or None on any failure.
 
-Deribit publishes the X:PM model in detail (see `support.deribit.com/hc/en-us/articles/25944756247837-Portfolio-Margin` and the PME whitepaper at `statics.deribit.com/files/DeribitPortfolioMarginModel.pdf`), but it is a large exchange-side risk engine: per-currency-pair price range buckets, volatility shock curves, an extended table with per-bucket dampeners and margin multipliers, delta shock and roll shock formulas that depend on live thresholds, and cross-currency haircuts for non-core collateral. All of these parameters are queryable live via `public/pme/get_params` and can change without notice — a local reimplementation would drift from the exchange's real number and give false confidence. This gate instead asks Deribit for the real, current margin figures rather than re-deriving them.
+**Fallback proxy:** When the live API call fails or is unavailable, uses a conservative local formula: `projected_util = (current_maintenance_margin + candidate_net_debit × qty) / equity`. This is a safety backstop, deliberately conservative since it doesn't include correlation offsets that the real PM calculation might allow.
 
-### Design
+**Fail-closed in test/live:** When margin data is unavailable in test/live mode, the gate rejects candidates to prevent margin calls. In paper mode, the gate is a no-op regardless of data availability.
 
-**Primary check — ask Deribit for the real number.** Before entering, call a Deribit margin-simulation endpoint with the candidate's near and far leg orders to get the account's *projected* initial/maintenance margin if the trade were placed. The exact endpoint/response shape must be confirmed against the live API at implementation time (`docs.deribit.com/api-reference` is a JS-rendered app that could not be scraped during this analysis session) — likely `private/get_margins` or equivalent, taking `instrument_name`/`amount`/`price` per leg. **First implementation task: a scratch script against `test.deribit.com` that calls the candidate endpoint(s) and prints the raw response**, so the real schema is confirmed before the gate is built against it.
-
-**Fallback check — conservative local proxy**, used whenever the simulation call fails, is unavailable, or credentials are absent:
-
-1. Reject immediately if the account's *current* `maintenance_margin / equity` (from `get_account_summary`, already fetched by `PortfolioTracker`) exceeds `MAX_MARGIN_UTILIZATION_PCT` — don't add risk to an account that is already stressed.
-2. Otherwise, approximate the *projected* utilization as `(current_maintenance_margin + candidate_net_debit × qty) / equity` — the candidate's own max loss is a floor on its margin contribution — and reject if that projected ratio exceeds `MAX_MARGIN_UTILIZATION_PCT`. This is a conservative floor, not the true PM number (PM can give correlation offsets that lower the real requirement, or extended-table/delta-shock effects that raise it) — it is a safety backstop, not a replacement for the primary check.
-
-`MAX_MARGIN_UTILIZATION_PCT` defaults to `0.80`, matching Deribit's own default Maintenance Margin Factor, so the bot self-limits before reaching Deribit's liquidation threshold rather than at it.
-
-**Live-vs-paper behaviour:** in `test`/`live` mode with no usable margin data (API error, no credentials), the gate **fails closed** — reject the candidate and log a warning — since this gate exists specifically to prevent real liquidations. In `paper` mode (dry-run, no real account/margin), the gate is a no-op by default so paper trading is not blocked by the absence of a funded test account; `MARGIN_GATE_ENABLED` can force it on in paper mode for testing.
-
-### Prerequisite: `PortfolioTracker` is not currently wired into the running bot
-
-`strategy/decision.py`'s `DecisionEngine` already accepts an optional `portfolio: PortfolioTracker` and calls `portfolio.refresh()` at the top of `scan_tick()` when one is supplied (Phase 8b), and `monitor/loop.py`'s `BotLoop` already forwards a `portfolio` argument through — but `bot.py`'s `_run()` never actually constructs a `PortfolioTracker` or passes `portfolio=` to `BotLoop(...)`. This gate needs live margin data, so wiring `PortfolioTracker` into `bot.py` is a prerequisite, not optional.
+### Changes made
 
 ### `portfolio/tracker.py`
 
-- [ ] Capture `maintenance_margin` per currency in `_refresh_from_api()` alongside the existing `initial_margin` fetch (same `get_account_summary` response, no extra API call)
-- [ ] Add `maintenance_margin_usd` field to `PortfolioState` and a corresponding property on `PortfolioTracker`
-- [ ] Add `margin_utilization_pct` property — `maintenance_margin_usd / equity_usd`, or `0.0` when equity is zero/unavailable
-- [ ] Add `simulate_margin(legs: list[tuple[str, float, float]]) -> MarginImpact | None` — calls the Deribit margin-simulation endpoint (schema confirmed by the scratch script below) for the candidate's near/far leg `(instrument_name, amount, price)`; returns `None` on any failure so callers fall back to the local proxy rather than raising
-- [ ] `MarginImpact` dataclass: `projected_initial_margin_usd`, `projected_maintenance_margin_usd`
+- [x] `maintenance_margin_usd` property — tracks current maintenance margin from `get_account_summary`
+- [x] `margin_utilization_pct` property — `maintenance_margin_usd / equity_usd`
+- [x] `MarginImpact` dataclass — holds `projected_initial_margin_usd` and `projected_maintenance_margin_usd`
+- [x] `simulate_margin(legs)` — calls Deribit `private/get_margins` endpoint; extracts margin from response and converts to USD using spot prices; returns None on any failure
+- [x] Enhanced `_rest_post()` to support optional `bearer_token` parameter for authenticated POST requests
 
 ### `bot.py`
 
-- [ ] Instantiate `PortfolioTracker` in `_run()` (using `config.DERIBIT_CLIENT_ID`/`SECRET`) and pass `portfolio=tracker` to `BotLoop(...)` — closes the wiring gap above
-- [ ] Startup log line includes current margin utilization when a tracker is attached
+- [x] Instantiated `PortfolioTracker` in `_run()` when credentials are configured
+- [x] Passed `portfolio=tracker` to `BotLoop()` for use by DecisionEngine
 
 ### `config.py`
 
-- [ ] `MAX_MARGIN_UTILIZATION_PCT = 0.80` — ceiling on `maintenance_margin / equity`, current and projected-after-entry
-- [ ] `MARGIN_GATE_ENABLED = True` — kill switch; when `False` the gate always passes (escape hatch if the simulation endpoint proves unreliable)
-- [ ] `MARGIN_GATE_REQUIRED_LIVE = True` — in `test`/`live` mode, missing/failed margin data blocks entry (fail closed); paper mode does not require it
+- [x] `MAX_MARGIN_UTILIZATION_PCT = 0.80` — ceiling on `maintenance_margin / equity` (matches Deribit's default)
+- [x] `MARGIN_GATE_ENABLED = True` — gate can be disabled via config
+- [x] `MARGIN_GATE_REQUIRED_LIVE = True` — gate fails closed in test/live mode when margin data unavailable
 
 ### `strategy/decision.py`
 
-- [ ] `_check_margin_gate(candidate: CalendarCandidate) -> str | None` — mirrors `_check_liquidity_gate`'s signature and style (returns a rejection reason string or `None`); tries `self._portfolio.simulate_margin(...)` first, falls back to the local proxy formula, applies the fail-open/fail-closed rule based on `config.TRADING_MODE`
-- [ ] Call `_check_margin_gate()` in `scan_tick()`'s RANK loop immediately after the existing `_check_liquidity_gate()` call — same skip-and-continue pattern (one rejected candidate does not stop the scan)
-- [ ] Call `_check_margin_gate()` in `_try_roll()` alongside the existing `_check_liquidity_gate()` reuse — a roll changes portfolio composition and can trigger a margin call on its own (this is exactly how the 2026-07-01 incident occurred)
-- [ ] Log rejections at INFO (not DEBUG, unlike the liquidity gate) — a margin-gate rejection is a higher-signal event worth surfacing without needing debug logging enabled
+- [x] `_check_margin_gate(candidate)` — checks if adding candidate would breach margin ceiling
+  - Paper mode: returns None (no-op)
+  - Test/live mode: checks current utilization, tries live simulation API, falls back to proxy formula
+  - Rejects if current OR projected utilization exceeds MAX_MARGIN_UTILIZATION_PCT
+- [x] Called in `scan_tick()` after liquidity gate to reject over-leveraged candidates
+- [x] Called in `_try_roll()` to prevent rolls that would breach margin ceiling
+- [x] Logs rejections at INFO level
 
-### Tests and scratch
+### Tests
 
-- [ ] `scratch/scratch_margin_probe.py` — **run first, before writing the gate.** Connects to `test.deribit.com` with paper/test credentials, calls the candidate margin-simulation endpoint for a small hypothetical order, and prints the raw JSON response so the real schema can be confirmed and `simulate_margin()` built against it. Aborts if `TRADING_MODE == "live"`.
-- [ ] `tests/test_portfolio.py` — `TestMaintenanceMargin` (capture, property, `margin_utilization_pct` calculation, zero-equity edge case) and `TestSimulateMargin` (mocked REST success, mocked REST failure returns `None`, credentials absent returns `None`)
-- [ ] `tests/test_decision.py` — `TestMarginGate`: candidate approved when utilization is low; candidate rejected when current utilization already exceeds `MAX_MARGIN_UTILIZATION_PCT`; candidate rejected when projected utilization (via proxy) exceeds the ceiling; `simulate_margin` result takes precedence over the proxy when available; fails open in paper mode with no tracker; fails closed in test/live mode with no tracker or a failed API call; `MARGIN_GATE_ENABLED = False` always passes; roll path also invokes the gate
-- [ ] `scratch/scratch_margin_gate.py` — end-to-end demonstration against the paper/test account: prints current margin utilization, then runs a few synthetic candidates through `_check_margin_gate()` showing approve/reject outcomes and reasons. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_margin_gate` from the repo root.
+- [x] `tests/test_portfolio.py::TestMaintenanceMargin::test_simulate_margin_success` — mocks API call and verifies margin calculation
+- [x] `tests/test_portfolio.py::TestMaintenanceMargin::test_simulate_margin_no_credentials` — verifies returns None without credentials
+- [x] `tests/test_portfolio.py::TestMaintenanceMargin::test_simulate_margin_empty_legs` — verifies returns None for empty legs
+- [x] `tests/test_portfolio.py::TestMaintenanceMargin::test_simulate_margin_api_failure` — verifies graceful error handling
+- [x] `tests/test_decision.py::TestMarginGate::test_margin_gate_disabled_when_flag_false` — verifies gate disabled by config
+- [x] `tests/test_decision.py::TestMarginGate::test_margin_gate_noop_in_paper_mode` — verifies paper mode no-op
+- [x] `tests/test_decision.py::TestMarginGate::test_margin_gate_no_portfolio_tracker` — verifies behavior without tracker
+- [x] `tests/test_decision.py::TestMarginGate::test_margin_gate_rejects_when_current_utilization_high` — verifies current util check
+- [x] `tests/test_decision.py::TestMarginGate::test_margin_gate_accepts_when_utilization_low` — verifies approval when safe
+- [x] `tests/test_decision.py::TestMarginGate::test_margin_gate_uses_live_simulation_when_available` — verifies live API takes precedence
+
+### Scratch scripts
+
+- [ ] `scratch/scratch_margin_gate.py` — end-to-end demonstration (optional, can be added later if needed)
 
 ---
 

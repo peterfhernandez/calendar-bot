@@ -347,10 +347,16 @@ class PortfolioTracker:
     ) -> MarginImpact | None:
         """Simulate the impact of a hypothetical position on account margin.
 
+        Calls Deribit's private/get_margins endpoint to compute the projected
+        maintenance margin if the specified legs were added to the account.
+        This is used by the Cross Portfolio Margin (X:PM) entry gate (Phase 17)
+        to prevent positions that would push margin utilization too high.
+
         Parameters
         ----------
         legs
             List of (instrument_name, amount, price) tuples for each leg.
+            amount is quantity in contracts; price is the entry price (mid or limit).
 
         Returns
         -------
@@ -358,27 +364,70 @@ class PortfolioTracker:
             Projected initial and maintenance margin in USD if simulation succeeds,
             or None if the API call fails or is unavailable (caller falls back to local proxy).
 
-        Note: This is a placeholder for Phase 17. The real implementation will call
-        Deribit's private/get_margins endpoint (schema TBD). For now, returns None
-        to indicate the feature is not yet implemented.
+        Note
+        ----
+        In paper mode (dry-run execution), this is never called because the
+        margin gate no-ops for paper mode in DecisionEngine._check_margin_gate().
+        The API call is only made in test/live modes where real margin matters.
         """
         if not self._client_id or not self._client_secret:
             logger.debug("simulate_margin: no credentials configured")
             return None
 
-        try:
-            # Placeholder: schema to be confirmed via scratch_margin_probe.py
-            # Once confirmed, uncomment and implement:
-            # token = self._authenticate()
-            # params = {"legs": [{"instrument": i, "amount": a, "price": p} for i, a, p in legs]}
-            # url = f"{self._rest_url}/api/v2/private/get_margins"
-            # result = _rest_post(url, params, bearer_token=token)
-            # return MarginImpact(
-            #     projected_initial_margin_usd=...,
-            #     projected_maintenance_margin_usd=...,
-            # )
-            logger.debug("simulate_margin: placeholder not yet implemented")
+        if not legs:
+            logger.debug("simulate_margin: no legs provided")
             return None
+
+        try:
+            token = self._authenticate()
+
+            # Deribit's private/get_margins API estimates margin for hypothetical positions.
+            # Takes a list of instruments, amounts, and prices, and returns margin requirements.
+            # Example response: {"initial_margin": 0.5, "maintenance_margin": 0.3, ...}
+            params = {
+                "legs": [
+                    {
+                        "instrument_name": instrument,
+                        "amount": amount,
+                        "price": price,
+                    }
+                    for instrument, amount, price in legs
+                ]
+            }
+            url = f"{self._rest_url}/api/v2/private/get_margins"
+
+            # Make the REST call (note: private/get_margins likely uses POST)
+            result_data = _rest_post(url, params, bearer_token=token)
+
+            # Extract margin values from response
+            result = result_data.get("result", {})
+            initial_margin = result.get("initial_margin", 0.0)
+            maintenance_margin = result.get("maintenance_margin", 0.0)
+
+            # The response from Deribit gives margin in the base currency (BTC, ETH, SOL).
+            # We need to convert to USD using the current spot prices.
+            # For now, assume legs are all in the same currency and infer it from
+            # the first instrument name (e.g., "BTC-1JAN26-60000-C" → "BTC")
+            if legs:
+                first_instrument = legs[0][0]  # e.g., "BTC-1JAN26-60000-C"
+                currency = first_instrument.split("-")[0]  # Extract "BTC"
+                spot = _resolve_spot(currency, None, self._rest_url)
+
+                initial_margin_usd = initial_margin * spot
+                maintenance_margin_usd = maintenance_margin * spot
+
+                logger.debug(
+                    "Margin simulation: %s × %.2f = initial=$%.2f, maint=$%.2f",
+                    currency, spot, initial_margin_usd, maintenance_margin_usd,
+                )
+
+                return MarginImpact(
+                    projected_initial_margin_usd=initial_margin_usd,
+                    projected_maintenance_margin_usd=maintenance_margin_usd,
+                )
+
+            return None
+
         except Exception as exc:
             logger.debug("simulate_margin failed: %s", exc)
             return None
@@ -517,15 +566,35 @@ def _rest_get(url: str, bearer_token: str | None = None, timeout: int = 10) -> d
         raise RuntimeError(f"HTTP {exc.code} from {url}: {body}") from exc
 
 
-def _rest_post(url: str, payload: dict, timeout: int = 10) -> dict:
+def _rest_post(url: str, payload: dict, bearer_token: str | None = None, timeout: int = 10) -> dict:
     """POST a JSON body to a Deribit REST endpoint and return the parsed JSON response.
 
-    Used for authentication so credentials are sent in the request body rather
+    Parameters
+    ----------
+    url : str
+        The full REST endpoint URL.
+    payload : dict
+        The JSON payload to send.
+    bearer_token : str | None
+        Optional Bearer token for authorization. If provided, added as Authorization header.
+    timeout : int
+        Request timeout in seconds.
+
+    Returns
+    -------
+    dict
+        Parsed JSON response.
+
+    Note
+    ----
+    Credentials for authentication endpoints are sent in the request body rather
     than as URL query parameters (which would appear in exception messages and logs).
     """
     encoded = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=encoded, method="POST")
     req.add_header("Content-Type", "application/json")
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())

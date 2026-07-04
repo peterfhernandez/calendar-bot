@@ -673,17 +673,43 @@ class TestMaintenanceMargin:
         tracker._maintenance_margin_usd = 1_000.0
         assert tracker.margin_utilization_pct == 0.0
 
-    def test_simulate_margin_placeholder(self):
-        """simulate_margin returns None (placeholder for Phase 17)."""
+    def test_simulate_margin_success(self):
+        """simulate_margin calls Deribit API and returns projected margin."""
         db = tempfile.mktemp(suffix=".db")
         tracker = PortfolioTracker(
             db_path=Path(db),
             client_id="test_id",
             client_secret="test_secret",
         )
-        legs = [("BTC-1JAN26-100000-C", 1.0, 0.05)]
-        result = tracker.simulate_margin(legs)
-        assert result is None  # Placeholder returns None
+        legs = [
+            ("BTC-1JAN26-100000-C", 1.0, 0.05),
+            ("BTC-1FEB26-100000-C", 1.0, 0.03),
+        ]
+
+        # Mock the API calls
+        auth_response = {"result": {"access_token": "fake_token"}}
+        margin_response = {
+            "result": {
+                "initial_margin": 0.5,      # 0.5 BTC initial margin
+                "maintenance_margin": 0.3,  # 0.3 BTC maintenance margin
+            }
+        }
+
+        with patch("portfolio.tracker._rest_get") as mock_get, \
+             patch("portfolio.tracker._rest_post") as mock_post, \
+             patch("portfolio.tracker._resolve_spot") as mock_spot:
+            mock_get.return_value = auth_response
+            mock_post.return_value = margin_response
+            mock_spot.return_value = 100_000.0  # BTC spot price in USD
+
+            result = tracker.simulate_margin(legs)
+
+            assert result is not None
+            assert result.projected_initial_margin_usd > 0
+            assert result.projected_maintenance_margin_usd > 0
+            # Assuming BTC spot of 100,000, 0.5 BTC = $50,000
+            assert result.projected_initial_margin_usd == pytest.approx(50_000.0)
+            assert result.projected_maintenance_margin_usd == pytest.approx(30_000.0)
 
     def test_simulate_margin_no_credentials(self):
         """simulate_margin returns None when credentials are not configured."""
@@ -693,3 +719,36 @@ class TestMaintenanceMargin:
         legs = [("BTC-1JAN26-100000-C", 1.0, 0.05)]
         result = tracker.simulate_margin(legs)
         assert result is None
+
+    def test_simulate_margin_empty_legs(self):
+        """simulate_margin returns None for empty legs list."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(
+            db_path=Path(db),
+            client_id="test_id",
+            client_secret="test_secret",
+        )
+        result = tracker.simulate_margin([])
+        assert result is None
+
+    def test_simulate_margin_api_failure(self):
+        """simulate_margin returns None if the API call fails."""
+        db = tempfile.mktemp(suffix=".db")
+        tracker = PortfolioTracker(
+            db_path=Path(db),
+            client_id="test_id",
+            client_secret="test_secret",
+        )
+        legs = [("BTC-1JAN26-100000-C", 1.0, 0.05)]
+
+        # Mock authentication to succeed but margin call to fail
+        auth_response = {"result": {"access_token": "fake_token"}}
+
+        with patch("portfolio.tracker._rest_get") as mock_get, \
+             patch("portfolio.tracker._rest_post") as mock_post:
+            mock_get.return_value = auth_response
+            mock_post.side_effect = RuntimeError("API error")
+
+            result = tracker.simulate_margin(legs)
+            # Should gracefully handle the error and return None
+            assert result is None

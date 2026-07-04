@@ -2315,12 +2315,13 @@ class TestMarginGate:
             portfolio=portfolio_mock,
         )
 
-        with patch("config.MARGIN_GATE_ENABLED", True):
-            with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
-                candidate = _make_candidate()
-                reason = engine._check_margin_gate(candidate)
-                assert reason is not None
-                assert "current margin utilization" in reason
+        with patch("config.TRADING_MODE", "test"):
+            with patch("config.MARGIN_GATE_ENABLED", True):
+                with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
+                    candidate = _make_candidate()
+                    reason = engine._check_margin_gate(candidate)
+                    assert reason is not None
+                    assert "current margin utilization" in reason
 
     def test_margin_gate_accepts_when_utilization_low(self):
         """Gate passes when projected utilization stays below ceiling."""
@@ -2338,14 +2339,15 @@ class TestMarginGate:
             portfolio=portfolio_mock,
         )
 
-        with patch("config.MARGIN_GATE_ENABLED", True):
-            with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
-                candidate = _make_candidate()
-                candidate.net_debit = 0.01
-                candidate.qty = 1.0
-                # Projected: (50000 + 0.01*1.0) / 100000 = 0.5000001, well below 0.80
-                reason = engine._check_margin_gate(candidate)
-                assert reason is None
+        with patch("config.TRADING_MODE", "test"):
+            with patch("config.MARGIN_GATE_ENABLED", True):
+                with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
+                    candidate = _make_candidate()
+                    candidate.net_debit = 0.01
+                    candidate.qty = 1.0
+                    # Projected: (50000 + 0.01*1.0) / 100000 = 0.5000001, well below 0.80
+                    reason = engine._check_margin_gate(candidate)
+                    assert reason is None
 
     def test_margin_gate_uses_live_simulation_when_available(self):
         """Gate prefers live margin-simulation result over local proxy."""
@@ -2369,14 +2371,15 @@ class TestMarginGate:
             portfolio=portfolio_mock,
         )
 
-        with patch("config.MARGIN_GATE_ENABLED", True):
-            with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
-                candidate = _make_candidate()
-                reason = engine._check_margin_gate(candidate)
-                # 85000 / 100000 = 0.85 > 0.80, so rejected
-                assert reason is not None
-                assert "projected margin utilization" in reason
-                portfolio_mock.simulate_margin.assert_called_once()
+        with patch("config.TRADING_MODE", "test"):
+            with patch("config.MARGIN_GATE_ENABLED", True):
+                with patch("config.MAX_MARGIN_UTILIZATION_PCT", 0.80):
+                    candidate = _make_candidate()
+                    reason = engine._check_margin_gate(candidate)
+                    # 85000 / 100000 = 0.85 > 0.80, so rejected
+                    assert reason is not None
+                    assert "projected margin utilization" in reason
+                    portfolio_mock.simulate_margin.assert_called_once()
 
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
