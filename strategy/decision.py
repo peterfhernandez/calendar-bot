@@ -744,39 +744,38 @@ class DecisionEngine:
         near_days_left, far_days_left = _days_left(pos)
         if near_days_left <= 0:
             # Near leg has expired — close the full position.
-            # Apply retry limiting: cap at 3 failed attempts, then force-close to prevent stuck positions.
+            # Apply retry limiting: cap at 3 failed attempts, then mark as stuck to prevent forced liquidation.
             trade_id = pos["trade_id"]
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= 3:
                 logger.error(
-                    "trade_id=%d near leg expired but close failed %d times — halting retries, force-closing",
+                    "trade_id=%d near leg expired but close failed %d times — marking as stuck for manual intervention",
                     trade_id, failure_count,
                 )
-                # When a normal close fails due to expired near leg (Deribit rejects orders on
-                # expired instruments), bypass the executor and mark the position as closed
-                # in the DB with a force-close note. This breaks the retry loop.
-                near_instr = pos.get("near_instrument", "")
-                logger.warning(
-                    "trade_id=%d near leg (%s) is expired/untradeable; position marked as closed to prevent retry loop",
-                    trade_id, near_instr,
+                # Mark as stuck instead of force-closing, mirroring the stop/tp behavior
+                mark_position_close_stuck(
+                    trade_id=trade_id,
+                    error_reason=f"Near leg expired, close failed after {failure_count} attempts — position needs manual close on Deribit",
+                    intended_close_reason="expired-near-leg",
+                    db_path=self._db_path,
                 )
-                # Record force-close without calling executor (which would fail anyway)
-                try:
-                    close_calendar_trade(
-                        trade_id=trade_id,
-                        date_close=date.today(),
-                        spot_close=spot,
-                        pnl=0.0,  # unknown P&L; position is stuck
-                        result="Loss (Force Close)",
-                        notes="Near leg expired — force closed (Deribit untradeable)",
-                        close_fees=0.0,
-                        db_path=self._db_path,
-                    )
-                    self._close_roll_failures.pop(trade_id, None)
-                    return f"trade_id={trade_id} force closed (expired near leg)", 0.0
-                except Exception as exc:
-                    logger.error("Force close of trade_id=%d failed: %s", trade_id, exc)
-                    return f"trade_id={trade_id} force close FAILED: {exc}", 0.0
+                self._close_roll_failures.pop(trade_id, None)
+
+                # Notify user about stuck position (only once, not every monitor tick)
+                if trade_id not in self._notified_stuck and self._notifier:
+                    try:
+                        self._notifier.notify_close_stuck(
+                            trade_id=trade_id,
+                            asset=pos.get("asset", ""),
+                            strike=pos.get("strike", 0.0),
+                            reason="Near leg expired",
+                            error=f"Close failed after {failure_count} attempts",
+                        )
+                        self._notified_stuck.add(trade_id)
+                    except Exception as exc:
+                        logger.error("Failed to notify about stuck position: %s", exc)
+
+                return f"trade_id={trade_id} marked as close_stuck (expired near leg)", 0.0
 
             close_msg = self._close_position(pos, spot, "Near leg expired")
             if "FAILED" in close_msg:

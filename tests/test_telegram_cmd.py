@@ -904,7 +904,7 @@ class TestSetMyCommands:
 @pytest.mark.asyncio
 async def test_handle_close_resets_close_stuck_flag():
     """Test /close command resets close_stuck flag in database and clears notification flag."""
-    from db.state import mark_position_close_stuck
+    from db.state import mark_position_close_stuck, get_connection
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
@@ -966,15 +966,22 @@ async def test_handle_close_resets_close_stuck_flag():
         assert len(trades) == 1
         assert trades[0].close_status == "open", "close_status should be reset to 'open'"
 
+        # Close all database connections before temp directory cleanup
+        try:
+            conn = get_connection(db_path)
+            conn.close()
+        except Exception:
+            pass
+
 
 @pytest.mark.asyncio
 async def test_handle_close_manually_clears_notification_flag():
     """Test /close_manually command clears notification flag from engine."""
+    from db.state import create_calendar_trade, get_connection
+
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_db(db_path)
-
-        from db.state import create_calendar_trade
 
         # Create a trade using the test fixture
         trade = _make_trade(trade_id=43, asset="BTC")
@@ -1021,6 +1028,13 @@ async def test_handle_close_manually_clears_notification_flag():
         # Verify position was closed
         trades = get_open_trades(db_path)
         assert len(trades) == 0, "Trade should be closed"
+
+        # Close all database connections before temp directory cleanup
+        try:
+            conn = get_connection(db_path)
+            conn.close()
+        except Exception:
+            pass
 
 
 class TestHandlePnl:

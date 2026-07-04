@@ -394,20 +394,24 @@ class Notifier:
                                 await asyncio.sleep(1)
                                 continue
                             else:
-                                raise RuntimeError(f"Telegram HTTP {resp.status}: {body[:200]}")
+                                logger.error("Telegram HTTP %d (final attempt): %s", resp.status, body[:200])
+                                return False
             except asyncio.TimeoutError:
                 if attempt == 0:
                     logger.warning("Telegram timeout (retrying)...")
                     await asyncio.sleep(1)
                     continue
                 else:
-                    raise RuntimeError("Telegram API timeout (both attempts)")
+                    logger.error("Telegram API timeout (both attempts)")
+                    return False
             except Exception as exc:  # noqa: BLE001
                 if attempt == 0:
                     logger.warning("Telegram network error (retrying): %s", exc)
                     await asyncio.sleep(1)
                     continue
                 else:
-                    raise
+                    logger.error("Telegram send failed (final attempt): %s", exc)
+                    return False
 
-        raise RuntimeError("Telegram send failed after 2 attempts")
+        logger.error("Telegram send failed after 2 attempts")
+        return False

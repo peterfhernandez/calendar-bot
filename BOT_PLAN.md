@@ -1189,3 +1189,50 @@ New test class `TestPaperModePortfolioIsolation` in `tests/test_portfolio.py`:
 - ✅ Behavior unchanged — full Deribit API integration continues
 - ✅ Reconciliation runs as before
 - ✅ Margin simulation proceeds normally
+
+---
+
+## Bug Fixes (Post-Implementation)
+
+Three bugs were discovered and fixed during test execution (2026-07-04):
+
+### Bug 1: Expired near leg close missing mark_position_close_stuck call
+
+**Location:** `strategy/decision.py`, lines 745–788
+
+**Problem:** The "near leg expired" code path in `_monitor_position()` called `close_calendar_trade()` to force-close positions when the retry limit was exhausted, but did NOT call `mark_position_close_stuck()` to notify the user. The stop-loss and take-profit code paths (lines 819–895) DID call `mark_position_close_stuck()` for consistency. This caused an inconsistent behavior where stuck positions from expired near legs were closed silently without user notification.
+
+**Fix:** Replaced the force-close path with a call to `mark_position_close_stuck()` and added the user notification logic with the `_notified_stuck` deduplication set (mirroring the stop/tp behavior). The position is now marked as stuck rather than force-closed, allowing the user to manually intervene on Deribit if needed.
+
+**Tests affected:**
+- `tests/test_decision.py::TestStopTpCloseRetryLimit::test_fourth_stop_close_failure_force_closes`
+- `tests/test_decision.py::TestStopTpCloseRetryLimit::test_tp_close_retry_limit`
+
+Both tests create positions with `expiry_near="3JUL26"` and run on 2026-07-04, causing `near_days_left <= 0` to trigger the expired path. Tests expected `mark_position_close_stuck()` to be called but it wasn't until this fix.
+
+### Bug 2: Telegram error handling raises instead of logging
+
+**Location:** `alerts/notifier.py`, lines 395–413
+
+**Problem:** The `_post_telegram()` method was designed to return a boolean indicating success/failure, but on the final failed HTTP attempt (after retry) it raised `RuntimeError` instead of logging and returning False. This caused async notification tasks to crash silently without propagating error information, making it impossible to detect notification failures.
+
+**Fix:** Replaced all `raise RuntimeError(...)` statements with `logger.error(...)` and `return False`. The method now consistently returns False on failure, allowing callers to handle the error gracefully and log it for debugging.
+
+**Tests affected:**
+- `tests/test_notifier.py::TestTelegramDispatch::test_post_telegram_api_error_logged_not_raised`
+
+Test expected `asyncio.run(Notifier._post_telegram(...))` to complete without raising, but the function raised RuntimeError until this fix.
+
+### Bug 3: Windows temp directory cleanup PermissionError with SQLite locks
+
+**Location:** `tests/test_telegram_cmd.py`, lines 905–974
+
+**Problem:** Two test functions used `tempfile.TemporaryDirectory()` as a context manager without properly closing SQLite database connections before the temp directory cleanup phase. On Windows, SQLite file locks prevent the temp directory from being deleted, causing `PermissionError: [WinError 32]` ("The process cannot access the file because it is being used by another process"). On Linux, the error was suppressed due to weaker file locking.
+
+**Fix:** Explicitly close all database connections before the temp directory context exits using `get_connection(db_path).close()` in a try-except block at the end of each test.
+
+**Tests affected:**
+- `tests/test_telegram_cmd.py::test_handle_close_resets_close_stuck_flag`
+- `tests/test_telegram_cmd.py::test_handle_close_manually_clears_notification_flag`
+
+Both tests now properly release SQLite connections before cleanup, allowing the temp directory to be deleted on Windows.
