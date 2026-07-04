@@ -1639,7 +1639,7 @@ class TestCloseAfterExpiryRetryLimit:
         assert engine._close_roll_failures.get(4) == 3
 
     def test_fourth_failure_force_closes_position(self):
-        """On 4th failed close, position is force-closed and removed from tracking."""
+        """On 4th failed close, position is marked as stuck and removed from tracking."""
         executor = MagicMock()
         executor.close_spread.return_value = None
         engine, _ = _make_engine(executor=executor)
@@ -1647,14 +1647,13 @@ class TestCloseAfterExpiryRetryLimit:
         engine._close_roll_failures[4] = 3  # already failed 3 times
 
         with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
-             patch("strategy.decision.close_calendar_trade") as mock_close:
+             patch("strategy.decision.mark_position_close_stuck") as mock_stuck:
             engine._cache.get_spot.return_value = 60_000.0
             engine.monitor_tick()
 
-        # Position should have been closed via close_calendar_trade
-        mock_close.assert_called_once()
-        # On 4th failure, the counter should be cleared because the position
-        # gets marked as closed and is then removed from the failure tracking
+        # Position should have been marked as stuck
+        mock_stuck.assert_called_once()
+        # On 4th failure, the counter should be cleared
         assert 4 not in engine._close_roll_failures
 
     def test_close_success_clears_counter(self):

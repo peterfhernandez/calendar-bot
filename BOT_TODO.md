@@ -830,6 +830,9 @@ MAX_LOSS_PCT  = 0.005     # 0.5% max loss per trade (half the paper default)
 - [x] **Deploy workflow does not kill stale bot processes** — the GitHub Actions PowerShell script in `.github/workflows/deploy.yml` used `Get-Process -Name python` to find bot processes, but `Get-Process` does not populate the `CommandLine` property by default so the filter `$_.CommandLine -like '*bot.py*'` always failed silently. Result: new bot process started while stale process still held the port, causing errors. Three fixes: (1) Changed to `Get-CimInstance Win32_Process -Filter "Name='python.exe'"` which exposes `CommandLine` correctly; (2) Fixed path typos: `coderepoo` → `coderepo`, `bot_paper` → `bot-paper`; (3) Added `-WorkingDirectory` and `Start-Sleep -Seconds 2` between kill and restart for clean process shutdown. Tests: none (PowerShell workflow manual validation required).
 - [x] **Expired near leg close stuck in retry loop (issue #3, trade_id=4)** — when a near leg expires on Deribit (e.g. 3JUL26 as of 2026-07-01), the bot attempts to close but Deribit rejects with `-32602 Invalid params` (cannot trade expired instruments). The close-on-expiry path in `_monitor_position()` was not using the retry-limit logic that the roll path had; it would retry every monitor tick forever. Fixed by: (1) applying `_close_roll_failures` tracking to the expiry-close path; (2) capping failed attempts at 3 retries; (3) on 4th failure, force-closing the position by marking it as closed in the DB without calling the executor (which would fail anyway), breaking the infinite retry loop. This prevents naked leg accumulation and margin call risk from stuck positions. Tests: `TestCloseAfterExpiryRetryLimit` (5 tests) in `tests/test_decision.py`. Scratch: `scratch/scratch_expired_near_retry_limit.py`.
 - [x] **Stop-loss and take-profit close stuck in retry loop (trade_id=5 incident)** — when a stop-loss or take-profit close failed (e.g. error 10019 locked_by_admin), the stop/TP close paths in `_monitor_position()` did not use the retry-limit logic, causing 69+ consecutive close attempts over 1+ hours. Unlike expiry closes which used `_try_close()` (which had retry tracking), stop and TP closes called `_close_position()` directly without retry limiting. Fixed by: (1) adding `_close_roll_failures` tracking to both `if status == "stop":` and `if status == "tp":` blocks in `_monitor_position()`; (2) capping failed attempts at 3 retries; (3) on 4th failure, force-closing the position by calling `close_calendar_trade()` directly without executor retry. Tests: `TestStopTpCloseRetryLimit` (4 tests) in `tests/test_decision.py`.
+- [x] **Expired near leg close missing mark_position_close_stuck call** — the "near leg expired" code path in `_monitor_position()` (lines 745–788) did NOT call `mark_position_close_stuck()` when retries were exhausted, unlike the stop/tp paths which did. This meant stuck positions from expired instruments were force-closed silently in the DB without notifying the user. Fixed by: (1) replacing the force-close path with a call to `mark_position_close_stuck()`; (2) adding the user notification logic with the `_notified_stuck` deduplication set to prevent spam; (3) ensuring consistency with stop/tp behavior. Tests: `test_fourth_stop_close_failure_force_closes` and `test_tp_close_retry_limit` in `tests/test_decision.py` (both now pass).
+- [x] **Telegram error handling raises instead of logging** — `alerts/notifier.py` `_post_telegram()` method (line 397) raised `RuntimeError` on the final failed HTTP attempt instead of logging and returning False as designed. This caused async tasks to crash silently without propagating error info. Fixed by: replacing all `raise RuntimeError(...)` calls with `logger.error(...)` and `return False`. This allows callers to handle failures gracefully without crashing. Tests: `test_post_telegram_api_error_logged_not_raised` in `tests/test_notifier.py` (now passes).
+- [x] **Windows temp directory cleanup PermissionError with SQLite locks** — two test functions (`test_handle_close_resets_close_stuck_flag` and `test_handle_close_manually_clears_notification_flag` in `tests/test_telegram_cmd.py`) failed on Windows because SQLite connections remained open when `TemporaryDirectory.__exit__` tried to delete temp files, causing `PermissionError: [WinError 32]`. Fixed by explicitly closing all database connections before the temp directory context exits using `get_connection(db_path).close()`. Tests: both now pass on Windows.
 
 ---
 
@@ -995,7 +998,72 @@ If notifications still fail to arrive:
 3. Verify `.env` has valid TELEGRAM_TOKEN and TELEGRAM_CHAT
 4. See TELEGRAM_DEBUGGING_GUIDE.md for detailed solutions
 
-**Phase 17b — Notification Spam Prevention for Stuck Positions:**
+---
+
+## Phase 17b — Paper Mode Portfolio Isolation
+
+In paper mode, the bot should be completely isolated from Deribit. All portfolio metrics (equity, available cash, unrealized P&L, margin) should be calculated from the SQLite database and live cache prices, with zero REST API calls to Deribit.
+
+**Root Cause:** `portfolio/tracker.py` unconditionally calls Deribit REST APIs when credentials are configured, regardless of trading mode. This causes:
+1. Unnecessary API overhead in paper mode
+2. Reconciliation warnings comparing Deribit margin with DB margin (confusing when paper mode shouldn't touch Deribit)
+3. Portfolio snapshots showing zero equity/available_cash in DB-only fallback mode
+4. "RECONCILE MISMATCH" warnings that are not actionable in paper mode
+
+### Implementation
+
+- [ ] **Item 1: Import TRADING_MODE** — Add `TRADING_MODE` from config to `portfolio/tracker.py`
+  - [ ] Import statement at top of file
+  - [ ] Use in trading-mode checks
+
+- [ ] **Item 2: Skip API in paper mode** — Modify `refresh()` to return early if `TRADING_MODE == "paper"`, after calculating SQLite values but before any Deribit API calls
+  - [ ] Check `TRADING_MODE == "paper"` before calling `_refresh_from_api()`
+  - [ ] Ensure SQLite calculations (`_used_margin`, `_realized_pnl_today`, `_open_position_count`, `_fees_paid_today`, `_fees_paid_total`) always run
+  - [ ] Skip reconciliation entirely in paper mode
+
+- [ ] **Item 3: Calculate unrealized P&L from cache in paper mode** — Implement `_calculate_unrealized_pnl_from_cache()` that:
+  - [ ] Queries open positions from SQLite
+  - [ ] Fetches live spread values from `ChainCache` for each position
+  - [ ] Sums `(spread_value - net_debit * qty)` per position
+  - [ ] Falls back to 0.0 if cache unavailable (consistent with current behavior)
+  - [ ] Called in paper mode when Deribit API is skipped
+
+- [ ] **Item 4: Implement DB-only portfolio calculation** — Create `_calculate_db_only_portfolio()` that:
+  - [ ] Computes `equity_usd` from: initial capital + realized P&L today + unrealized P&L from cache
+  - [ ] Computes `available_cash` from DB-only metrics (no Deribit API call)
+  - [ ] Returns dict with equity, available_cash, and unrealized_pnl
+  - [ ] Called in paper mode after skipping API calls
+
+- [ ] **Item 5: Add safety guards and docstrings** 
+  - [ ] Add explicit `if TRADING_MODE != "paper"` check at start of `_refresh_from_api()` as belt-and-suspenders
+  - [ ] Add explicit `if TRADING_MODE != "paper"` guard in `simulate_margin()` for clarity
+  - [ ] Update class docstring to document paper vs test/live behavior
+  - [ ] Update method docstrings noting which are test/live only
+
+### Test Coverage
+
+- [ ] `TestPaperModePortfolioIsolation::test_no_deribit_api_calls_in_paper_mode` — verify zero REST API calls to Deribit in paper mode
+- [ ] `TestPaperModePortfolioIsolation::test_no_reconciliation_warning_in_paper_mode` — verify no RECONCILE MISMATCH warnings logged
+- [ ] `TestPaperModePortfolioIsolation::test_equity_calculated_from_db_in_paper_mode` — verify non-zero equity from DB calculation
+- [ ] `TestPaperModePortfolioIsolation::test_unrealized_pnl_from_cache_in_paper_mode` — verify unrealized P&L calculated from live cache prices
+- [ ] `TestPaperModePortfolioIsolation::test_test_mode_still_uses_deribit_api` — regression: verify test/live modes still call Deribit API
+
+### Expected Results
+
+In **paper mode**:
+- ✅ Zero Deribit REST API calls in `portfolio/tracker.py`
+- ✅ Portfolio snapshot shows realistic equity and unrealized P&L (calculated from DB + cache)
+- ✅ No reconciliation warnings or mismatches
+- ✅ All values come from SQLite + live cache, never from Deribit
+
+In **test/live mode**:
+- ✅ Behavior unchanged — full Deribit API integration continues
+- ✅ Reconciliation still runs to verify DB matches Deribit
+- ✅ Margin simulation API calls proceed normally
+
+---
+
+## Phase 17c — Notification Spam Prevention for Stuck Positions
 
 - [x] **Notification deduplication** — Add `_notified_stuck: set[int]` to track positions already notified
 - [x] **Stop-loss guard** — Only send `notify_close_stuck()` once per stuck position, not every monitor tick
