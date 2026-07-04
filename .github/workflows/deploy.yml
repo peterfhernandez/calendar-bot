@@ -19,7 +19,7 @@ jobs:
           # Kill existing bot processes — use Get-CimInstance instead of Get-Process
           # (Get-Process doesn't expose CommandLine by default, so the filter silently fails)
           Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*bot.py*' } |
+            Where-Object { $_.CommandLine -like '*bot*' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
           Start-Sleep -Seconds 2
@@ -27,13 +27,9 @@ jobs:
           # Start paper bot (default mode, reads .env)
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py" `
             -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_stdout.log" `
-            -RedirectStandardError "C:\Users\Peter\coderepo\calendar-bot\logs\bot-paper_err.log"
-            
-          # Start test bot in background, output to log
+            -WindowStyle Normal
+
+          # Start test bot in a visible window
           Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log" `
             -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput "C:\Users\Peter\coderepo\calendar-bot\logs\bot-test_stdout.log" `
-            -RedirectStandardError "C:\Users\Peter\coderepo\calendar-bot\logs\bot-test_err.log"
+            -WindowStyle Normal
