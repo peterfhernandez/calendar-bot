@@ -902,6 +902,138 @@ class TestSetMyCommands:
 
 
 @pytest.mark.asyncio
+async def test_handle_info_displays_position_status():
+    """Test /info command displays current position status and market prices."""
+    from db.state import create_calendar_trade, get_connection
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        init_db(db_path)
+
+        # Create an open trade
+        trade_id = create_calendar_trade(
+            asset="BTC",
+            date_open=datetime.now(timezone.utc).date(),
+            option_type="Call",
+            strike=95_000.0,
+            expiry_near="2026-07-03",
+            expiry_far="2026-07-31",
+            near_days=3,
+            far_days=31,
+            qty=2.0,
+            spot_open=100_000.0,
+            near_prem=0.015,
+            far_prem=0.025,
+            net_debit=0.010,
+            near_instrument="BTC-3JUL26-95000-C",
+            far_instrument="BTC-31JUL26-95000-C",
+            open_fees=0.002,
+            db_path=db_path,
+        ).id
+
+        # Mock Telegram update and context
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+        context.args = [f"trade_id={trade_id}"]
+
+        # Mock cache with live prices
+        cache = MagicMock()
+        near_snap = MagicMock()
+        near_snap.bid = 0.014
+        near_snap.ask = 0.016
+        far_snap = MagicMock()
+        far_snap.bid = 0.024
+        far_snap.ask = 0.026
+        cache.get.side_effect = lambda inst: near_snap if "3JUL" in inst else far_snap
+
+        # Call handler
+        await handlers.handle_info(update, context, cache, db_path)
+
+        # Verify response was sent
+        update.message.reply_text.assert_called_once()
+        response = update.message.reply_text.call_args[0][0]
+
+        # Verify response contains expected information
+        assert f"Trade #{trade_id} Status" in response
+        assert "BTC" in response
+        assert "95000" in response
+        assert "Current Market Prices" in response
+        assert "Near leg" in response
+        assert "0.014" in response and "0.016" in response
+        assert "Far leg" in response
+        assert "0.024" in response and "0.026" in response
+        assert "Unrealized P&L" in response
+
+        # Close all database connections before temp directory cleanup
+        try:
+            conn = get_connection(db_path)
+            conn.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_handle_info_handles_missing_cache():
+    """Test /info command handles missing/stale cache data gracefully."""
+    from db.state import create_calendar_trade, get_connection
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        init_db(db_path)
+
+        # Create an open trade
+        trade_id = create_calendar_trade(
+            asset="BTC",
+            date_open=datetime.now(timezone.utc).date(),
+            option_type="Put",
+            strike=90_000.0,
+            expiry_near="2026-07-05",
+            expiry_far="2026-08-02",
+            near_days=5,
+            far_days=33,
+            qty=1.0,
+            spot_open=100_000.0,
+            near_prem=0.02,
+            far_prem=0.03,
+            net_debit=0.01,
+            near_instrument="BTC-5JUL26-90000-P",
+            far_instrument="BTC-2AUG26-90000-P",
+            open_fees=0.001,
+            db_path=db_path,
+        ).id
+
+        # Mock Telegram update and context
+        update = AsyncMock()
+        update.message = AsyncMock()
+        context = MagicMock()
+        context.args = [f"trade_id={trade_id}"]
+
+        # Mock cache with no data (returns None)
+        cache = MagicMock()
+        cache.get.return_value = None
+
+        # Call handler
+        await handlers.handle_info(update, context, cache, db_path)
+
+        # Verify response was sent
+        update.message.reply_text.assert_called_once()
+        response = update.message.reply_text.call_args[0][0]
+
+        # Verify response indicates cache data is missing
+        assert f"Trade #{trade_id} Status" in response
+        assert "NOT IN CACHE" in response
+        assert "Cannot calculate current P&L" in response
+
+        # Close all database connections before temp directory cleanup
+        try:
+            conn = get_connection(db_path)
+            conn.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_handle_close_resets_close_stuck_flag():
     """Test /close command resets close_stuck flag in database and clears notification flag."""
     from db.state import mark_position_close_stuck, get_connection

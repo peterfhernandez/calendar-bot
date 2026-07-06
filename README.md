@@ -165,6 +165,9 @@ The bot accepts incoming commands from the same Telegram chat it uses for outgoi
 | `/start_drain` | Activates drain mode — no new entries or rolls; existing positions close at stop/TP/expiry |
 | `/start_with_assets BTC,ETH,...` | Override the active asset list at runtime and resume scanning |
 | `/drain_and_new [portfolio=N] [assets=A,B]` | Close existing positions outright (no rolls) while still allowing new entries; optionally sets a new portfolio budget and asset list |
+| `/info trade_id=N` | Check current position status on Deribit with live bid/ask prices and unrealized P&L |
+| `/close trade_id=N` | Retry closing a stuck position (resets the close_stuck flag so bot attempts close on next monitor tick) |
+| `/close_manually trade_id=N spread=VALUE` | Manually close a stuck position with a user-provided spread value when automatic close fails |
 
 `/stop_bot` and `/start_bot` pause and resume the decision engine without restarting the process, so the listener stays connected throughout.
 

@@ -467,13 +467,15 @@ async def handle_info(
 
     if near_snap:
         near_mid = _mid(near_snap.bid, near_snap.ask)
-        parts.append(f"Near leg: bid={near_snap.bid:.4f} ask={near_snap.ask:.4f} mid={near_mid:.4f if near_mid else 'N/A'}")
+        mid_str = f"{near_mid:.4f}" if near_mid is not None else "N/A"
+        parts.append(f"Near leg: bid={near_snap.bid:.4f} ask={near_snap.ask:.4f} mid={mid_str}")
     else:
         parts.append(f"Near leg: NOT IN CACHE (stale or not subscribed)")
 
     if far_snap:
         far_mid = _mid(far_snap.bid, far_snap.ask)
-        parts.append(f"Far leg:  bid={far_snap.bid:.4f} ask={far_snap.ask:.4f} mid={far_mid:.4f if far_mid else 'N/A'}")
+        far_mid_str = f"{far_mid:.4f}" if far_mid is not None else "N/A"
+        parts.append(f"Far leg:  bid={far_snap.bid:.4f} ask={far_snap.ask:.4f} mid={far_mid_str}")
     else:
         parts.append(f"Far leg: NOT IN CACHE (stale or not subscribed)")
 
