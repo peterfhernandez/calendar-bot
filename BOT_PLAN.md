@@ -227,6 +227,10 @@ Rather than killing and restarting the OS process (which would take the listener
 | `/start_drain` | Sets `DRAIN_MODE = True`; no new entries or rolls; existing positions close at stop/TP/expiry |
 | `/start_with_assets BTC,ETH,...` | Override `config.ASSETS` at runtime and resume scanning |
 | `/drain_and_new [portfolio=N] [assets=A,B]` | Close existing positions outright (no rolls) but allow new entries; optional portfolio value and asset list override |
+| `/info trade_id=N` | Check current position status on Deribit with live bid/ask prices and unrealized P&L |
+| `/close trade_id=N` | Retry closing a stuck position (resets the close_stuck flag so bot tries again on next monitor tick) |
+| `/close_manually trade_id=N spread=VALUE` | Manually close a stuck position with a user-provided spread value when automatic close fails |
+| `/pnl` | Equity curve chart (PNG): cumulative realized P&L (black line) + current unrealized P&L (dotted green) |
 | `/help` | Lists every available command with a one-line description |
 
 **`/start_with_assets`**
