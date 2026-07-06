@@ -19,22 +19,6 @@ jobs:
           git -C C:\Users\Peter\coderepo\calendar-bot fetch origin master
           git -C C:\Users\Peter\coderepo\calendar-bot reset --hard origin/master
 
-      - name: Restart bot
-        run: |
-          # Kill existing bot processes — use Get-CimInstance instead of Get-Process
-          # (Get-Process doesn't expose CommandLine by default, so the filter silently fails)
-          Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*bot*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-
-          Start-Sleep -Seconds 2
-
-          # Start paper bot (default mode, reads .env)
-          Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py" `
-            -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
-            -WindowStyle Normal
-
-          # Start test bot in a visible window
-          Start-Process python -ArgumentList "C:\Users\Peter\coderepo\calendar-bot\bot.py --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log" `
-            -WorkingDirectory "C:\Users\Peter\coderepo\calendar-bot" `
-            -WindowStyle Normal
+      - name: Restart Calendar Bot services
+        shell: powershell
+        run: Restart-Service -Name "CalendarBotPaper", "CalendarBotTest" -Force
