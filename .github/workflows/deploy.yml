@@ -15,8 +15,9 @@ jobs:
         run: git config --global --add safe.directory C:/Users/Peter/coderepo/calendar-bot
 
       - name: Pull latest
-        run: git -C C:\Users\Peter\coderepo\calendar-bot fetch origin master
-             git -C C:\Users\Peter\coderepo\calendar-bot reset --hard origin/master
+        run: |
+          git -C C:\Users\Peter\coderepo\calendar-bot fetch origin master
+          git -C C:\Users\Peter\coderepo\calendar-bot reset --hard origin/master
 
       - name: Restart bot
         run: |
