@@ -11,6 +11,9 @@ jobs:
   deploy:
     runs-on: self-hosted
     steps:
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory C:/Users/Peter/coderepo/calendar-bot
+
       - name: Pull latest
         run: git -C C:\Users\Peter\coderepo\calendar-bot pull origin master
 
