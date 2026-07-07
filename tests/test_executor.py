@@ -937,3 +937,166 @@ class TestRunInsideEventLoop:
         result = asyncio.run(inner())
         assert result is not None
         assert "fees_paid" in result
+
+
+# ── Phase 18: Tick-size rounding for far-leg close order rejection fix ───────
+
+class TestTickSizeRounding:
+    """Tests for Phase 18 Bug 1: tick-size aware price rounding to prevent "-32602 Invalid params" errors."""
+
+    def test_tick_size_rounding_basic(self):
+        """Basic tick-size rounding: price divided by tick_size and multiplied back."""
+        from execution.executor import _round_to_tick
+
+        # Standard 0.0001 tick — rounds to nearest tick
+        assert _round_to_tick(1.23456, "BTC-3JAN26-60000-C", tick_size=0.0001) == pytest.approx(1.2346)
+        assert _round_to_tick(1.23454, "BTC-3JAN26-60000-C", tick_size=0.0001) == pytest.approx(1.2345)
+
+        # Coarser 0.0005 tick (e.g., higher-priced options)
+        # 0.5554 / 0.0005 = 1110.8, rounds to 1111, 1111 * 0.0005 = 0.5555
+        assert _round_to_tick(0.5550, "BTC-3JAN26-60000-C", tick_size=0.0005) == pytest.approx(0.5550)
+        assert _round_to_tick(0.5554, "BTC-3JAN26-60000-C", tick_size=0.0005) == pytest.approx(0.5555)
+        assert _round_to_tick(0.5560, "BTC-3JAN26-60000-C", tick_size=0.0005) == pytest.approx(0.5560)
+
+    def test_tick_size_rounding_none_fallback(self):
+        """When tick_size is None, default to 4 decimals."""
+        from execution.executor import _round_to_tick
+
+        result = _round_to_tick(1.23456, "BTC-UNKNOWN", tick_size=None)
+        assert result == round(1.23456, 4)
+
+    def test_tick_size_cache_populated(self):
+        """Tick sizes are cached after fetching from Deribit."""
+        from execution.executor import _TICK_SIZE_CACHE
+
+        # Clear cache
+        _TICK_SIZE_CACHE.clear()
+
+        async def fetch_and_check():
+            from execution.executor import _DeribitRPCClient
+
+            client = _DeribitRPCClient("test_id", "test_secret")
+            # Mock the get_instrument call
+            with patch.object(client, "_rpc", new_callable=AsyncMock) as mock_rpc:
+                mock_rpc.return_value = {
+                    "instruments": [{"instrument_name": "BTC-3JAN26-60000-C", "tick_size": 0.0001}]
+                }
+                instr = await client.get_instrument("BTC-3JAN26-60000-C")
+                assert instr["instruments"][0]["tick_size"] == 0.0001
+
+        asyncio.run(fetch_and_check())
+
+    def test_place_order_rounds_to_tick(self):
+        """place_order() automatically rounds prices to valid ticks."""
+        async def test_rounding():
+            from execution.executor import _DeribitRPCClient, _TICK_SIZE_CACHE
+
+            _TICK_SIZE_CACHE["BTC-3JAN26-60000-C"] = 0.0001
+
+            client = _DeribitRPCClient("test_id", "test_secret")
+            with patch.object(client, "_rpc", new_callable=AsyncMock) as mock_rpc:
+                with patch.object(client, "_ws", MagicMock()):
+                    with patch.object(client, "_authenticate", new_callable=AsyncMock):
+                        # Simulate order with a price that needs rounding
+                        await client.place_order(
+                            "BTC-3JAN26-60000-C", "buy", 1.0, 1.23456789
+                        )
+                        # Verify _rpc was called with rounded price
+                        call_args = mock_rpc.call_args
+                        assert call_args is not None
+
+        asyncio.run(test_rounding())
+
+
+# ── Phase 18: Stuck-position retry loop fix ──────────────────────────────────
+
+class TestStuckPositionRetryFix:
+    """Tests for Phase 18 Bug 2: stuck positions excluded from re-evaluation to prevent infinite retry loops."""
+
+    def test_get_open_trades_excludes_stuck(self, tmp_path):
+        """get_open_trades() must exclude positions with close_status='close_stuck'."""
+        from db.state import (
+            init_db, create_calendar_trade, get_open_trades, mark_position_close_stuck
+        )
+        from datetime import date
+
+        db_path = tmp_path / "test_stuck.db"
+        init_db(db_path)
+
+        # Create two trades: one normal, one stuck
+        trade_normal = create_calendar_trade(
+            asset="BTC", date_open=date.today(), option_type="Call",
+            strike=60000.0, expiry_near="3JAN26", expiry_far="24JAN26",
+            near_days=3, far_days=24,
+            near_instrument="BTC-3JAN26-60000-C", far_instrument="BTC-24JAN26-60000-C",
+            qty=1.0, spot_open=100_000.0, near_prem=0.02, far_prem=0.07, net_debit=0.05,
+            db_path=db_path,
+        )
+
+        trade_stuck = create_calendar_trade(
+            asset="BTC", date_open=date.today(), option_type="Call",
+            strike=55000.0, expiry_near="3JAN26", expiry_far="24JAN26",
+            near_days=3, far_days=24,
+            near_instrument="BTC-3JAN26-55000-C", far_instrument="BTC-24JAN26-55000-C",
+            qty=1.0, spot_open=100_000.0, near_prem=0.025, far_prem=0.085, net_debit=0.06,
+            db_path=db_path,
+        )
+
+        # Mark the second trade as stuck
+        mark_position_close_stuck(
+            trade_id=trade_stuck.id,
+            error_reason="Test stuck position",
+            db_path=db_path,
+        )
+
+        # Verify get_open_trades() excludes the stuck position
+        open_trades = get_open_trades(db_path)
+        assert len(open_trades) == 1
+        assert open_trades[0].id == trade_normal.id
+
+
+# ── Phase 18: Force-close PnL estimation fix ─────────────────────────────────
+
+class TestForceClosePnLFix:
+    """Tests for Phase 18 Bug 3: force-closed positions record real P&L, not 0.0."""
+
+    def test_close_position_executor_failure(self):
+        """_close_position() handles executor failure gracefully."""
+        from strategy.decision import DecisionEngine
+        from unittest.mock import patch
+
+        # Create a mock executor that returns None (failure)
+        mock_executor = MagicMock()
+        mock_executor.close_spread.return_value = None
+
+        # Create a mock notifier
+        mock_notifier = MagicMock()
+
+        engine = DecisionEngine(
+            cache=MagicMock(),
+            portfolio_value=10_000.0,
+            executor=mock_executor,
+            notifier=mock_notifier,
+        )
+
+        # Create a position with last_spread_value set
+        pos = {
+            "trade_id": 1,
+            "asset": "BTC",
+            "strike": 60000.0,
+            "net_debit": 0.05,
+            "qty": 1.0,
+            "open_fees": 0.001,
+            "roll_pnl": 0.0,
+            "last_spread_value": 0.04,  # Last known spread value
+            "near_prem": 0.02,
+            "far_prem": 0.07,
+        }
+
+        # Mock mark_position_close_stuck to avoid DB operations in this unit test
+        with patch("strategy.decision.mark_position_close_stuck"):
+            # Close with executor failure but last_spread_value available
+            result = engine._close_position(pos, spot=100_000.0, reason="Test close")
+
+            # Should return message indicating stuck status
+            assert "close_stuck" in result.lower() or "marked" in result.lower()

@@ -52,6 +52,9 @@ ORDER_TIMEOUT_SEC:  int   = getattr(config, "ORDER_TIMEOUT_SEC",  30)
 MAX_RETRIES:        int   = getattr(config, "MAX_ORDER_RETRIES",  3)
 _RETRY_DELAYS = [1, 3, 9]   # seconds between retry attempts
 
+# ── Tick-size cache for price rounding ─────────────────────────────────────────
+_TICK_SIZE_CACHE: dict[str, float] = {}  # instrument_name → tick_size
+
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -167,6 +170,10 @@ class _DeribitRPCClient:
     async def get_ticker(self, instrument: str) -> dict:
         return await self._rpc("public/ticker", {"instrument_name": instrument})
 
+    async def get_instrument(self, instrument: str) -> dict:
+        """Fetch instrument metadata including tick_size for price rounding."""
+        return await self._rpc("public/get_instruments", {"instrument_name": instrument})
+
     async def place_order(
         self,
         instrument: str,
@@ -175,12 +182,30 @@ class _DeribitRPCClient:
         price:      float,  # limit price in Deribit index fraction
         label:      str = "",
     ) -> dict:
+        # Round price to instrument's valid tick size to prevent "-32602 Invalid params" errors
+        # Tick size varies with option price level (tick_size_steps); try cache first, then fetch
+        tick_size = _TICK_SIZE_CACHE.get(instrument)
+        if tick_size is None:
+            try:
+                # Fetch instrument metadata to get tick_size
+                instr_data = await self._rpc("public/get_instruments", {"instrument_name": instrument})
+                instruments = instr_data.get("instruments", [])
+                if instruments and isinstance(instruments, list):
+                    tick_size = instruments[0].get("tick_size")
+                    if tick_size:
+                        _TICK_SIZE_CACHE[instrument] = tick_size
+            except Exception:
+                pass  # Fall back to default rounding below
+
+        # Round to the valid tick (or default 4 decimals)
+        rounded_price = _round_to_tick(price, instrument, tick_size)
+
         method = f"private/{direction}"
         params = {
             "instrument_name": instrument,
             "amount":          amount,
             "type":            "limit",
-            "price":           price,
+            "price":           rounded_price,
             "post_only":       False,
         }
         if label:
@@ -247,6 +272,45 @@ def _contract_amount(spot: float, asset: str, portfolio_value: float, max_loss_p
         return round(max(0.1, amount_coins), 4)  # Deribit min = 0.1 BTC/ETH
     # Linear: amount in integer contracts
     return float(max(1, int(qty_usd)))
+
+
+def _round_to_tick(price: float, instrument: str, tick_size: float | None = None) -> float:
+    """
+    Round a price to the instrument's valid tick size (Deribit's minimum price increment).
+
+    Deribit's options use variable tick sizes that scale with price (tick_size_steps).
+    This function rounds the price to the nearest valid tick to prevent order rejections
+    with "-32602 Invalid params" errors when Deribit's JSON-RPC layer validates the price.
+
+    Parameters
+    ----------
+    price : float
+        The price to round (in index fraction for BTC/ETH, USD for linear assets).
+    instrument : str
+        The instrument name (e.g., "BTC-3JAN26-60000-C").
+    tick_size : float | None
+        Explicit tick size. If None, attempts to fetch from cache or uses a safe default.
+
+    Returns
+    -------
+    float
+        The price rounded to the nearest valid tick.
+    """
+    # If tick_size not provided, try to fetch from cache
+    if tick_size is None:
+        tick_size = _TICK_SIZE_CACHE.get(instrument)
+
+    # If still no tick size, use a conservative default
+    # (Deribit typically uses 0.0001 or larger increments for options)
+    if tick_size is None:
+        return round(price, 4)  # Safe default: 4 decimal places
+
+    if tick_size <= 0:
+        return price  # Safeguard
+
+    # Round to nearest tick: floor for buys (conservative), ceil for sells (conservative)
+    # For a generic approach, we round to the nearest tick
+    return round(price / tick_size) * tick_size
 
 
 def _check_slippage(fill_price_usd: float, intended_usd: float, limit_pct: float) -> None:
@@ -885,6 +949,39 @@ class CalendarExecutor:
                 return pool.submit(asyncio.run, coro).result()
         else:
             return asyncio.run(coro)
+
+    def _fetch_and_cache_tick_size(self, instrument: str) -> float | None:
+        """
+        Fetch an instrument's tick size from Deribit and cache it.
+
+        Returns None if the fetch fails (e.g., in paper mode or network error).
+        The tick size is stored in the global _TICK_SIZE_CACHE for reuse.
+        """
+        if config.TRADING_MODE == "paper":
+            return None  # Paper mode doesn't make API calls; use default rounding
+
+        async def _fetch():
+            try:
+                async with _DeribitRPCClient(self.client_id, self.client_secret) as client:
+                    result = await client.get_instrument(instrument)
+                    # Result is a list of instruments; extract the first (or matching) one
+                    instruments = result.get("instruments", result.get("instrument", []))
+                    if isinstance(instruments, list) and len(instruments) > 0:
+                        instr = instruments[0]
+                    elif isinstance(instruments, dict):
+                        instr = instruments
+                    else:
+                        return None
+                    tick_size = instr.get("tick_size")
+                    if tick_size is not None:
+                        _TICK_SIZE_CACHE[instrument] = tick_size
+                        logger.debug("Cached tick_size for %s: %s", instrument, tick_size)
+                    return tick_size
+            except Exception as e:
+                logger.debug("Failed to fetch tick_size for %s: %s", instrument, e)
+                return None
+
+        return self._run(_fetch())
 
     # ── ExecutorProtocol implementation ───────────────────────────────────────
 
