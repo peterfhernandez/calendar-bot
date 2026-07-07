@@ -480,7 +480,8 @@ calendar-bot/
 | --- | --- |
 | Leg risk on entry (one leg fills, other doesn't) | Use Deribit combo orders; individual-leg fallback only when both legs are liquid and cancels near leg immediately on far-leg failure |
 | Leg risk on close (one leg fills, other times out) | Close operations unwind partial fills: if near fills but far times out, reverse-sell near at market; if far fills but near times out, reverse-buy far at market. Deribit API errors on close are caught and retried up to 3 times; on 4th failure, position is force-closed to prevent naked leg accumulation |
-| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then force-close on 4th failure. Prevents incidents like trade_id=4 (4.5-min retry loop leading to margin call) and trade_id=27 (207 rolls in 3.5 hours) |
+| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then **intended to** force-close/mark-stuck on 4th failure. **Known gap (Phase 18, not yet fixed):** the "mark as stuck" branches reset `_close_roll_failures` to zero immediately after marking, and `get_open_trades()` never filters out `close_status == 'close_stuck'` positions, so the position keeps being monitored and the same failing close keeps retrying indefinitely rather than actually stopping. Confirmed in test-mode logs: trade_id=3 re-marked "stuck" 40 times over ~29 hours; trade_id=5 stuck 6+ days before a manual `/close_manually`. |
+| Close order rejected by exchange (`-32602 Invalid params`) | **Known gap (Phase 18, not yet fixed):** `execution/executor.py` blanket-rounds every order price to 4 decimals and never fetches an instrument's actual Deribit tick size (`tick_size_steps` scales with option premium). Far-leg close orders — typically priced higher than the near leg — land in a coarser tick band and get rejected by Deribit's JSON-RPC layer before any business-logic check runs. Confirmed in test-mode logs: 636 occurrences of `Deribit error -32602: Invalid params`, 100% on far-leg close submissions, 0% on near-leg. See Phase 18 below for the fix design. |
 | IV collapse after entry | Check IV term structure before entering; set max IV drop stop |
 | Liquidity gaps on crypto calendars | Two-stage liquidity filter: OI in scanner, bid/ask size + spread in decision gate |
 | Overfitting scanner to recent market | Backtest across at least 2 vol regimes |
@@ -1240,3 +1241,65 @@ Test expected `asyncio.run(Notifier._post_telegram(...))` to complete without ra
 - `tests/test_telegram_cmd.py::test_handle_close_manually_clears_notification_flag`
 
 Both tests now properly release SQLite connections before cleanup, allowing the temp directory to be deleted on Windows.
+
+---
+
+## Phase 18 — Close-Order Reliability & Stuck-Position Retry Bugfixes
+
+### How this was found
+
+A post-hoc analysis of `db/calendar_bot_test.db` and `logs/bot_test.log*` (test-mode run under `config_test.py`, 2026-06-28 → 2026-07-07) turned up three distinct, compounding bugs in the close/retry path. Of the 4 closed trades in the test DB, 3 went through an abnormal close (retry-failed, stuck, or manual) rather than a clean auto-close — the opposite of what Phase 17c's "one notification, then quiet" design intended to signal. See BOT_TODO.md Phase 18 for the actionable checklist; this section is the root-cause writeup.
+
+### Bug 1 — Far-leg close orders rejected with `-32602 Invalid params`
+
+**Symptom:** `logs/bot_test.log*` contains 636 occurrences of `Deribit error -32602: Invalid params`. Every one of the 75 explicit `Failed to submit far close order` log lines is on the **far** leg; `Failed to submit near close order` never once appears across four log files. The failure rate is 100% far / 0% near, consistent across every asset, strike, and expiry that attempted a close in this run — not an occasional edge case.
+
+**Root cause:** `execution/executor.py` has no concept of an instrument's tick size. Deribit's option tick size is not constant — it scales with the option's premium level (`tick_size_steps` in the instrument metadata: e.g. a coarser tick applies once price crosses a threshold). Every price the executor sends is produced by a blanket `round(price, 4)` (`_index_price()`, and directly in `_async_close_spread`, `_async_enter_spread`, `_async_roll_near_leg`, and the unwind/flatten helpers) with no awareness of the actual tick increment Deribit expects for that specific instrument at that specific price level.
+
+Calendar spreads buy the longer-dated (far) leg and sell the shorter-dated (near) leg; the far leg carries more time value and is therefore priced higher, on average landing in a coarser tick band than the near leg. A price that isn't a multiple of the instrument's real tick size fails Deribit's own JSON-RPC parameter schema validation — which is why the error is the generic `-32602 Invalid params` (a request-shape rejection) rather than one of the business-rule codes also seen in these logs (`10009 not_enough_funds`, `11044 not_open_order`, both of which *do* reach Deribit's order-matching logic before failing).
+
+**Fix:**
+
+1. Add a per-instrument tick-size lookup (via `public/get_instruments` or the `tick_size`/`tick_size_steps` field already present on ticker responses used elsewhere in the executor) with a short-lived cache to avoid a round trip on every order.
+2. Round every price the executor submits to the nearest valid tick before calling `place_order()` — near and far legs must each use their *own* instrument's tick size, not a shared constant. Apply at every price-producing call site: `_async_enter_spread` (individual-leg fallback), `_async_enter_spread_combo`, `_async_close_spread` (both legs), `_async_roll_near_leg` (close + open), and the `FLATTEN-NEAR` / `UNWIND-NEAR` / `UNWIND-FAR` emergency-unwind orders.
+3. Add regression tests that replay the exact instrument/price pairs from trade_id=3, 4, and 5's logs against a mocked coarse tick size and assert the submitted price is valid.
+
+### Bug 2 — The retry-cap safety net doesn't actually stop retrying
+
+**Symptom:** trade_id=3 (BTC 59000 Put) triggered its stop-loss on 2026-07-05 and was not fully closed until 2026-07-06 11:32:42 — roughly **29 hours** later. The `ERROR strategy.decision: trade_id=3 stop-loss close failed 3 times — marking as stuck for manual intervention` log line fired **40 separate times** across that window, each with a fresh `mark_position_close_stuck()` DB write. trade_id=5 (BTC 50000 Put) was stuck from 2026-06-30 until a manual `/close_manually` on 2026-07-06 — over 6 days.
+
+**Root cause:** two gaps compound:
+
+1. In `strategy/decision.py`, every "mark as stuck" branch (near-leg-expired ~line 745, stop-loss ~line 818, take-profit ~line 857) calls `mark_position_close_stuck()` and then **immediately** does `self._close_roll_failures.pop(trade_id, None)` — clearing the in-memory retry counter back to zero in the same breath it declares the position unrecoverable.
+2. `mark_position_close_stuck()` (`db/state.py`) only ever writes to the `close_status` column. `get_open_trades()` — the query `monitor_tick()` uses to decide what to re-evaluate every cycle — filters exclusively on `result`, which is never touched by the stuck-marking path. So a position marked "stuck" is functionally indistinguishable from a healthy open position on the very next monitor tick: it gets re-evaluated, the same close order fails again (Bug 1), the freshly-zeroed counter climbs back to 3, and the position gets marked "stuck" *again*.
+
+The Telegram-alert half of Phase 17c's fix does work — `_notified_stuck` correctly prevents the user from being paged on every one of those 40 cycles — but the underlying retry loop, redundant DB writes, and continued uncontrolled market exposure on the position were never actually addressed. Notably, `tests/test_decision.py::test_fourth_failure_force_closes_position` currently **asserts** `4 not in engine._close_roll_failures` after the 4th failure — i.e. the existing test suite encodes this bug as intended behavior, which is why it was never caught.
+
+**Fix (recommended approach):** stop re-evaluating a position for stop/tp/roll once it is genuinely marked `close_stuck`, until a human clears it via the existing `/close` or `/close_manually` commands (which already call `reset_close_stuck_position()`). Concretely: either filter `close_status != 'close_stuck'` into the monitor loop's open-position query, or check the flag at the top of `_monitor_position()` and skip straight through. This is simpler and safer than "keep retrying on a slower cadence," and it matches the "needs manual intervention" message already sent to the operator — once Bug 1 is fixed, most closes should succeed on the first or second attempt anyway, so this path should rarely trigger in practice. `tests/test_decision.py`'s two "fourth failure" tests need to be rewritten to assert the new behavior (counter/position frozen, not reset-and-retry).
+
+### Bug 3 — A force-closed trade was recorded with `pnl=0.0`
+
+**Symptom:** trade_id=1 (ETH 1400 Put) in the test DB has `result='Loss (Stop retry limit exceeded)'` and `pnl=0.0`, despite `last_spread_value=57.13` sitting just under `net_debit=57.42` — a real (small) loss, not a breakeven.
+
+**Root cause:** `_close_position()` in `strategy/decision.py` only ever writes a DB result when `self._executor.close_spread(pos)` returns a real credit; if it returns `None` the function returns `"...close FAILED"` immediately and never calls `close_calendar_trade()`. That means this specific row was written by a different, likely now-removed, code path — `git log -- strategy/decision.py` shows several rounds of retry-logic changes (`740895e`, `d0cc03a`, `4f4c2b6`, `f5dc9c9`) that plausibly replaced whatever force-close path produced this exact result string. Wherever that logic ends up, the takeaway is the same: a position can be force-closed and recorded without a confirmed fill price, and today that silently defaults PnL to 0 instead of using the last known mark.
+
+**Fix:** any force-close path (expired-near-leg, roll-retry-exceeded, or a to-be-added stuck-position timeout) must compute PnL from the last known mark-to-market value (`last_spread_value`, or a fresh `check_calendar_status` call) rather than defaulting to zero when `close_spread()` returns `None`. `close_error_reason` already exists on the schema to flag "this PnL is an estimate, not a confirmed fill" — use it. Add a regression test replaying trade_id=1's exact inputs and asserting the recorded PnL is non-zero.
+
+### Related observation — BTC/ETH entry skew in test mode (not a bug)
+
+Test-mode entries were 6 BTC to 1 ETH. This traces to `test.deribit.com`'s ETH options book being much thinner than BTC's: ETH candidates were rejected by the liquidity gate (`MAX_LEG_SPREAD_PCT`) roughly 2.7x more often than BTC (27,042 vs 10,035 skips in the log history) despite `ASSETS = ["BTC", "ETH"]` weighting both equally. This is a test-exchange liquidity artifact, not a config or scanner defect, and is not expected to persist on the live orderbook — no action needed, called out here only so it isn't mistaken for a Phase 18 bug.
+
+### New/changed files (planned)
+
+| File | Change |
+| --- | --- |
+| `execution/executor.py` | + tick-size lookup/cache; round all order prices to valid ticks at every price-producing call site |
+| `strategy/decision.py` | Stop resetting `_close_roll_failures` on mark-stuck; skip re-evaluation of `close_stuck` positions; ensure force-close paths compute real PnL |
+| `db/state.py` | Possibly extend `get_open_trades()` (or add a variant) to exclude `close_status == 'close_stuck'` from routine monitor re-evaluation |
+| `tests/test_executor.py` | + tick-size rounding tests |
+| `tests/test_decision.py` | Rewrite the two "fourth failure" tests to assert frozen/excluded behavior instead of reset-and-retry; + zero-PnL regression test |
+| `scratch/scratch_tick_size_close.py` | New — demonstrates the tick-size bug and fix against test.deribit.com (read-only ticker calls; no live orders unless `TRADING_MODE` explicitly allows it) |
+
+### Status
+
+Not started — this phase documents root causes found via log/DB forensics on 2026-07-07. Implementation is tracked as an open checklist in BOT_TODO.md Phase 18.

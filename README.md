@@ -117,6 +117,18 @@ The four flags (`--env`, `--db`, `--log`, `--config`) are pre-parsed before any 
 
 ---
 
+## Known issues
+
+Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 2026-06-28 → 2026-07-07) surfaced three bugs in the close/retry path, tracked in [BOT_TODO.md Phase 18](BOT_TODO.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes) with full root-cause detail in [BOT_PLAN.md](BOT_PLAN.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes):
+
+- **Far-leg close orders can be rejected by Deribit** (`-32602 Invalid params`) because the executor doesn't account for per-instrument tick size when rounding order prices. This can leave a position open past its intended stop-loss.
+- **The retry-cap "mark as stuck" safety net doesn't stop retrying** — the failure counter resets right after a position is marked stuck, and stuck positions aren't excluded from routine monitoring, so the bot can keep retrying the same failing close indefinitely. One test-mode position stayed open ~29 hours past its stop trigger; another needed 6+ days and a manual `/close_manually` before it closed.
+- **A force-closed position was recorded with `pnl=0.0`** instead of its real loss in one observed case.
+
+Until Phase 18 lands, watch for `close_stuck` positions (`/positions` or the "MANUAL ACTION REQUIRED" Telegram alert) and use `/close` or `/close_manually` if a position doesn't resolve within a few minutes of its stop/take-profit triggering.
+
+---
+
 ## Trading modes
 
 The bot supports three operational modes set by `TRADING_MODE` in `config.py`:
