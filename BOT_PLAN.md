@@ -1237,6 +1237,7 @@ Test expected `asyncio.run(Notifier._post_telegram(...))` to complete without ra
 **Fix:** Explicitly close all database connections before the temp directory context exits using `get_connection(db_path).close()` in a try-except block at the end of each test.
 
 **Tests affected:**
+
 - `tests/test_telegram_cmd.py::test_handle_close_resets_close_stuck_flag`
 - `tests/test_telegram_cmd.py::test_handle_close_manually_clears_notification_flag`
 
