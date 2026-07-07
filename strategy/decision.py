@@ -759,7 +759,9 @@ class DecisionEngine:
                     intended_close_reason="expired-near-leg",
                     db_path=self._db_path,
                 )
-                self._close_roll_failures.pop(trade_id, None)
+                # NOTE: Do NOT reset the failure counter — it's kept for historical tracking.
+                # This position is now excluded from get_open_trades() due to close_status='close_stuck',
+                # so it will not be re-evaluated in future monitor ticks.
 
                 # Notify user about stuck position (only once, not every monitor tick)
                 if trade_id not in self._notified_stuck and self._notifier:
@@ -829,7 +831,9 @@ class DecisionEngine:
                     intended_close_reason="stop-loss",
                     db_path=self._db_path,
                 )
-                self._close_roll_failures.pop(trade_id, None)
+                # NOTE: Do NOT reset the failure counter — it's kept for historical tracking.
+                # This position is now excluded from get_open_trades() due to close_status='close_stuck',
+                # so it will not be re-evaluated in future monitor ticks.
 
                 # Notify user about stuck position (only once, not every monitor tick)
                 if trade_id not in self._notified_stuck and self._notifier:
@@ -868,7 +872,9 @@ class DecisionEngine:
                     intended_close_reason="take-profit",
                     db_path=self._db_path,
                 )
-                self._close_roll_failures.pop(trade_id, None)
+                # NOTE: Do NOT reset the failure counter — it's kept for historical tracking.
+                # This position is now excluded from get_open_trades() due to close_status='close_stuck',
+                # so it will not be re-evaluated in future monitor ticks.
 
                 # Notify user about stuck position (only once, not every monitor tick)
                 if trade_id not in self._notified_stuck and self._notifier:
@@ -959,8 +965,18 @@ class DecisionEngine:
 
         close_credit = self._executor.close_spread(pos)
         if close_credit is None:
-            logger.error("Executor failed to close trade_id=%d", trade_id)
-            return f"trade_id={trade_id} close FAILED"
+            # Executor failed to close; mark as stuck instead of recording fake PnL=0.0
+            logger.error(
+                "Executor failed to close trade_id=%d — marking as stuck for manual intervention",
+                trade_id,
+            )
+            mark_position_close_stuck(
+                trade_id=trade_id,
+                error_reason=f"Executor failed to close ({reason}) — position needs manual close on Deribit",
+                intended_close_reason=reason,
+                db_path=self._db_path,
+            )
+            return f"trade_id={trade_id} marked as close_stuck ({reason})"
 
         if spread_value is not None:
             # spread_value is already qty-weighted; net_debit is per-unit

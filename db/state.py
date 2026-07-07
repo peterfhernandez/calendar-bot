@@ -360,11 +360,16 @@ def update_last_spread_value(
 
 
 def get_open_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]:
-    """Return all currently open calendar trades as CalendarTrade objects."""
+    """Return all currently open calendar trades as CalendarTrade objects.
+
+    Excludes positions marked as close_stuck to prevent repeated monitoring attempts.
+    Stuck positions are only included when explicitly queried via get_stuck_positions().
+    """
     init_db(db_path)
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM calendar_trades WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))}) ORDER BY date_open",
+            f"SELECT * FROM calendar_trades WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))}) "
+            f"AND close_status != 'close_stuck' ORDER BY date_open",
             _OPEN_STATUSES,
         ).fetchall()
     return [_row_to_trade(r) for r in rows]
