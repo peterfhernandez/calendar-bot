@@ -207,7 +207,7 @@ async def _fetch_deribit_open_orders(
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}))
         return await asyncio.wait_for(fut, timeout=15)
 
-    async with websockets.connect(endpoint, ping_interval=20, open_timeout=15) as ws:
+    async with websockets.connect(endpoint, ping_interval=20, open_timeout=15, max_size=10 * 1024 * 1024) as ws:
         pump_task = asyncio.create_task(pump(ws))
         try:
             if client_id and client_secret:

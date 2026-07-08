@@ -111,6 +111,7 @@ class _DeribitRPCClient:
             ping_interval=20,
             ping_timeout=20,
             open_timeout=15,
+            max_size=10 * 1024 * 1024,  # 10MB — handle large Deribit responses
         )
         self._pump_task = asyncio.create_task(self._pump())
         await self._authenticate()

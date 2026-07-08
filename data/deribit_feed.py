@@ -206,6 +206,7 @@ class DeribitFeed:
             self._endpoint,
             ping_interval=20,
             ping_timeout=20,
+            max_size=10 * 1024 * 1024,  # 10MB — handle large Deribit option chain snapshots
         ) as ws:
             self._ws = ws
             logger.info("Connected")
