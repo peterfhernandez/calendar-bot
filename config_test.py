@@ -25,7 +25,7 @@ _load_env()
 # Overrides include:
 #  - lower MIN_OI_NEAR and MIN_OI_FAR to allow thinly-traded assets (e.g. Far legs) to participate in the test.
 #  - shorten FAR_DAYS_OPTIONS  to bias toward short holds.
-#  - lower MAX_LEG_SPREAD_PCT to allow wider spreads on thinly-traded assets.
+#  - increase MAX_LEG_SPREAD_PCT to allow wider spreads on thinly-traded assets.
 #  - lower MIN_EV to allow any positive EV candidate to be accepted, even if the expected profit is small.
 
 # Assets the bot will trade (scanner, decision engine, execution)
@@ -80,7 +80,7 @@ def asset_config(asset: str, key: str):
 # Liquidity gate (applied just before order submission)
 MIN_LEG_BID_SIZE       = 1      # minimum bid-size (contracts) per leg — requires bid_size in TickerSnapshot
 MIN_LEG_ASK_SIZE       = 1      # minimum ask-size (contracts) per leg — requires ask_size in TickerSnapshot
-MAX_LEG_SPREAD_PCT     = 0.02   # reject if (ask-bid)/mid > 5% on either leg
+MAX_LEG_SPREAD_PCT     = 0.1    # reject if (ask-bid)/mid > 10% on either leg
 MAX_ENTRY_PREMIUM      = 0.10   # reject if net_debit > spread_mid * (1 + 10%)
 COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individual-leg fallback
 
