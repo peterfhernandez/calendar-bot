@@ -20,6 +20,13 @@ def _load_env(path: str | None = None) -> None:
 
 _load_env()
 
+# Any overrides in this config_test file prioritize completing many short
+# order-lifecycle cycles for mechanics validation, not strategy quality.
+# Overrides include:
+#  - lower MIN_OI_NEAR and MIN_OI_FAR to allow thinly-traded assets (e.g. Far legs) to participate in the test.
+#  - shorten FAR_DAYS_OPTIONS  to bias toward short holds.
+#  - lower MAX_LEG_SPREAD_PCT to allow wider spreads on thinly-traded assets.
+
 # Assets the bot will trade (scanner, decision engine, execution)
 ASSETS = ["BTC","ETH"]
 
@@ -30,7 +37,7 @@ COLLECTOR_ASSETS = ["BTC", "ETH", "SOL"]
 
 # Calendar horizons (days to expiry)
 NEAR_DAYS_OPTIONS = [1, 7, 14]
-FAR_DAYS_OPTIONS  = [7, 14, 30, 45]
+FAR_DAYS_OPTIONS  = [7, 14]
 
 # 1-day near legs are only valid with short far legs — a 1d/30d+ spread is
 # unusual and almost always illiquid.  Set to 0 to disable the restriction.
@@ -72,14 +79,14 @@ def asset_config(asset: str, key: str):
 # Liquidity gate (applied just before order submission)
 MIN_LEG_BID_SIZE       = 1      # minimum bid-size (contracts) per leg — requires bid_size in TickerSnapshot
 MIN_LEG_ASK_SIZE       = 1      # minimum ask-size (contracts) per leg — requires ask_size in TickerSnapshot
-MAX_LEG_SPREAD_PCT     = 0.05   # reject if (ask-bid)/mid > 5% on either leg
+MAX_LEG_SPREAD_PCT     = 0.02   # reject if (ask-bid)/mid > 5% on either leg
 MAX_ENTRY_PREMIUM      = 0.10   # reject if net_debit > spread_mid * (1 + 10%)
 COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individual-leg fallback
 
 # Position sizing
-MAX_LOSS_PCT       = 0.02  # max 2% of portfolio per trade
-MAX_POSITIONS      = 1     # max concurrent open calendar spreads
-MAX_TOTAL_RISK_PCT = 0.03   # hard 10% total capital-at-risk across all open positions
+MAX_LOSS_PCT       = 0.02   # max 2% of portfolio per trade
+MAX_POSITIONS      = 5      # max concurrent open calendar spreads
+MAX_TOTAL_RISK_PCT = 0.1    # hard 10% total capital-at-risk across all open positions
 MAX_QTY            = 100.0  # hard cap on contracts per trade — guards against near-zero debit producing absurd sizes
 MIN_NET_DEBIT      = 0.10   # USD — reject candidates whose debit is so small it cannot be sized sensibly
 
