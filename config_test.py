@@ -26,6 +26,7 @@ _load_env()
 #  - lower MIN_OI_NEAR and MIN_OI_FAR to allow thinly-traded assets (e.g. Far legs) to participate in the test.
 #  - shorten FAR_DAYS_OPTIONS  to bias toward short holds.
 #  - lower MAX_LEG_SPREAD_PCT to allow wider spreads on thinly-traded assets.
+#  - lower MIN_EV to allow any positive EV candidate to be accepted, even if the expected profit is small.
 
 # Assets the bot will trade (scanner, decision engine, execution)
 ASSETS = ["BTC","ETH"]
@@ -48,7 +49,7 @@ MIN_IV_CONTANGO = 0.02   # front IV must exceed back IV by at least 2%
 MIN_POP         = 0.45   # minimum probability of profit
 MIN_OI_NEAR     = 100    # minimum open interest on near-leg strike
 MIN_OI_FAR      = 50     # minimum open interest on far-leg strike
-MIN_EV          = 0.2    # minimum expected value as a fraction of net_debit.
+MIN_EV          = 0      # minimum expected value as a fraction of net_debit.
                          # 0.0 = reject non-positive EV; 0.10 = EV must be ≥ 10% of debit paid.
                          # e.g. a candidate with net_debit=0.02 BTC and ev_score=0.25
                          # has an expected profit of 25% of the debit (0.005 BTC per contract).
