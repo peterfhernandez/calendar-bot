@@ -12,6 +12,8 @@ from db.state import (
     get_calendar_stats,
     update_near_leg,
     get_all_closed_trades,
+    get_open_instrument_names,
+    mark_position_close_stuck,
 )
 
 
@@ -379,3 +381,60 @@ class TestGetAllClosedTrades:
         # Check chronological order
         for i in range(len(trades) - 1):
             assert trades[i].date_close <= trades[i + 1].date_close
+
+
+# ── get_open_instrument_names ────────────────────────────────────────────────
+
+class TestGetOpenInstrumentNames:
+    def test_returns_both_legs_of_open_positions(self, db):
+        _open_trade(db)
+        names = get_open_instrument_names(db_path=db)
+        assert "BTC-7JUN26-100000-C" in names
+        assert "BTC-4JUL26-100000-C" in names
+
+    def test_excludes_closed_positions(self, db):
+        t = _open_trade(db)
+        close_calendar_trade(
+            t.id, date_close=date(2026, 6, 7),
+            spot_close=101_000.0, pnl=10.0, result="Win", db_path=db,
+        )
+        assert get_open_instrument_names(db_path=db) == []
+
+    def test_includes_close_stuck_positions(self, db):
+        # A stuck position is still open on the exchange and needs coverage.
+        t = _open_trade(db)
+        mark_position_close_stuck(t.id, error_reason="timeout", db_path=db)
+        names = get_open_instrument_names(db_path=db)
+        assert "BTC-7JUN26-100000-C" in names
+        assert "BTC-4JUL26-100000-C" in names
+
+    def test_deduplicates_and_sorts(self, db):
+        _open_trade(db)
+        _open_trade(db)  # same instruments, second open position
+        names = get_open_instrument_names(db_path=db)
+        assert names == sorted(set(names))
+        assert len(names) == 2
+
+    def test_skips_null_instruments(self, db):
+        create_calendar_trade(
+            asset="ETH",
+            date_open=date(2026, 6, 1),
+            option_type="Put",
+            strike=1_400.0,
+            expiry_near="2026-06-07",
+            expiry_far="2026-07-04",
+            near_days=7,
+            far_days=30,
+            qty=1.0,
+            spot_open=1_500.0,
+            near_prem=50.0,
+            far_prem=80.0,
+            net_debit=30.0,
+            near_instrument=None,
+            far_instrument="ETH-4JUL26-1400-P",
+            db_path=db,
+        )
+        assert get_open_instrument_names(db_path=db) == ["ETH-4JUL26-1400-P"]
+
+    def test_empty_db_returns_empty_list(self, db):
+        assert get_open_instrument_names(db_path=db) == []

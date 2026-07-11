@@ -119,15 +119,14 @@ The four flags (`--env`, `--db`, `--log`, `--config`) are pre-parsed before any 
 
 ## Known issues
 
-Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 2026-06-28 → 2026-07-07) surfaced three bugs in the close/retry path, tracked in [BOT_TODO.md Phase 18](BOT_TODO.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes) with full root-cause detail in [BOT_PLAN.md](BOT_PLAN.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes):
+Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 2026-06-28 → 2026-07-07) surfaced four bugs in the close/retry and feed-coverage paths, all now fixed and tracked in [BOT_TODO.md Phase 18](BOT_TODO.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes) with full root-cause detail in [BOT_PLAN.md](BOT_PLAN.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes):
 
-- **Far-leg close orders can be rejected by Deribit** (`-32602 Invalid params`) because the executor doesn't account for per-instrument tick size when rounding order prices. This can leave a position open past its intended stop-loss.
-- **The retry-cap "mark as stuck" safety net doesn't stop retrying** — the failure counter resets right after a position is marked stuck, and stuck positions aren't excluded from routine monitoring, so the bot can keep retrying the same failing close indefinitely. One test-mode position stayed open ~29 hours past its stop trigger; another needed 6+ days and a manual `/close_manually` before it closed.
-- **A force-closed position was recorded with `pnl=0.0`** instead of its real loss in one observed case.
+- **Far-leg close orders could be rejected by Deribit** (`-32602 Invalid params`) because the executor didn't account for per-instrument tick size when rounding order prices. Fixed — order prices are now rounded to each instrument's own tick size.
+- **The retry-cap "mark as stuck" safety net didn't stop retrying** — stuck positions weren't excluded from routine monitoring, so the bot could keep retrying the same failing close indefinitely. Fixed — `close_stuck` positions are skipped by the monitor until cleared via `/close` or `/close_manually`.
+- **A force-closed position was recorded with `pnl=0.0`** instead of its real loss in one observed case. Fixed — positions the executor can't close are marked stuck rather than recorded with a fake P&L.
+- **The WebSocket feed's ticker subscription window could silently stop covering a long-dated open position's far leg after a reconnect**, since the subscription window was tied to the scanner's day-window config rather than to actually-open positions. This disabled stop-loss/take-profit monitoring for the affected position (repeated "No IV for trade N — skipping status check" warnings). Fixed — the feed now unions the near/far instrument names of every open position (from `db/state.py::get_open_instrument_names`) into its subscription list on every connect and reconnect, so open-position legs stay covered regardless of the configured day window.
 
-A fourth bug, identified 2026-07-11, is also tracked there but not yet fixed: **the WebSocket feed's ticker subscription window can silently stop covering a long-dated open position's far leg after a reconnect**, since the subscription window is tied to the scanner's day-window config rather than to actually-open positions. This disables stop-loss/take-profit monitoring for the affected position (logged as repeated "No IV for trade N — skipping status check" warnings) until the bot is restarted with a wider config or the position is closed.
-
-Until Phase 18 lands, watch for `close_stuck` positions (`/positions` or the "MANUAL ACTION REQUIRED" Telegram alert) and use `/close` or `/close_manually` if a position doesn't resolve within a few minutes of its stop/take-profit triggering. Also watch logs for recurring "No IV for trade N" warnings, which indicate the Bug 4 feed-coverage gap above.
+Positions can still become `close_stuck` when the exchange repeatedly rejects a close (`/positions` or the "MANUAL ACTION REQUIRED" Telegram alert will flag them) — use `/close` to retry or `/close_manually` to resolve them.
 
 ---
 

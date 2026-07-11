@@ -320,5 +320,92 @@ class TestDeribitFeedOfflineTracking(unittest.IsolatedAsyncioTestCase):
         assert feed._retry_count == 0
 
 
+class TestFeedOpenPositionCoverage(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for Phase 18 Bug 4.
+
+    Open-position instrument names supplied via the extra_instruments
+    provider must stay subscribed on every connect AND reconnect, even when
+    their expiry falls outside the day window derived from
+    NEAR_DAYS_OPTIONS/FAR_DAYS_OPTIONS.
+    """
+
+    # The far leg of test-mode trade_id=1 (far_days=51) — outside the 1–28d
+    # window that config_test.py's [7, 14] FAR_DAYS_OPTIONS produces.
+    _FAR_LEG = "BTC-28AUG26-56000-P"
+    _WINDOW  = ["BTC-17JUL26-56000-P", "BTC-24JUL26-56000-P"]
+
+    def _feed(self, provider) -> DeribitFeed:
+        return DeribitFeed(assets=["BTC"], extra_instruments=provider)
+
+    async def _run_subscribe_all(self, feed: DeribitFeed) -> list[list[str]]:
+        """Run _subscribe_all with mocked I/O; return the subscribed batches."""
+        batches: list[list[str]] = []
+
+        async def fake_fetch(asset):
+            feed._instruments[asset] = list(self._WINDOW)
+            return list(self._WINDOW)
+
+        async def fake_subscribe(instruments):
+            batches.append(list(instruments))
+
+        with patch.object(feed, "fetch_instruments", side_effect=fake_fetch), \
+             patch.object(feed, "_subscribe_tickers", side_effect=fake_subscribe):
+            await feed._subscribe_all()
+        return batches
+
+    async def test_open_position_instrument_outside_window_is_subscribed(self):
+        feed = self._feed(lambda: [self._FAR_LEG])
+        batches = await self._run_subscribe_all(feed)
+        subscribed = [name for batch in batches for name in batch]
+        self.assertIn(self._FAR_LEG, subscribed)
+
+    async def test_open_position_instrument_stays_subscribed_across_reconnect(self):
+        feed = self._feed(lambda: [self._FAR_LEG])
+        # First connect
+        first = await self._run_subscribe_all(feed)
+        # Simulated reconnect — _subscribe_all runs again from _connect_and_stream
+        second = await self._run_subscribe_all(feed)
+        for batches in (first, second):
+            subscribed = [name for batch in batches for name in batch]
+            self.assertIn(self._FAR_LEG, subscribed)
+
+    async def test_instrument_already_in_window_not_duplicated(self):
+        feed = self._feed(lambda: [self._WINDOW[0]])
+        batches = await self._run_subscribe_all(feed)
+        subscribed = [name for batch in batches for name in batch]
+        self.assertEqual(subscribed.count(self._WINDOW[0]), 1)
+
+    async def test_provider_recomputed_on_each_connect(self):
+        """A position closed between reconnects drops out of the extras."""
+        extras = [[self._FAR_LEG]]  # mutable so we can change between passes
+
+        feed = self._feed(lambda: extras[0])
+        first = await self._run_subscribe_all(feed)
+        self.assertIn(self._FAR_LEG, [n for b in first for n in b])
+
+        extras[0] = []  # position closed
+        second = await self._run_subscribe_all(feed)
+        self.assertNotIn(self._FAR_LEG, [n for b in second for n in b])
+
+    async def test_provider_failure_does_not_break_feed(self):
+        def boom():
+            raise RuntimeError("db unavailable")
+
+        feed = self._feed(boom)
+        batches = await self._run_subscribe_all(feed)
+        # Day-window subscription must still have happened
+        self.assertEqual(batches, [self._WINDOW])
+
+    async def test_no_provider_behaves_as_before(self):
+        feed = DeribitFeed(assets=["BTC"])
+        batches = await self._run_subscribe_all(feed)
+        self.assertEqual(batches, [self._WINDOW])
+
+    async def test_extras_recorded_in_instruments_map(self):
+        feed = self._feed(lambda: [self._FAR_LEG])
+        await self._run_subscribe_all(feed)
+        self.assertIn(self._FAR_LEG, feed._instruments["BTC"])
+
+
 if __name__ == "__main__":
     unittest.main()

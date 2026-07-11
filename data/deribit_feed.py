@@ -81,6 +81,13 @@ class DeribitFeed:
         Async callback invoked for every ticker update received.
     backoff_max:
         Maximum seconds between reconnect attempts.
+    extra_instruments:
+        Optional zero-argument callable returning instrument names that must
+        stay subscribed regardless of the scanner's day-window config —
+        typically the near/far legs of currently-open positions
+        (``db.state.get_open_instrument_names``).  Re-invoked on every
+        connect *and* reconnect so coverage survives WS drops even when a
+        leg's expiry falls outside NEAR_DAYS_OPTIONS/FAR_DAYS_OPTIONS.
     """
 
     def __init__(
@@ -91,6 +98,7 @@ class DeribitFeed:
         client_secret: str = "",
         on_ticker: TickerCallback | None = None,
         backoff_max: float = 60.0,
+        extra_instruments: Callable[[], list[str]] | None = None,
     ) -> None:
         self.assets        = [a.upper() for a in assets]
         self.paper         = paper
@@ -98,6 +106,7 @@ class DeribitFeed:
         self.client_secret = client_secret
         self.on_ticker     = on_ticker
         self.backoff_max   = backoff_max
+        self.extra_instruments = extra_instruments
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._running  = False
@@ -220,15 +229,61 @@ class DeribitFeed:
                 if self.client_id and self.client_secret:
                     await self._authenticate()
 
-                for asset in self.assets:
-                    instruments = await self.fetch_instruments(asset)
-                    logger.info("Subscribing to %d %s instruments", len(instruments), asset)
-                    await self._subscribe_tickers(instruments)
+                await self._subscribe_all()
 
                 await pump_task
             except Exception:
                 pump_task.cancel()
                 raise
+
+    async def _subscribe_all(self) -> None:
+        """Subscribe to the day-window instrument lists plus open-position legs.
+
+        Runs on every connect and reconnect.  The day-window lists come from
+        fetch_instruments(); the union with open-position instrument names
+        guarantees that a long-dated far leg opened under a wider config stays
+        covered even after the window is narrowed or a WS drop rebuilds the
+        subscription list.
+        """
+        # Reset — subscriptions from a previous connection are gone after a
+        # reconnect, so the map must reflect only the current connection.
+        self._instruments = {}
+        for asset in self.assets:
+            instruments = await self.fetch_instruments(asset)
+            logger.info("Subscribing to %d %s instruments", len(instruments), asset)
+            await self._subscribe_tickers(instruments)
+
+        extras = self._open_position_extras()
+        if extras:
+            logger.info(
+                "Subscribing to %d open-position instrument(s) outside the day window: %s",
+                len(extras), extras,
+            )
+            await self._subscribe_tickers(extras)
+
+    def _open_position_extras(self) -> list[str]:
+        """Return open-position instrument names not already subscribed.
+
+        Calls the extra_instruments provider (if configured), drops names the
+        day-window lists already cover, and records the remainder in
+        self._instruments so later lookups see them as subscribed.  Never
+        raises — a provider failure must not take down the feed.
+        """
+        if self.extra_instruments is None:
+            return []
+        try:
+            names = list(self.extra_instruments() or [])
+        except Exception as exc:
+            logger.warning(
+                "Could not determine open-position instruments for feed coverage: %s", exc
+            )
+            return []
+        subscribed = {n for lst in self._instruments.values() for n in lst}
+        extras = sorted({n for n in names if n and n not in subscribed})
+        for name in extras:
+            asset = name.split("-")[0]
+            self._instruments.setdefault(asset, []).append(name)
+        return extras
 
     async def _pump(self, ws) -> None:
         """Read messages from the WebSocket and dispatch them."""
