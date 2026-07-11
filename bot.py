@@ -58,7 +58,7 @@ import config
 from alerts.notifier import Notifier
 from data.chain_cache import ChainCache
 from data.deribit_feed import DeribitFeed
-from db.state import list_assets_with_open_positions
+from db.state import get_open_instrument_names, list_assets_with_open_positions
 from execution.executor import CalendarExecutor
 from monitor.loop import BotLoop, configure_logging
 from portfolio.tracker import PortfolioTracker
@@ -145,6 +145,10 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
         client_id=config.DERIBIT_CLIENT_ID,
         client_secret=config.DERIBIT_CLIENT_SECRET,
         on_ticker=cache.update,
+        # Recomputed on every connect/reconnect so open-position legs stay
+        # subscribed even when their expiry falls outside the scanner's
+        # day window (Phase 18 Bug 4).
+        extra_instruments=get_open_instrument_names,
     )
 
     executor = None

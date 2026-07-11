@@ -252,6 +252,30 @@ def list_assets_with_open_positions(db_path: Path = DB_PATH) -> list[str]:
     return [row["asset"] for row in rows]
 
 
+def get_open_instrument_names(db_path: Path = DB_PATH) -> list[str]:
+    """Return distinct near/far instrument names across all open positions.
+
+    Used by the WebSocket feed to keep ticker subscriptions covering every
+    open position's legs, even when a leg's days-to-expiry falls outside the
+    scanner's configured day window (NEAR_DAYS_OPTIONS/FAR_DAYS_OPTIONS).
+    Includes positions marked ``close_stuck`` — they are still open on the
+    exchange and need live price coverage for /info and manual intervention.
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT near_instrument, far_instrument FROM calendar_trades "
+            f"WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))})",
+            _OPEN_STATUSES,
+        ).fetchall()
+    names: set[str] = set()
+    for row in rows:
+        for col in ("near_instrument", "far_instrument"):
+            if row[col]:
+                names.add(row[col])
+    return sorted(names)
+
+
 def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
     """
     Reconstruct trading state for an asset from trade history.
