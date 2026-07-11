@@ -1286,6 +1286,32 @@ The Telegram-alert half of Phase 17c's fix does work — `_notified_stuck` corre
 
 **Fix:** any force-close path (expired-near-leg, roll-retry-exceeded, or a to-be-added stuck-position timeout) must compute PnL from the last known mark-to-market value (`last_spread_value`, or a fresh `check_calendar_status` call) rather than defaulting to zero when `close_spread()` returns `None`. `close_error_reason` already exists on the schema to flag "this PnL is an estimate, not a confirmed fill" — use it. Add a regression test replaying trade_id=1's exact inputs and asserting the recorded PnL is non-zero.
 
+### Bug 4 — Feed subscription window silently drops IV coverage for long-dated open positions on reconnect
+
+**Symptom:** the test-mode bot's one open position, trade_id=1 (BTC 56000 Put calendar, near leg `17JUL26` / far leg `28AUG26`), has logged `WARNING strategy.decision: No IV for trade 1 — skipping status check` on every single monitor tick since 2026-07-09 21:23:49, and continuously since a bot restart on 2026-07-10 07:56 — over a day of stop-loss/take-profit monitoring silently disabled for this position.
+
+**Root cause:** `data/deribit_feed.py::fetch_instruments()` (~line 163-184) rebuilds the WS ticker-subscription list every time the feed connects — on the initial `start()` call *and* on every reconnect, since `_connect_and_stream()` is re-invoked after every WS drop in `start()`'s retry loop. The list is filtered to a fixed calendar-day window derived from strategy config:
+
+```python
+min_ms = config.NEAR_DAYS_OPTIONS[0]  * 86_400_000
+max_ms = config.FAR_DAYS_OPTIONS[-1]  * 86_400_000
+names = [r["instrument_name"] for r in result
+         if min_ms <= (r["expiration_timestamp"] - now) <= max_ms * 2]
+```
+
+With `NEAR_DAYS_OPTIONS=[1,7,14]` and `FAR_DAYS_OPTIONS=[7,14]` in `config_test.py`, this is a 1–28 calendar-day window. Trade 1's far leg (`BTC-28AUG26-56000-P`) was opened 2026-07-09 08:35 with `far_days=51` (confirmed by direct query of `db/calendar_bot_test.db`'s `calendar_trades` table, alongside `near_days=9`), because at that moment `config_test.py`'s `FAR_DAYS_OPTIONS` still included `45` (i.e. `[7, 14, 30, 45]`). A commit at 2026-07-09 08:04 ("shorten FAR_DAYS_OPTIONS to bias toward short holds") trimmed it to `[7, 14]` — a reasonable change for the *scanner's* candidate matching, but the same config value also drives the feed's subscription window, and nobody intended it to retroactively affect WS coverage of an *already-open* position's far leg.
+
+Confirmed from `logs/test/bot-test-stderr.log`: subscription counts dropped from 588 BTC instruments (07:37-08:04 on 07-09, wide enough to include the 51-day far leg — no "No IV" warnings during this window) to 584 (after a WS reconnect at 19:06:33 on 07-09, "No IV" warnings begin shortly after at 21:23:49) to just 302 BTC instruments after the 07:56 restart on 07-10 (warnings persist continuously from then on). Once the far-leg instrument is no longer subscribed, `data/chain_cache.py::ChainCache.get_chain()` excludes it once its last-seen timestamp exceeds the 30s TTL (`CHAIN_CACHE_TTL_SEC`), so it vanishes from the chain almost immediately. `strategy/decision.py::_get_iv()` (~line 1225) then returns `None` on every call, forever, producing the endless "No IV for trade %d — skipping status check" warning at line 794. This is a real monitoring/risk gap (stop-loss/take-profit silently skipped indefinitely), not just log noise.
+
+**Fix (planned, not yet implemented):**
+
+1. Decouple the WS subscription window from the scanner's day-window config. `fetch_instruments()` (or its caller in `_connect_and_stream()`) should always additionally include the exact `near_instrument`/`far_instrument` names of every currently-open position, regardless of that position's remaining days-to-expiry, unioned with the normal day-window candidate list.
+2. The needed data already exists: `db/state.py` has `list_assets_with_open_positions()` and `load_calendar_state()` (used by `strategy/decision.py` already), which expose `near_instrument`/`far_instrument` per open trade. Likely need a small new helper in `db/state.py`, e.g. `get_open_instrument_names(db_path) -> list[str]`, that returns just the instrument-name strings across all open positions without loading full state.
+3. This union must be recomputed on *every* reconnect, not just at bot startup, since `_connect_and_stream()` — not just the initial `start()` call — is the code path that currently drops coverage after a WS drop.
+4. Open design question: `DeribitFeed` currently has no reference to the DB path or open-position state — it's constructed in `bot.py` with just `assets`/`paper`/credentials/`on_ticker`. The fix needs either (a) passing a `db_path` or a callback into `DeribitFeed.__init__` so it can query open positions itself before each subscribe, or (b) having `bot.py` compute the extra instrument list and pass it into `fetch_instruments()`/`_connect_and_stream()` as an optional parameter each time it's called. Option (a) keeps the feed self-sufficient and avoids `bot.py` having to intercept every reconnect; option (b) keeps `DeribitFeed` free of DB-layer knowledge, consistent with its current design as a pure data-plumbing class. Leaning toward (b) for that separation-of-concerns reason, but noting both here since it affects the shape of the `db/state.py` helper.
+5. Note the precedent: Phase 8i expanded the feed's *asset* list to cover open positions outside `config.ASSETS`, but operated at the asset level, not the specific-instrument/DTE level — it did not address this problem.
+6. Add regression test coverage in `tests/test_feed.py` (open-position instruments remain subscribed across a simulated reconnect even when outside the day window) and a `scratch/scratch_feed_open_position_coverage.py` per this repo's conventions (demonstrates a position near/past the window boundary staying subscribed across a reconnect, read-only, no live orders).
+
 ### Related observation — BTC/ETH entry skew in test mode (not a bug)
 
 Test-mode entries were 6 BTC to 1 ETH. This traces to `test.deribit.com`'s ETH options book being much thinner than BTC's: ETH candidates were rejected by the liquidity gate (`MAX_LEG_SPREAD_PCT`) roughly 2.7x more often than BTC (27,042 vs 10,035 skips in the log history) despite `ASSETS = ["BTC", "ETH"]` weighting both equally. This is a test-exchange liquidity artifact, not a config or scanner defect, and is not expected to persist on the live orderbook — no action needed, called out here only so it isn't mistaken for a Phase 18 bug.
@@ -1300,7 +1326,12 @@ Test-mode entries were 6 BTC to 1 ETH. This traces to `test.deribit.com`'s ETH o
 | `tests/test_executor.py` | + tick-size rounding tests |
 | `tests/test_decision.py` | Rewrite the two "fourth failure" tests to assert frozen/excluded behavior instead of reset-and-retry; + zero-PnL regression test |
 | `scratch/scratch_tick_size_close.py` | New — demonstrates the tick-size bug and fix against test.deribit.com (read-only ticker calls; no live orders unless `TRADING_MODE` explicitly allows it) |
+| `data/deribit_feed.py` | Union open-position `near_instrument`/`far_instrument` names into the WS ticker-subscription list on every connect and reconnect, independent of the day-window config |
+| `db/state.py` | + `get_open_instrument_names(db_path) -> list[str]` helper returning instrument names across all open positions |
+| `bot.py` | Possibly — if passing `db_path` or a callback into `DeribitFeed.__init__`, or computing the extra instrument list to pass into `fetch_instruments()`/`_connect_and_stream()` |
+| `tests/test_feed.py` | + regression tests asserting open-position instruments stay subscribed across a simulated reconnect even when outside the day window |
+| `scratch/scratch_feed_open_position_coverage.py` | New — demonstrates a position near/past the window boundary staying subscribed across a reconnect (read-only, no live orders) |
 
 ### Status
 
-Not started — this phase documents root causes found via log/DB forensics on 2026-07-07. Implementation is tracked as an open checklist in BOT_TODO.md Phase 18.
+Bugs 1-3: implemented via commit 46a9627. Bug 4: newly identified 2026-07-11 via test-mode DB/log analysis (subscription-window gap affecting trade_id=1); fix planned above but not yet implemented — tracked as an open checklist item in BOT_TODO.md Phase 18.

@@ -1078,7 +1078,7 @@ In **test/live mode**:
 
 ## Phase 18 — Close-Order Reliability & Stuck-Position Retry Bugfixes
 
-**Status: completed.** Implemented via commit 46a9627. Fixes for all three bugs identified via test-mode analysis of `db/calendar_bot_test.db` and `logs/bot_test.log*` (test-mode run under `config_test.py`, 2026-06-28 → 2026-07-07). Root causes and solutions detailed in BOT_PLAN.md Phase 18.
+**Status:** Bugs 1-3 completed (commit 46a9627), fixed via test-mode analysis of `db/calendar_bot_test.db` and `logs/bot_test.log*` (test-mode run under `config_test.py`, 2026-06-28 → 2026-07-07). Bug 4 identified 2026-07-11 via a separate test-mode DB/log analysis; fix planned but not yet implemented. Root causes and solutions detailed in BOT_PLAN.md Phase 18.
 
 ### Bug 1 — Far-leg close order rejected by Deribit (`-32602 Invalid params`)
 
@@ -1099,6 +1099,13 @@ In **test/live mode**:
 - [x] **Root cause:** When executor failed to close, positions were recorded with fake `pnl=0.0` instead of using the last known mark-to-market value.
 - [x] **Fix:** Modified `_close_position()` in `strategy/decision.py` to mark positions as stuck (instead of recording zero PnL) when the executor fails to close. This preserves actual P&L data and signals that manual intervention is needed.
 - [x] **Test coverage:** Tests updated and passing; no regressions in existing test suite.
+
+### Bug 4 — Feed subscription window silently drops IV coverage for long-dated open positions on reconnect
+
+- [ ] **Root cause:** `data/deribit_feed.py::fetch_instruments()` (~line 163-184) rebuilds the WS ticker-subscription list from `config.NEAR_DAYS_OPTIONS[0]`/`config.FAR_DAYS_OPTIONS[-1]` on every connect *and* every reconnect (`_connect_and_stream()` re-runs it after every WS drop). trade_id=1 (BTC 56000 Put, far leg `BTC-28AUG26-56000-P`, far_days=51) was opened 2026-07-09 08:35 when `config_test.py`'s `FAR_DAYS_OPTIONS` still included `45`; a same-day 08:04 commit trimmed it to `[7, 14]` for scanner purposes, but that value also drives the feed's subscription window, so the open position's far leg fell outside it. Subscription counts dropped from 588 BTC instruments (wide enough to cover the 51-day leg) to 584 after a reconnect at 19:06:33 on 07-09, then to 302 after the 07-10 07:56 restart — after which `ChainCache.get_chain()`'s 30s TTL (`CHAIN_CACHE_TTL_SEC`) drops the far leg entirely and `strategy/decision.py::_get_iv()` (~line 1225) returns `None` forever, producing the "No IV for trade 1 — skipping status check" warning (line 794) on every monitor tick since — stop-loss/take-profit monitoring silently disabled for this position for over a day.
+- [ ] **Fix:** Union the day-window candidate list with the exact `near_instrument`/`far_instrument` names of every open position, recomputed on every reconnect (not just startup). Add a small helper in `db/state.py`, e.g. `get_open_instrument_names(db_path) -> list[str]`, built on the existing `list_assets_with_open_positions()`/`load_calendar_state()` data. `DeribitFeed` currently has no reference to the DB or open-position state (constructed in `bot.py` with just `assets`/`paper`/credentials/`on_ticker`) — needs either (a) a `db_path`/callback passed into `DeribitFeed.__init__` so it can query open positions itself before each subscribe, or (b) `bot.py` computing the extra instrument list and passing it into `fetch_instruments()`/`_connect_and_stream()` as an optional parameter on each call. Note: Phase 8i addressed a related but distinct gap (feed's *asset* list not covering open positions outside `config.ASSETS`) — it did not touch this instrument-level day-window problem.
+- [ ] **Test coverage:** Add regression tests to `tests/test_feed.py` asserting open-position instruments remain subscribed across a simulated reconnect even when outside the configured day window.
+- [ ] **Scratch verification:** Add `scratch/scratch_feed_open_position_coverage.py` demonstrating a position near/past the window boundary staying subscribed across a reconnect (read-only, no live orders).
 
 ### Related observation (not a bug, documented for context)
 

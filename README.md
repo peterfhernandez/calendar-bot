@@ -125,7 +125,9 @@ Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 20
 - **The retry-cap "mark as stuck" safety net doesn't stop retrying** — the failure counter resets right after a position is marked stuck, and stuck positions aren't excluded from routine monitoring, so the bot can keep retrying the same failing close indefinitely. One test-mode position stayed open ~29 hours past its stop trigger; another needed 6+ days and a manual `/close_manually` before it closed.
 - **A force-closed position was recorded with `pnl=0.0`** instead of its real loss in one observed case.
 
-Until Phase 18 lands, watch for `close_stuck` positions (`/positions` or the "MANUAL ACTION REQUIRED" Telegram alert) and use `/close` or `/close_manually` if a position doesn't resolve within a few minutes of its stop/take-profit triggering.
+A fourth bug, identified 2026-07-11, is also tracked there but not yet fixed: **the WebSocket feed's ticker subscription window can silently stop covering a long-dated open position's far leg after a reconnect**, since the subscription window is tied to the scanner's day-window config rather than to actually-open positions. This disables stop-loss/take-profit monitoring for the affected position (logged as repeated "No IV for trade N — skipping status check" warnings) until the bot is restarted with a wider config or the position is closed.
+
+Until Phase 18 lands, watch for `close_stuck` positions (`/positions` or the "MANUAL ACTION REQUIRED" Telegram alert) and use `/close` or `/close_manually` if a position doesn't resolve within a few minutes of its stop/take-profit triggering. Also watch logs for recurring "No IV for trade N" warnings, which indicate the Bug 4 feed-coverage gap above.
 
 ---
 
