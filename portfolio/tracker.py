@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # If Deribit-reported margin and SQLite-computed margin diverge by more than
 # this fraction, a warning is logged (possible manual trade or missed fill).
-_RECONCILE_THRESHOLD = 0.10  # 10%
+_RECONCILE_THRESHOLD = config.RECONCILE_THRESHOLD_PCT
 
 # Currencies supported on Deribit that map 1:1 to asset names.
 # USDC/USDT trade at spot=1.0 so no price fetch is needed.
@@ -622,8 +622,7 @@ class PortfolioTracker:
             - unrealized_pnl: Current unrealized P&L (populated separately in refresh())
         """
         # In paper mode, we estimate starting equity from the initial capital
-        # If not explicitly set, we can derive it from DB + realized/unrealized
-        initial_capital = getattr(config, "INITIAL_CAPITAL", 10000.0)  # Default fallback
+        initial_capital = config.INITIAL_CAPITAL
         unrealized = self._unrealized_pnl
 
         # Equity = initial capital + realized today + unrealized (from cache)

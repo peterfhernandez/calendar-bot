@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+import config
 from data.chain_cache import ChainCache
 from data.deribit_feed import TickerSnapshot
 from db.state import get_calendar_stats, init_db
@@ -189,7 +190,7 @@ class BacktestEngine:
 
     def __init__(
         self,
-        portfolio_value:     float = 10_000.0,
+        portfolio_value:     float = config.DEFAULT_PORTFOLIO_VALUE,
         scan_every_n_frames: int   = 1,
         daily_loss_limit:    float = 1e9,
     ) -> None:

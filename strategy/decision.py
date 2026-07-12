@@ -58,7 +58,7 @@ from strategy.sizer import size_candidate
 logger = logging.getLogger(__name__)
 
 # Days before near-leg expiry at which we consider rolling
-_ROLL_TRIGGER_DAYS = 2
+_ROLL_TRIGGER_DAYS = config.ROLL_TRIGGER_DAYS
 
 
 # ── Executor protocol ─────────────────────────────────────────────────────────
@@ -753,10 +753,11 @@ class DecisionEngine:
         near_days_left, far_days_left = _days_left(pos)
         if near_days_left <= 0:
             # Near leg has expired — close the full position.
-            # Apply retry limiting: cap at 3 failed attempts, then mark as stuck to prevent forced liquidation.
+            # Apply retry limiting: cap at config.POSITION_FAILURE_RETRY_CAP failed attempts,
+            # then mark as stuck to prevent forced liquidation.
             trade_id = pos["trade_id"]
             failure_count = self._close_roll_failures.get(trade_id, 0)
-            if failure_count >= 3:
+            if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
                 return self._mark_stuck_and_notify(
                     pos, "Near leg expired", "expired-near-leg", failure_count
                 ), 0.0
@@ -801,7 +802,7 @@ class DecisionEngine:
 
         if status == "stop":
             failure_count = self._close_roll_failures.get(trade_id, 0)
-            if failure_count >= 3:
+            if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
                 return self._mark_stuck_and_notify(
                     pos, "Stop-loss trigger", "stop-loss", failure_count
                 ), 0.0
@@ -815,7 +816,7 @@ class DecisionEngine:
 
         if status == "tp":
             failure_count = self._close_roll_failures.get(trade_id, 0)
-            if failure_count >= 3:
+            if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
                 return self._mark_stuck_and_notify(
                     pos, "Take-profit trigger", "take-profit", failure_count
                 ), 0.0
@@ -839,7 +840,7 @@ class DecisionEngine:
 
             # Cap roll/close retry attempts per position — prevents unbounded retry loops
             failure_count = self._close_roll_failures.get(trade_id, 0)
-            if failure_count >= 3:
+            if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
                 logger.error(
                     "trade_id=%d roll/close failed %d times — halting retries, closing position",
                     trade_id, failure_count,

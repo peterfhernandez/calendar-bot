@@ -9,6 +9,8 @@ e.g. 80% IV → v=0.80, 5% rate → r=0.05. Time (T) is in years.
 
 import math
 
+import config
+
 
 # ── Normal distribution helpers ───────────────────────────────────────────────
 
@@ -170,18 +172,16 @@ def prob_otm_call(S: float, K: float, T: float, r: float, v: float) -> float:
 # ── Strike rounding ───────────────────────────────────────────────────────────
 
 def strike_increment(spot: float) -> float:
-    """Return a sensible strike increment for a given spot price."""
-    if spot < 5:
-        return 0.50
-    if spot < 20:
-        return 1.0
-    if spot < 100:
-        return 5.0
-    if spot < 500:
-        return 10.0
-    if spot < 2_000:
-        return 50.0
-    return 100.0
+    """Return a sensible strike increment for a given spot price.
+
+    The lookup table lives in config.STRIKE_INCREMENT_TABLE:
+    (max_spot_exclusive, increment) rows, first match wins; spots above the
+    last row use config.STRIKE_INCREMENT_DEFAULT.
+    """
+    for max_spot, increment in config.STRIKE_INCREMENT_TABLE:
+        if spot < max_spot:
+            return increment
+    return config.STRIKE_INCREMENT_DEFAULT
 
 
 def round_strike(price: float, spot: float) -> float:
@@ -219,26 +219,23 @@ def adjust_far_leg_price(
     float
         Adjusted price accounting for bid/ask spread and liquidity
     """
-    # Base bid/ask spread as % of mid price
-    # Near-dated (< 14 days): ~0.5% spread
-    # Medium (14-30 days): ~1% spread
-    # Far-dated (> 30 days): ~2% spread
-    if days_to_expiry <= 7:
-        spread_pct = 0.005
-    elif days_to_expiry <= 14:
-        spread_pct = 0.010
-    elif days_to_expiry <= 30:
-        spread_pct = 0.015
-    else:
-        spread_pct = 0.025
+    # Base bid/ask spread as % of mid price — the DTE→spread model lives in
+    # config.FAR_LEG_SPREAD_TABLE: (max_days_to_expiry, spread_pct) rows,
+    # first match wins; longer-dated legs use FAR_LEG_SPREAD_DEFAULT.
+    spread_pct = config.FAR_LEG_SPREAD_DEFAULT
+    for max_days, pct in config.FAR_LEG_SPREAD_TABLE:
+        if days_to_expiry <= max_days:
+            spread_pct = pct
+            break
 
     # Additional liquidity premium for very far dates (penalty for poor liquidity)
     # Increases with time to expiry
     liquidity_penalty = 0.0
-    if days_to_expiry > 30:
-        # Scale penalty: +0.5% per 30 days beyond 30d
-        excess_days = days_to_expiry - 30
-        liquidity_penalty = (excess_days / 30.0) * 0.005
+    last_table_days = config.FAR_LEG_SPREAD_TABLE[-1][0]
+    if days_to_expiry > last_table_days:
+        # Scale penalty per 30 days beyond the last table row
+        excess_days = days_to_expiry - last_table_days
+        liquidity_penalty = (excess_days / 30.0) * config.FAR_LEG_LIQUIDITY_PENALTY_PER_30D
 
     total_adjustment_pct = spread_pct + liquidity_penalty
 

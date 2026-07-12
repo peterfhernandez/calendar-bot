@@ -30,10 +30,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Deribit endpoints ─────────────────────────────────────────────────────────
-
-_WS_PAPER = "wss://test.deribit.com/ws/api/v2"
-_WS_LIVE  = "wss://www.deribit.com/ws/api/v2"
+# The WS endpoint comes from config.DERIBIT_WS_URL (see _endpoint below) —
+# no URL is hardcoded here.
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -213,9 +211,9 @@ class DeribitFeed:
         logger.info("Connecting to %s", self._endpoint)
         async with websockets.connect(
             self._endpoint,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=10 * 1024 * 1024,  # 10MB — handle large Deribit option chain snapshots
+            ping_interval=config.DERIBIT_WS_PING_INTERVAL,
+            ping_timeout=config.DERIBIT_WS_PING_TIMEOUT,
+            max_size=config.DERIBIT_WS_MAX_SIZE,  # large Deribit option chain snapshots
         ) as ws:
             self._ws = ws
             logger.info("Connected")
@@ -392,7 +390,9 @@ class DeribitFeed:
         self._req_id += 1
         return self._req_id
 
-    async def _rpc(self, method: str, params: dict, timeout: float = 15.0) -> dict:
+    async def _rpc(
+        self, method: str, params: dict, timeout: float = config.RPC_TIMEOUT_SEC
+    ) -> dict:
         """Send a JSON-RPC request and await the response."""
         if not self._ws:
             raise RuntimeError("Not connected")
@@ -458,11 +458,9 @@ async def _debug_main(assets: list[str], paper: bool, timeout: int) -> None:
 if __name__ == "__main__":
     import argparse
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    from core.logging_setup import setup_logging
+
+    setup_logging()
 
     parser = argparse.ArgumentParser(description="Debug Deribit ticker feed")
     parser.add_argument("--assets",  nargs="+", default=["BTC"], help="Assets to stream (default: BTC)")

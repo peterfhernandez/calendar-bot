@@ -24,11 +24,11 @@ from strategy.scanner import CalendarCandidate
 
 logger = logging.getLogger(__name__)
 
-# Minimum allowed quantity to avoid dust trades
-_MIN_QTY = 0.1
+# Minimum allowed quantity to avoid dust trades (Deribit contract increment)
+_MIN_QTY = config.MIN_CONTRACT_SIZE
 
 # Fraction of strike within which two positions are considered correlated
-_STRIKE_CORRELATION_PCT = 0.05   # ±5% of strike
+_STRIKE_CORRELATION_PCT = config.STRIKE_CORRELATION_PCT
 
 
 @dataclass
@@ -128,7 +128,7 @@ def size_candidate(
     if candidate.net_debit <= 0:
         return SizeResult(qty=0.0, reason="net_debit is zero or negative")
 
-    min_net_debit = getattr(config, "MIN_NET_DEBIT", 0.10)
+    min_net_debit = config.MIN_NET_DEBIT
     if candidate.net_debit < min_net_debit:
         return SizeResult(
             qty=0.0,
@@ -161,7 +161,7 @@ def size_candidate(
     qty = max(0.0, math.floor(raw_qty * 10) / 10)
 
     # Hard cap to prevent runaway sizes from low-debit candidates that slip past the floor
-    max_qty = getattr(config, "MAX_QTY", 100.0)
+    max_qty = config.MAX_QTY
     if qty > max_qty:
         qty = math.floor(max_qty * 10) / 10
 

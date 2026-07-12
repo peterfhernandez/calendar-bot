@@ -46,11 +46,11 @@ from execution.order_manager import OrderManager, OrderState, TrackedOrder
 
 logger = logging.getLogger(__name__)
 
-# ── Defaults (can be overridden in config.py) ─────────────────────────────────
-SLIPPAGE_LIMIT_PCT: float = getattr(config, "SLIPPAGE_LIMIT_PCT", 0.02)
-ORDER_TIMEOUT_SEC:  int   = getattr(config, "ORDER_TIMEOUT_SEC",  30)
-MAX_RETRIES:        int   = getattr(config, "MAX_ORDER_RETRIES",  3)
-_RETRY_DELAYS = [1, 3, 9]   # seconds between retry attempts
+# ── Defaults (all sourced from config.py — Phase 20b/20c) ─────────────────────
+SLIPPAGE_LIMIT_PCT: float = config.SLIPPAGE_LIMIT_PCT
+ORDER_TIMEOUT_SEC:  int   = config.ORDER_TIMEOUT_SEC
+MAX_RETRIES:        int   = config.MAX_ORDER_RETRIES
+_RETRY_DELAYS = config.ORDER_RETRY_DELAYS   # seconds between retry attempts
 
 # ── Tick-size cache for price rounding ─────────────────────────────────────────
 _TICK_SIZE_CACHE: dict[str, float] = {}  # instrument_name → tick_size
@@ -108,10 +108,10 @@ class _DeribitRPCClient:
     async def __aenter__(self) -> "_DeribitRPCClient":
         self._ws = await websockets.connect(
             self._endpoint,
-            ping_interval=20,
-            ping_timeout=20,
-            open_timeout=15,
-            max_size=10 * 1024 * 1024,  # 10MB — handle large Deribit responses
+            ping_interval=config.DERIBIT_WS_PING_INTERVAL,
+            ping_timeout=config.DERIBIT_WS_PING_TIMEOUT,
+            open_timeout=config.DERIBIT_WS_OPEN_TIMEOUT,
+            max_size=config.DERIBIT_WS_MAX_SIZE,  # large Deribit responses
         )
         self._pump_task = asyncio.create_task(self._pump())
         await self._authenticate()
@@ -153,7 +153,7 @@ class _DeribitRPCClient:
         fut: asyncio.Future = loop.create_future()
         self._pending[req_id] = fut
         await self._ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}))
-        return await asyncio.wait_for(fut, timeout=15)
+        return await asyncio.wait_for(fut, timeout=config.RPC_TIMEOUT_SEC)
 
     async def _authenticate(self) -> None:
         if not (self.client_id and self.client_secret):
@@ -270,7 +270,7 @@ def _contract_amount(spot: float, asset: str, portfolio_value: float, max_loss_p
     if asset.upper() in ("BTC", "ETH"):
         # Each contract = 1 coin unit; net_debit_usd is already per-coin
         amount_coins = max_usd / (net_debit_usd * spot)
-        return round(max(0.1, amount_coins), 4)  # Deribit min = 0.1 BTC/ETH
+        return round(max(config.MIN_CONTRACT_SIZE, amount_coins), 4)  # Deribit minimum
     # Linear: amount in integer contracts
     return float(max(1, int(qty_usd)))
 
@@ -529,7 +529,7 @@ async def _async_enter_spread(
         }
 
     # ── Live / test: try combo order first ────────────────────────────────────
-    effective_combo_timeout = combo_timeout if combo_timeout is not None else getattr(config, "COMBO_FILL_TIMEOUT_SEC", 30)
+    effective_combo_timeout = combo_timeout if combo_timeout is not None else config.COMBO_FILL_TIMEOUT_SEC
     net_debit_limit_index   = far_limit - near_limit  # net debit as index fraction
 
     combo_fill = await _async_enter_spread_combo(
@@ -920,7 +920,7 @@ class CalendarExecutor:
         self,
         client_id:       str   = "",
         client_secret:   str   = "",
-        portfolio_value: float = 10_000.0,
+        portfolio_value: float = config.DEFAULT_PORTFOLIO_VALUE,
         order_manager:   OrderManager | None = None,
         slippage_pct:    float = SLIPPAGE_LIMIT_PCT,
         order_timeout:   int   = ORDER_TIMEOUT_SEC,

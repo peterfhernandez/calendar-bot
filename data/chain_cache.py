@@ -23,6 +23,7 @@ import threading
 import time
 from typing import Iterator
 
+import config
 from data.deribit_feed import TickerSnapshot
 
 logger = logging.getLogger(__name__)
@@ -35,11 +36,12 @@ class ChainCache:
     Parameters
     ----------
     ttl:
-        Seconds before a snapshot is considered stale (default 30 s).
+        Seconds before a snapshot is considered stale
+        (default: config.CHAIN_CACHE_TTL_SEC).
     """
 
-    def __init__(self, ttl: float = 30.0) -> None:
-        self.ttl = ttl
+    def __init__(self, ttl: float | None = None) -> None:
+        self.ttl = ttl if ttl is not None else float(config.CHAIN_CACHE_TTL_SEC)
         self._lock   = threading.RLock()
         self._data:  dict[str, TickerSnapshot] = {}   # instrument → snapshot
         self._spots: dict[str, float] = {}            # asset → latest spot
