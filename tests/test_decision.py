@@ -1685,16 +1685,24 @@ class TestStopTpCloseRetryLimit:
     """
 
     def _make_stopped_pos(self, trade_id: int = 5, asset: str = "BTC") -> dict:
-        """Create a position that will trigger stop-loss (30% of debit)."""
+        """
+        Create a position that will trigger stop-loss (30% of debit).
+
+        Expiries are generated relative to today so the near leg is never
+        expired — otherwise the expired-near-leg path would preempt the
+        stop/TP paths these tests are meant to exercise.
+        """
+        near_label = _future_label(10)
+        far_label = _future_label(38)
         return {
             "trade_id": trade_id,
             "asset": asset,
             "strike": 50_000.0,
             "option_type": "Call",
-            "near_instrument": "BTC-3JUL26-50000-C",
-            "far_instrument": "BTC-31JUL26-50000-C",
-            "expiry_near": "3JUL26",
-            "expiry_far": "31JUL26",
+            "near_instrument": f"BTC-{near_label}-50000-C",
+            "far_instrument": f"BTC-{far_label}-50000-C",
+            "expiry_near": near_label,
+            "expiry_far": far_label,
             "net_debit": 0.0086,
             "qty": 1.0,
             "open_fees": 0.00012,
@@ -2434,3 +2442,120 @@ class TestPauseResume:
 
         mock_load.assert_called_once()
         assert "paused" not in status.message.lower()
+
+
+# ── Phase 19: close-retry restoration ─────────────────────────────────────────
+
+class TestClosePositionExecutorFailure:
+    """
+    A single executor close failure must NOT mark the position close_stuck.
+    _close_position returns a FAILED result so the caller's retry counter
+    increments and the close is retried up to the cap; only the retry-cap
+    branches in _monitor_position mark positions stuck.
+    """
+
+    def _make_pos(self, trade_id: int = 7) -> dict:
+        near_label = _future_label(10)
+        far_label = _future_label(38)
+        return {
+            "trade_id": trade_id,
+            "asset": "BTC",
+            "strike": 50_000.0,
+            "option_type": "Call",
+            "near_instrument": f"BTC-{near_label}-50000-C",
+            "far_instrument": f"BTC-{far_label}-50000-C",
+            "expiry_near": near_label,
+            "expiry_far": far_label,
+            "net_debit": 0.0086,
+            "qty": 1.0,
+            "open_fees": 0.00012,
+            "near_prem": 0.01,
+            "far_prem": 0.025,
+        }
+
+    def test_failed_close_returns_failed_without_marking_stuck(self):
+        """First executor failure → FAILED result, no stuck marking, no DB write."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # close fails
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_pos()
+
+        with patch("strategy.decision.mark_position_close_stuck") as mock_stuck, \
+             patch("strategy.decision.close_calendar_trade") as mock_close_db:
+            result = engine._close_position(pos, 100_000.0, "Stop-loss (30% of debit)", 0.00258)
+
+        assert "FAILED" in result
+        mock_stuck.assert_not_called()   # not stuck after a single failure
+        mock_close_db.assert_not_called()  # no fake PnL=0.0 recorded
+
+    def test_stop_close_failures_notify_once_at_cap(self):
+        """After 3 failed closes the 4th tick marks stuck and notifies exactly once."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None
+        notifier = MagicMock()
+        engine, _ = _make_engine(executor=executor)
+        engine._notifier = notifier
+        pos = self._make_pos(trade_id=8)
+        engine._close_roll_failures[8] = 3
+
+        near_snap = _make_snap(pos["near_instrument"], mark_iv=0.85)
+        far_snap = _make_snap(pos["far_instrument"], mark_iv=0.75)
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.mark_position_close_stuck"):
+            engine._cache.get_spot.return_value = 100_000.0
+            engine._cache.get_chain.return_value = [near_snap, far_snap]
+            with patch("strategy.decision.check_calendar_status",
+                       return_value=("stop", 0.00258, 0.30, "STOP")):
+                engine.monitor_tick()
+
+        notifier.notify_close_stuck.assert_called_once()
+        assert 8 in engine._notified_stuck
+        # Counter dropped so a /close retry starts with fresh attempts
+        assert 8 not in engine._close_roll_failures
+
+    def test_roll_retry_limit_close_failure_marks_stuck(self):
+        """When the forced close after the roll retry cap also fails, the position
+        is marked stuck instead of retrying the same close every tick forever."""
+        executor = MagicMock()
+        executor.close_spread.return_value = None  # forced close fails too
+        engine, _ = _make_engine(executor=executor)
+        pos = self._make_pos(trade_id=9)
+        # Near leg inside the roll-trigger window but not expired
+        near_label = _future_label(1)
+        pos["expiry_near"] = near_label
+        pos["near_instrument"] = f"BTC-{near_label}-50000-C"
+        engine._close_roll_failures[9] = 3  # roll/close already failed 3 times
+
+        near_snap = _make_snap(pos["near_instrument"], mark_iv=0.85)
+        far_snap = _make_snap(pos["far_instrument"], mark_iv=0.75)
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos]), \
+             patch("strategy.decision.mark_position_close_stuck") as mock_stuck:
+            engine._cache.get_spot.return_value = 100_000.0
+            engine._cache.get_chain.return_value = [near_snap, far_snap]
+            with patch("strategy.decision.check_calendar_status",
+                       return_value=("ok", 0.0086, 1.0, "OK")):
+                engine.monitor_tick()
+
+        mock_stuck.assert_called_once()
+        assert 9 not in engine._close_roll_failures
+
+
+class TestMonitorTickIsolation:
+    """An exception while monitoring one position must not abort the tick for
+    the remaining open positions (Phase 19)."""
+
+    def test_exception_in_one_position_does_not_block_others(self):
+        engine, _ = _make_engine()
+        pos_a = {"trade_id": 1, "asset": "BTC"}
+        pos_b = {"trade_id": 2, "asset": "BTC"}
+
+        with patch.object(engine, "_load_all_open_positions", return_value=[pos_a, pos_b]), \
+             patch.object(engine, "_monitor_position",
+                          side_effect=[ValueError("boom"), (None, 5.0)]) as mock_monitor:
+            status = engine.monitor_tick()
+
+        # Both positions were attempted despite the first raising
+        assert mock_monitor.call_count == 2
+        # The failure is surfaced in the tick summary, and the tick completed
+        assert "ERROR" in status.message
+        assert engine._unrealized_pnl == 5.0

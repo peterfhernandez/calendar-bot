@@ -436,7 +436,16 @@ class DecisionEngine:
         unrealized_pnl = 0.0
 
         for pos in list(open_positions):
-            action, unr = self._monitor_position(pos)
+            try:
+                action, unr = self._monitor_position(pos)
+            except Exception as exc:
+                # One position failing (DB error, unexpected data) must not
+                # abort monitoring of the remaining open positions.
+                logger.exception(
+                    "Monitor failed for trade_id=%s: %s", pos.get("trade_id"), exc
+                )
+                actions.append(f"trade_id={pos.get('trade_id')} monitor ERROR: {exc}")
+                continue
             if action == "__NO_IV__":
                 skipped_no_iv += 1
             elif action:
@@ -748,36 +757,9 @@ class DecisionEngine:
             trade_id = pos["trade_id"]
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= 3:
-                logger.error(
-                    "trade_id=%d near leg expired but close failed %d times — marking as stuck for manual intervention",
-                    trade_id, failure_count,
-                )
-                # Mark as stuck instead of force-closing, mirroring the stop/tp behavior
-                mark_position_close_stuck(
-                    trade_id=trade_id,
-                    error_reason=f"Near leg expired, close failed after {failure_count} attempts — position needs manual close on Deribit",
-                    intended_close_reason="expired-near-leg",
-                    db_path=self._db_path,
-                )
-                # NOTE: Do NOT reset the failure counter — it's kept for historical tracking.
-                # This position is now excluded from get_open_trades() due to close_status='close_stuck',
-                # so it will not be re-evaluated in future monitor ticks.
-
-                # Notify user about stuck position (only once, not every monitor tick)
-                if trade_id not in self._notified_stuck and self._notifier:
-                    try:
-                        self._notifier.notify_close_stuck(
-                            trade_id=trade_id,
-                            asset=pos.get("asset", ""),
-                            strike=pos.get("strike", 0.0),
-                            reason="Near leg expired",
-                            error=f"Close failed after {failure_count} attempts",
-                        )
-                        self._notified_stuck.add(trade_id)
-                    except Exception as exc:
-                        logger.error("Failed to notify about stuck position: %s", exc)
-
-                return f"trade_id={trade_id} marked as close_stuck (expired near leg)", 0.0
+                return self._mark_stuck_and_notify(
+                    pos, "Near leg expired", "expired-near-leg", failure_count
+                ), 0.0
 
             close_msg = self._close_position(pos, spot, "Near leg expired")
             if "FAILED" in close_msg:
@@ -820,36 +802,9 @@ class DecisionEngine:
         if status == "stop":
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= 3:
-                logger.error(
-                    "trade_id=%d stop-loss close failed %d times — marking as stuck for manual intervention",
-                    trade_id, failure_count,
-                )
-                # Mark as stuck instead of force-closing
-                mark_position_close_stuck(
-                    trade_id=trade_id,
-                    error_reason=f"Stop-loss close failed after {failure_count} attempts — position needs manual close on Deribit",
-                    intended_close_reason="stop-loss",
-                    db_path=self._db_path,
-                )
-                # NOTE: Do NOT reset the failure counter — it's kept for historical tracking.
-                # This position is now excluded from get_open_trades() due to close_status='close_stuck',
-                # so it will not be re-evaluated in future monitor ticks.
-
-                # Notify user about stuck position (only once, not every monitor tick)
-                if trade_id not in self._notified_stuck and self._notifier:
-                    try:
-                        self._notifier.notify_close_stuck(
-                            trade_id=trade_id,
-                            asset=pos.get("asset", ""),
-                            strike=pos.get("strike", 0.0),
-                            reason="Stop-loss trigger",
-                            error=f"Close failed after {failure_count} attempts",
-                        )
-                        self._notified_stuck.add(trade_id)
-                    except Exception as exc:
-                        logger.error("Failed to notify about stuck position: %s", exc)
-
-                return f"trade_id={trade_id} marked as close_stuck (stop-loss)", 0.0
+                return self._mark_stuck_and_notify(
+                    pos, "Stop-loss trigger", "stop-loss", failure_count
+                ), 0.0
 
             result = self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv)
             if "FAILED" in result:
@@ -861,36 +816,9 @@ class DecisionEngine:
         if status == "tp":
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= 3:
-                logger.error(
-                    "trade_id=%d take-profit close failed %d times — marking as stuck for manual intervention",
-                    trade_id, failure_count,
-                )
-                # Mark as stuck instead of force-closing
-                mark_position_close_stuck(
-                    trade_id=trade_id,
-                    error_reason=f"Take-profit close failed after {failure_count} attempts — position needs manual close on Deribit",
-                    intended_close_reason="take-profit",
-                    db_path=self._db_path,
-                )
-                # NOTE: Do NOT reset the failure counter — it's kept for historical tracking.
-                # This position is now excluded from get_open_trades() due to close_status='close_stuck',
-                # so it will not be re-evaluated in future monitor ticks.
-
-                # Notify user about stuck position (only once, not every monitor tick)
-                if trade_id not in self._notified_stuck and self._notifier:
-                    try:
-                        self._notifier.notify_close_stuck(
-                            trade_id=trade_id,
-                            asset=pos.get("asset", ""),
-                            strike=pos.get("strike", 0.0),
-                            reason="Take-profit trigger",
-                            error=f"Close failed after {failure_count} attempts",
-                        )
-                        self._notified_stuck.add(trade_id)
-                    except Exception as exc:
-                        logger.error("Failed to notify about stuck position: %s", exc)
-
-                return f"trade_id={trade_id} marked as close_stuck (take-profit)", 0.0
+                return self._mark_stuck_and_notify(
+                    pos, "Take-profit trigger", "take-profit", failure_count
+                ), 0.0
 
             result = self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv)
             if "FAILED" in result:
@@ -916,7 +844,14 @@ class DecisionEngine:
                     "trade_id=%d roll/close failed %d times — halting retries, closing position",
                     trade_id, failure_count,
                 )
-                return self._close_position(pos, spot, "Roll/close retry limit exceeded — closing"), 0.0
+                result = self._close_position(pos, spot, "Roll/close retry limit exceeded — closing")
+                if "FAILED" in result:
+                    # Even the final forced close failed — stop the loop here
+                    # instead of re-attempting on every future monitor tick.
+                    return self._mark_stuck_and_notify(
+                        pos, "Roll retry limit exceeded", "roll-retry-limit", failure_count + 1
+                    ), 0.0
+                return result, 0.0
 
             rolled = self._try_roll(pos, spot)
             if rolled:
@@ -938,6 +873,55 @@ class DecisionEngine:
             - pos.get("open_fees", 0.0)
         )
         return None, unrealized
+
+    def _mark_stuck_and_notify(
+        self,
+        pos: dict,
+        reason: str,
+        intended_close_reason: str,
+        failure_count: int,
+    ) -> str:
+        """
+        Mark a position close_stuck after repeated close failures and alert
+        the operator (once per position, deduplicated via _notified_stuck).
+
+        The position is excluded from get_open_trades() once marked, so it is
+        not re-evaluated until the operator clears it via /close or
+        /close_manually.  The retry counter is dropped so a user-initiated
+        retry starts with a fresh set of attempts instead of being instantly
+        re-marked stuck.
+        """
+        trade_id = pos["trade_id"]
+        logger.error(
+            "trade_id=%d %s close failed %d times — marking as stuck for manual intervention",
+            trade_id, reason, failure_count,
+        )
+        mark_position_close_stuck(
+            trade_id=trade_id,
+            error_reason=(
+                f"{reason} close failed after {failure_count} attempts — "
+                f"position needs manual close on Deribit"
+            ),
+            intended_close_reason=intended_close_reason,
+            db_path=self._db_path,
+        )
+        self._close_roll_failures.pop(trade_id, None)
+
+        # Notify user about stuck position (only once, not every monitor tick)
+        if trade_id not in self._notified_stuck and self._notifier:
+            try:
+                self._notifier.notify_close_stuck(
+                    trade_id=trade_id,
+                    asset=pos.get("asset", ""),
+                    strike=pos.get("strike", 0.0),
+                    reason=reason,
+                    error=f"Close failed after {failure_count} attempts",
+                )
+                self._notified_stuck.add(trade_id)
+            except Exception as exc:
+                logger.error("Failed to notify about stuck position: %s", exc)
+
+        return f"trade_id={trade_id} marked as close_stuck ({intended_close_reason})"
 
     def _close_position(
         self,
@@ -965,18 +949,16 @@ class DecisionEngine:
 
         close_credit = self._executor.close_spread(pos)
         if close_credit is None:
-            # Executor failed to close; mark as stuck instead of recording fake PnL=0.0
+            # Executor failed to close. Return a FAILED result so the caller's
+            # retry counter (_close_roll_failures) increments and the close is
+            # retried up to the cap; the retry-cap branches in _monitor_position
+            # own marking the position close_stuck and alerting the operator.
+            # Nothing is recorded in the DB here, so no fake PnL=0.0 can be written.
             logger.error(
-                "Executor failed to close trade_id=%d — marking as stuck for manual intervention",
-                trade_id,
+                "Executor failed to close trade_id=%d (%s) — will retry up to the cap",
+                trade_id, reason,
             )
-            mark_position_close_stuck(
-                trade_id=trade_id,
-                error_reason=f"Executor failed to close ({reason}) — position needs manual close on Deribit",
-                intended_close_reason=reason,
-                db_path=self._db_path,
-            )
-            return f"trade_id={trade_id} marked as close_stuck ({reason})"
+            return f"trade_id={trade_id} close FAILED ({reason})"
 
         if spread_value is not None:
             # spread_value is already qty-weighted; net_debit is per-unit

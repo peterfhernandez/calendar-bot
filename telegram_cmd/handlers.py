@@ -529,6 +529,9 @@ async def handle_close(
         reset_close_stuck_position(trade_id, db_path)
         # Clear the notification flag so user gets notified again if it gets stuck again
         engine._notified_stuck.discard(trade_id)
+        # Drop any retry counter so the retried close gets a fresh set of
+        # attempts instead of being instantly re-marked as stuck.
+        engine._close_roll_failures.pop(trade_id, None)
         await update.message.reply_text(
             f"✓ Trade #{trade_id} reset for retry.\n"
             f"Bot will attempt to close on next monitor tick (~1 minute)."

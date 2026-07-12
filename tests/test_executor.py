@@ -1094,9 +1094,13 @@ class TestForceClosePnLFix:
         }
 
         # Mock mark_position_close_stuck to avoid DB operations in this unit test
-        with patch("strategy.decision.mark_position_close_stuck"):
+        with patch("strategy.decision.mark_position_close_stuck") as mock_stuck:
             # Close with executor failure but last_spread_value available
             result = engine._close_position(pos, spot=100_000.0, reason="Test close")
 
-            # Should return message indicating stuck status
-            assert "close_stuck" in result.lower() or "marked" in result.lower()
+            # Phase 19: a single executor failure returns FAILED so the caller's
+            # retry counter increments; the position is NOT marked stuck here
+            # (only the retry-cap branches in _monitor_position do that), and no
+            # fake PnL=0.0 row is ever written.
+            assert "FAILED" in result
+            mock_stuck.assert_not_called()

@@ -479,9 +479,9 @@ calendar-bot/
 | Risk | Mitigation |
 | --- | --- |
 | Leg risk on entry (one leg fills, other doesn't) | Use Deribit combo orders; individual-leg fallback only when both legs are liquid and cancels near leg immediately on far-leg failure |
-| Leg risk on close (one leg fills, other times out) | Close operations unwind partial fills: if near fills but far times out, reverse-sell near at market; if far fills but near times out, reverse-buy far at market. Deribit API errors on close are caught and retried up to 3 times; on 4th failure, position is force-closed to prevent naked leg accumulation |
-| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then **intended to** force-close/mark-stuck on 4th failure. **Known gap (Phase 18, not yet fixed):** the "mark as stuck" branches reset `_close_roll_failures` to zero immediately after marking, and `get_open_trades()` never filters out `close_status == 'close_stuck'` positions, so the position keeps being monitored and the same failing close keeps retrying indefinitely rather than actually stopping. Confirmed in test-mode logs: trade_id=3 re-marked "stuck" 40 times over ~29 hours; trade_id=5 stuck 6+ days before a manual `/close_manually`. |
-| Close order rejected by exchange (`-32602 Invalid params`) | **Known gap (Phase 18, not yet fixed):** `execution/executor.py` blanket-rounds every order price to 4 decimals and never fetches an instrument's actual Deribit tick size (`tick_size_steps` scales with option premium). Far-leg close orders — typically priced higher than the near leg — land in a coarser tick band and get rejected by Deribit's JSON-RPC layer before any business-logic check runs. Confirmed in test-mode logs: 636 occurrences of `Deribit error -32602: Invalid params`, 100% on far-leg close submissions, 0% on near-leg. See Phase 18 below for the fix design. |
+| Leg risk on close (one leg fills, other times out) | Close operations unwind partial fills: if near fills but far times out, reverse-sell near at market; if far fills but near times out, reverse-buy far at market. Deribit API errors on close are caught and retried up to 3 times; on 4th failure, position is marked `close_stuck` with a single operator alert and excluded from monitoring until manually cleared (Phase 19) |
+| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then mark `close_stuck` on the 4th failure with a single operator alert. Fixed in Phase 18 (`get_open_trades()` excludes `close_stuck` positions from routine monitoring) and Phase 19 (retry ladder restored after a regression; counter cleared on mark-stuck and on `/close` so operator retries start fresh). |
+| Close order rejected by exchange (`-32602 Invalid params`) | Fixed in Phase 18: `execution/executor.py` fetches and caches each instrument's tick size and rounds every submitted order price to a valid tick (previously a blanket 4-decimal round caused 636 `-32602 Invalid params` rejections, 100% on far-leg close submissions). |
 | IV collapse after entry | Check IV term structure before entering; set max IV drop stop |
 | Liquidity gaps on crypto calendars | Two-stage liquidity filter: OI in scanner, bid/ask size + spread in decision gate |
 | Overfitting scanner to recent market | Backtest across at least 2 vol regimes |
@@ -721,8 +721,8 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Secret leak prevention in logs (11)** | **< 0.5 day** | **Done** |
 | **Parallel mode isolation — --env/--db/--log/--config (12)** | **< 0.5 day** | **Done** |
 | **Fee-inclusive PnL display (13)** | **< 0.5 day** | **Done** |
-| **`/pnl` equity-curve chart (16)** | **1–1.5 days** | **Not started** |
-| **Cross Portfolio Margin entry gate (17)** | **2–3.5 days** | **Not started** |
+| **`/pnl` equity-curve chart (16)** | **1–1.5 days** | **Done** |
+| **Cross Portfolio Margin entry gate (17)** | **2–3.5 days** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~6–8.5 days** | |
 
@@ -1336,3 +1336,55 @@ Test-mode entries were 6 BTC to 1 ETH. This traces to `test.deribit.com`'s ETH o
 ### Status
 
 Bugs 1-3: implemented via commit 46a9627. Bug 4: identified 2026-07-11 via test-mode DB/log analysis (subscription-window gap affecting trade_id=1) and fixed the same day — open-position instrument names are unioned into the feed's ticker-subscription list on every connect and reconnect via the `extra_instruments` provider (`db/state.py::get_open_instrument_names`, wired in `bot.py`). All four Phase 18 bugs are now closed; checklist in BOT_TODO.md Phase 18.
+
+---
+
+## Phase 19 — Close-Retry Restoration & Notification Reliability
+
+### How this was found
+
+Defining Phase 19 started with a full-suite run: 12 tests were failing (8 in `tests/test_decision.py`, 4 in `tests/test_notifier.py`). Neither cluster was mere test rot — each traced to a real product bug.
+
+### Bug 1 — Phase 18's Bug 3 fix regressed the close-retry ladder
+
+**Symptom:** the retry-limit tests (`TestCloseAfterExpiryRetryLimit`, `TestStopTpCloseRetryLimit`) crashed with `ValueError: Calendar trade ID N not found` raised from `mark_position_close_stuck()` on the *first* simulated close failure.
+
+**Root cause:** Phase 18 Bug 3 ("force-closed position recorded with `pnl=0.0`") was fixed by moving `mark_position_close_stuck()` inside `_close_position()`, firing whenever `executor.close_spread()` returns `None`. Two unintended consequences:
+
+1. `_close_position()`'s failure return string changed from `"…close FAILED"` to `"…marked as close_stuck"`. Every caller gates its retry counter on `if "FAILED" in result:` — so `_close_roll_failures` never incremented again and the retry-cap branches (`failure_count >= 3`) in `_monitor_position()` became unreachable dead code. One transient API error (rate limit, timeout, `-32602`) now permanently stranded a position as `close_stuck` — excluded from all monitoring (Phase 18 Bug 2 filter) until manual intervention.
+2. The new stuck path bypassed the `_notified_stuck` notification logic, which lives only in the retry-cap branches. A position stranded this way never sent the "MANUAL ACTION REQUIRED" Telegram alert — the operator would only discover it via `/positions`.
+
+**Fix:** restore the `FAILED` return in `_close_position()` on executor failure. Nothing is written to the DB on that path, so Phase 18 Bug 3's actual goal — never record a fake `pnl=0.0` — is fully preserved. Marking stuck (and the one-shot notification) is owned exclusively by the retry-cap branches, whose three near-identical blocks are factored into a shared `_mark_stuck_and_notify(pos, reason, intended_close_reason, failure_count)` helper. The roll path's retry-cap branch now also marks the position stuck when its final forced close fails, instead of re-attempting the same failing close every subsequent tick.
+
+**Counter lifecycle:** `_mark_stuck_and_notify()` pops the position's `_close_roll_failures` entry. While stuck, the position is excluded from monitoring, so the counter served no purpose — but if the operator ran `/close` to retry, a stale counter of 3 would have re-marked the position stuck on the next tick *without attempting a single close*. The `/close` handler now also clears the counter explicitly, so a user-initiated retry gets a fresh set of 3 attempts.
+
+**Test fallout:** `TestStopTpCloseRetryLimit._make_stopped_pos` used hardcoded `3JUL26`/`31JUL26` expiries. Once those dates passed, the tests silently exercised the expired-near-leg path instead of the stop/TP paths they claim to test. Expiries are now generated relative to today (`_future_label`). `tests/test_executor.py::TestForceClosePnLFix::test_close_position_executor_failure`, which had encoded the regression as intended behavior, now asserts the restored semantics (FAILED return, no stuck marking, no DB write).
+
+### Bug 2 — Notifier suppressed all first alerts within `cooldown_sec` of system boot
+
+**Symptom:** `TestHelperMethods` (4 tests) failed with `_dispatch_email` never called — on a freshly booted machine only, which is why the suite passed on the long-running dev box.
+
+**Root cause:** `Notifier.send()` deduplicates via `last = self._sent_at.get(key, 0.0)` then `if now - last < self._cooldown:`. `now` is `time.monotonic()`, which on Linux and Windows is effectively *seconds since system boot*. With the `0.0` sentinel meaning "never sent", any alert fired while `monotonic() < cooldown_sec` (default 300 s) was treated as a duplicate and silently dropped. Real-world impact: a host reboot with the bot auto-starting loses the startup notification and the first alert of every type in the first 5 minutes — precisely the "notifications were not reliably delivered" class of problem Phase 17 chased.
+
+**Fix:** the missing-key sentinel is now `None`; suppression applies only when the key has genuinely been sent before. Duplicate suppression within the cooldown is unchanged (`TestCooldownBootWindow` covers both directions).
+
+### Hardening — monitor tick isolation
+
+The failing tests also demonstrated that a single raising position (the `ValueError` out of `mark_position_close_stuck`) aborts the entire `monitor_tick()` — every other open position loses its stop/TP evaluation for that tick, and the exception propagates into the scheduler job. `monitor_tick()` now wraps each `_monitor_position()` call in try/except: the failure is logged with a traceback, surfaced in the tick summary as `trade_id=N monitor ERROR: …`, and the loop continues to the remaining positions.
+
+### New/changed files
+
+| File | Change |
+| --- | --- |
+| `strategy/decision.py` | `_close_position()` returns `FAILED` on executor failure (no DB write, no stuck marking); new `_mark_stuck_and_notify()` helper replaces three duplicated retry-cap blocks; roll retry-cap close failure marks stuck; per-position try/except in `monitor_tick()` |
+| `alerts/notifier.py` | cooldown sentinel `0.0` → `None` in `send()` |
+| `telegram_cmd/handlers.py` | `/close` also clears `engine._close_roll_failures[trade_id]` |
+| `tests/test_decision.py` | date-robust `_make_stopped_pos`; + `TestClosePositionExecutorFailure` (3 tests), `TestMonitorTickIsolation` (1 test) |
+| `tests/test_notifier.py` | + `TestCooldownBootWindow` (2 tests) |
+| `tests/test_executor.py` | `TestForceClosePnLFix` updated to restored retry semantics |
+| `tests/test_telegram_cmd.py` | `/close` test asserts retry counter cleared |
+| `scratch/scratch_close_retry_stuck.py` | New — offline demo of retry ladder → stuck → `/close` reset, and the boot-window fix |
+
+### Status
+
+Complete — 530 tests passing. The retry ladder (3 attempts → mark stuck → one alert → excluded from monitoring → `/close` restarts fresh) is verified end-to-end by `scratch/scratch_close_retry_stuck.py`.

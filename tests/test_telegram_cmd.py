@@ -1080,6 +1080,7 @@ async def test_handle_close_resets_close_stuck_flag():
         mock_cache = MagicMock()
         engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
         engine._notified_stuck.add(db_trade.id)
+        engine._close_roll_failures[db_trade.id] = 3  # stale retry counter
 
         # Mock Telegram update and context
         update = AsyncMock()
@@ -1092,6 +1093,9 @@ async def test_handle_close_resets_close_stuck_flag():
 
         # Verify notification flag was cleared
         assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
+
+        # Verify retry counter was dropped so the retried close gets fresh attempts
+        assert db_trade.id not in engine._close_roll_failures, "Retry counter should be cleared"
 
         # Verify DB was updated
         trades = get_open_trades(db_path)
