@@ -1111,31 +1111,61 @@ In **test/live mode**:
 
 - Test-mode entries skewed heavily toward BTC (6 of 7 trades) because `test.deribit.com`'s ETH options order book is much thinner than BTC's — ETH candidates were rejected by the liquidity gate (`MAX_LEG_SPREAD_PCT`) roughly 2.7x more often than BTC (27,042 vs 10,035 skips) despite equal `ASSETS` weighting. This is a test-exchange liquidity artifact, not a config or code defect, and is not expected to hold on the live orderbook — no action needed, noted here so it isn't mistaken for one of the bugs above during Phase 18 work.
 
----
+## Phase 20 — Centralize Scattered Config Into `config.py`
 
-## Phase 19 — Close-Retry Restoration & Notification Reliability
+**Status:** Planned — not yet started. Full audit and root-cause detail in BOT_PLAN.md Phase 19. Audit found ~94 hardcoded config-like values outside `config.py` across 6 categories, plus 2 functional bugs. Ordered so 19d can ship independently and first if desired.
 
-**Status:** Complete. Found while defining Phase 19: the full test suite had 12 failures (8 in `tests/test_decision.py`, 4 in `tests/test_notifier.py`) which traced back to two real product bugs — a behavioral regression introduced by the Phase 18 Bug 3 fix, and a latent alert-suppression bug in the notifier. Root-cause writeup in BOT_PLAN.md Phase 19.
+### 20a — Centralize logging config
 
-### Bug 1 — Phase 18 regression: first close failure marked positions stuck, retry ladder dead
+- [ ] Add `LOGGING` section to `config.py`: `LOG_LEVEL`, `LOG_FORMAT`, `LOG_DATE_FORMAT`, `LOG_FILE_MAX_BYTES`, `LOG_BACKUP_COUNT`, `LOG_DIR`, `NOISY_LOGGERS` (dict of logger name → level)
+- [ ] Add a shared `setup_logging()` helper (new or in an existing shared module) that reads from `config.LOGGING`
+- [ ] Replace the 5 independently-hardcoded `logging.basicConfig` calls in `monitor/loop.py`, `collect.py`, `backtest/data_collector.py`, `data/deribit_feed.py`, `data/debug_viewer.py` with calls to `setup_logging()`
+- [ ] Move the `httpx`/`httpcore`/`telegram.ext.Updater`/`telegram.vendor.ptb_urllib3` → WARNING suppression list (currently only in `monitor/loop.py`) into `config.NOISY_LOGGERS`
+- [ ] Move the `bot.py`-only DEBUG override for `strategy.decision`/`strategy.sizer` into config (or a documented CLI flag) so it isn't a silent hardcoded exception
+- [ ] Update/add tests asserting `setup_logging()` reads level/format/rotation from config
 
-- [x] **Root cause:** the Phase 18 Bug 3 fix moved `mark_position_close_stuck()` *inside* `_close_position()`, firing on the very first executor failure. Its return string no longer contained `FAILED`, so the callers' `if "FAILED" in result:` counter increments never ran — the documented "retry 3 times, then mark stuck" policy became dead code. Worse, this new stuck path bypassed the `_notified_stuck` alert logic entirely, so a position stranded this way never sent the "MANUAL ACTION REQUIRED" alert.
-- [x] **Fix:** `_close_position()` again returns `trade_id=N close FAILED (reason)` on executor failure (recording nothing in the DB, so no fake `pnl=0.0` — the actual point of Phase 18 Bug 3 is preserved). The retry-cap branches own marking stuck; the triplicated mark-stuck/notify blocks are factored into a shared `_mark_stuck_and_notify()` helper.
-- [x] **Roll path:** when the forced close after the roll retry cap *also* fails, the position is now marked stuck (previously it would re-attempt the same failing close every tick forever).
-- [x] **Counter lifecycle:** `_mark_stuck_and_notify()` drops the position's `_close_roll_failures` counter (the position is excluded from monitoring while stuck, so the counter is stale), and the `/close` handler also clears it — a user-initiated retry now gets a fresh 3 attempts instead of being instantly re-marked stuck.
-- [x] **Tests:** `TestClosePositionExecutorFailure` (3 tests) added; `TestStopTpCloseRetryLimit._make_stopped_pos` made date-robust (hardcoded `3JUL26` expiries had passed, silently routing the stop/TP tests through the expired-near-leg path); `tests/test_executor.py::TestForceClosePnLFix` updated to the restored semantics.
+### 20b — Fix fake-configurable values
 
-### Bug 2 — Notifier boot-window alert suppression
+- [ ] Add real `config.py` keys (with existing defaults preserved) for the 6 `getattr(config, "X", default)` calls that reference nonexistent keys: `SLIPPAGE_LIMIT_PCT` (`execution/executor.py`), `ORDER_TIMEOUT_SEC` (`execution/executor.py`), `MAX_ORDER_RETRIES` (`execution/executor.py`), `STUCK_ORDER_TIMEOUT_SEC` (`execution/order_manager.py`), `INITIAL_CAPITAL` (`portfolio/tracker.py`), `COLLECTOR_INTERVAL_SEC` (`backtest/data_collector.py`)
+- [ ] Switch those 6 call sites from `getattr(config, "X", default)` to a direct `config.X` reference
+- [ ] Remove the 4 redundant `getattr(config, "X", default)` calls that already shadow an existing config key with a matching fallback: `MAX_FAR_DAYS_FOR_1D_NEAR` (`strategy/scanner.py`), `MIN_NET_DEBIT` and `MAX_QTY` (`strategy/sizer.py`), `COMBO_FILL_TIMEOUT_SEC` (`execution/executor.py`) — import directly instead
+- [ ] Update tests that relied on the `getattr` fallback defaults to import from config instead
 
-- [x] **Root cause:** `Notifier.send()` used `self._sent_at.get(key, 0.0)` as the "never sent" sentinel against `time.monotonic()`, which is typically seconds since system boot. If the bot started within `cooldown_sec` (default 300 s) of boot, `now - 0.0 < cooldown` held and every first alert of each type was silently suppressed — e.g. alerts lost after a host reboot + auto-start.
-- [x] **Fix:** missing key is now `None`; suppression only applies when the key was genuinely sent before. Dedup behaviour is unchanged.
-- [x] **Tests:** `TestCooldownBootWindow` (2 tests) in `tests/test_notifier.py` pin `time.monotonic` to a small value and assert first-send dispatch + duplicate suppression.
+### 20c — Centralize network/timeout/retry/alert constants
 
-### Hardening — monitor tick isolation
+- [ ] Add to `config.py`: `DERIBIT_WS_PING_INTERVAL`, `DERIBIT_WS_PING_TIMEOUT`, `DERIBIT_WS_OPEN_TIMEOUT`, `DERIBIT_WS_MAX_SIZE`, `RPC_TIMEOUT_SEC`, `ORDER_RETRY_DELAYS`, `ALERT_COOLDOWN_SEC`, `SMTP_TIMEOUT_SEC`, `TELEGRAM_TIMEOUT_SEC`
+- [ ] Point `execution/executor.py`, `execution/order_manager.py`, `data/deribit_feed.py` at the new `config.DERIBIT_WS_*`/`RPC_TIMEOUT_SEC` constants instead of their independently-duplicated literals
+- [ ] Fix `alerts/notifier.py` to import `config.SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD` instead of re-reading `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS` from the environment directly
+- [ ] Add `SMTP_FROM` to `config.py`'s alert block (currently invisible to config, only read in `alerts/notifier.py`)
+- [ ] Wire `Notifier(cooldown_sec=...)`'s default to `config.ALERT_COOLDOWN_SEC`
+- [ ] Update/add tests for notifier config sourcing and WS/RPC constant usage
 
-- [x] `monitor_tick()` wraps each `_monitor_position()` call in try/except: one position failing (e.g. a DB error while marking stuck — observed as `ValueError` from `mark_position_close_stuck`) no longer aborts monitoring of the remaining open positions. The failure is logged with traceback and surfaced in the tick summary. Test: `TestMonitorTickIsolation`.
+### 20d — Fix the two functional config-bypass bugs (can ship independently, first)
 
-### Housekeeping
+- [ ] Fix `execution/order_manager.py::_fetch_deribit_open_orders` to iterate `config.ASSETS` instead of the hardcoded `"BTC"`/`"ETH"` currency loop, so SOL orders are reconciled on restart
+- [ ] Fix `data/chain_cache.py::ChainCache.__init__` and `data/debug_viewer.py` to default their TTL from `config.CHAIN_CACHE_TTL_SEC` instead of independently hardcoded values (30.0 / 60.0)
+- [ ] Remove the dead duplicate Deribit WS-URL constants in `data/deribit_feed.py` (`_WS_PAPER`/`_WS_LIVE`, confirmed unused)
+- [ ] Remove the dead duplicate hostname constants in `backtest/data_collector.py` (`_PAPER_HOST`/`_LIVE_HOST`, confirmed unused)
+- [ ] Add a regression test asserting SOL orders are included in reconciliation after this fix
+- [ ] Add a regression test asserting `debug_viewer`'s cache TTL matches `config.CHAIN_CACHE_TTL_SEC` when not overridden
 
-- [x] Ticked stale checkboxes for Phase 16 (`/pnl` chart), Phase 17 (`scratch_margin_gate.py`), and Phase 17b (paper mode portfolio isolation) — all verified implemented with passing tests (530 tests green).
-- [x] `scratch/scratch_close_retry_stuck.py` — offline demo of the retry ladder (fail ×3 → stuck + single alert → excluded from monitoring), the `/close`-style reset, and the notifier boot-window fix. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_close_retry_stuck`.
+### 20e — Move business-logic magic numbers into config
+
+- [ ] Add to `config.py`: `STRIKE_INCREMENT_TABLE`, `FAR_LEG_SPREAD_TABLE`, `NEAR_DAY_TOLERANCE`, `FAR_DAY_TOLERANCE`, `ROLL_TRIGGER_DAYS`, `POSITION_FAILURE_RETRY_CAP`, `RECONCILE_THRESHOLD_PCT`, `MIN_CONTRACT_SIZE`, `DEFAULT_PORTFOLIO_VALUE`, `EV_SAMPLE_COUNT`, `BREAKEVEN_SCAN_STEPS`
+- [ ] Update `core/pricing.py` (`strike_increment()`, `adjust_far_leg_price()`) to read the increment/spread tables from config
+- [ ] Update `core/calendar_engine.py` (breakeven scan resolution/range, the undocumented 70% warn threshold) to read from config
+- [ ] Update `strategy/scanner.py` (DTE tolerances, EV sample count/range, scan-range fallback) to read from config
+- [ ] Update `strategy/decision.py` (`_ROLL_TRIGGER_DAYS`, the `failure_count >= 3` retry cap used in 4 places) to read from config
+- [ ] Update `strategy/sizer.py` (`_MIN_QTY`, `_STRIKE_CORRELATION_PCT`) and `execution/executor.py`'s duplicate min-contract-size constant to share `config.MIN_CONTRACT_SIZE`
+- [ ] Update `portfolio/tracker.py`'s `_RECONCILE_THRESHOLD` to read `config.RECONCILE_THRESHOLD_PCT`
+- [ ] Consolidate the `10_000.0` default portfolio value hardcoded in `bot.py`, `execution/executor.py`, and `backtest/engine.py` into `config.DEFAULT_PORTFOLIO_VALUE`
+- [ ] Update/add tests for each moved constant (existing test suites should still pass with config-sourced values equal to today's literals)
+
+### 20f — Paths, timezone, and date-format cleanup
+
+- [ ] Add `DB_PATH`, `HISTORIC_DATA_DB_PATH`, `TIMEZONE`, `DATE_FORMAT` to `config.py`
+- [ ] Update `db/state.py` to source its SQLite path and `ZoneInfo("Australia/Sydney")` from `config.DB_PATH`/`config.TIMEZONE` instead of a local `BOT_DB_PATH` env read and a hardcoded timezone
+- [ ] Update `backtest/data_collector.py` to source its DuckDB/schema paths from `config.HISTORIC_DATA_DB_PATH` (or a documented override)
+- [ ] Update `telegram_cmd/pnl_chart.py` to source its date format from `config.DATE_FORMAT`
+- [ ] Confirm `bot.py`'s `--env`/`--db`/`--log`/`--config` pre-parser env-var bootstrap (`BOT_ENV_FILE`/`BOT_DB_PATH`/`BOT_LOG_FILE`/`BOT_CONFIG_FILE`) still works unchanged — this shim intentionally predates config.py's import and is not part of the bypass being fixed
+- [ ] Update/add tests for `db/state.py` path/timezone sourcing
