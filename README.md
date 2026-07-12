@@ -128,6 +128,8 @@ Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 20
 
 Positions can still become `close_stuck` when the exchange repeatedly rejects a close (`/positions` or the "MANUAL ACTION REQUIRED" Telegram alert will flag them) — use `/close` to retry or `/close_manually` to resolve them.
 
+An audit found roughly 94 config-like values (log levels/formats, timeouts, retry counts, magic-number thresholds, hardcoded paths) hardcoded outside `config.py` instead of being centralized there, plus two functional bugs stemming from the bypass (SOL orders never reconciled on restart; a debug-tool cache TTL that ignores `CHAIN_CACHE_TTL_SEC`). A phased consolidation plan is tracked in [BOT_TODO.md Phase 19](BOT_TODO.md#phase-19--centralize-scattered-config-into-configpy) / [BOT_PLAN.md Phase 19](BOT_PLAN.md#phase-19--centralize-scattered-config-into-configpy) — planned, not yet started.
+
 ---
 
 ## Trading modes
