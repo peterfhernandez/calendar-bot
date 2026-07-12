@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter
 import matplotlib.dates as mdates
 
+import config
 from data.chain_cache import ChainCache
 from db.state import CalendarTrade
 
@@ -40,7 +41,7 @@ def build_cumulative_series(closed_trades: list[CalendarTrade]) -> list[tuple[da
             pnl = t.pnl or 0.0
             cumulative += pnl
             try:
-                date_close = datetime.strptime(t.date_close, "%Y-%m-%d").replace(tzinfo=None)
+                date_close = datetime.strptime(t.date_close, config.DATE_FORMAT).replace(tzinfo=None)
             except (ValueError, TypeError):
                 continue
             series.append((date_close, cumulative))
@@ -153,7 +154,7 @@ def render_pnl_chart(
 
     # Rotate and thin x-axis labels for readability with many trades
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d"))
+    ax.xaxis.set_major_formatter(DateFormatter(config.DATE_FORMAT))
     fig.autofmt_xdate(rotation=45, ha="right")
 
     # Grid and legend

@@ -1,4 +1,5 @@
 import os as _os
+from pathlib import Path as _Path
 
 # Load .env file if present (never commit .env to git).
 # Uses setdefault so that values already in os.environ (e.g. pre-loaded by
@@ -176,11 +177,131 @@ SMTP_HOST      = _os.environ.get("SMTP_HOST",      "smtp.gmail.com")
 SMTP_PORT      = int(_os.environ.get("SMTP_PORT",  "587"))
 SMTP_USER      = _os.environ.get("SMTP_USER",      "")
 SMTP_PASSWORD  = _os.environ.get("SMTP_PASS",      "")  # env var is SMTP_PASS; alias here
+SMTP_FROM      = _os.environ.get("SMTP_FROM",      "") or SMTP_USER  # sender address (defaults to SMTP_USER)
 # Telegram — set both TOKEN and CHAT to enable Telegram alerts.
 TELEGRAM_TOKEN      = _os.environ.get("TELEGRAM_TOKEN",      "")  # bot token (TELEGRAM_TOKEN in .env)
 TELEGRAM_BOT_TOKEN  = TELEGRAM_TOKEN                               # alias for compatibility
 TELEGRAM_CHAT       = _os.environ.get("TELEGRAM_CHAT",       "")  # chat ID  (TELEGRAM_CHAT in .env)
 TELEGRAM_CHAT_ID    = TELEGRAM_CHAT                                # alias for compatibility
+
+# ── Logging (Phase 20a) ───────────────────────────────────────────────────────
+# Shared by core/logging_setup.py::setup_logging() — every entry point (bot,
+# collector, debug viewer, standalone feed) uses the same format and rotation.
+LOG_LEVEL           = "INFO"                                      # root logger level
+LOG_FORMAT          = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+LOG_DATE_FORMAT     = "%Y-%m-%d %H:%M:%S"
+LOG_FILE_MAX_BYTES  = 10 * 1024 * 1024   # rotate the log file at 10 MB
+LOG_BACKUP_COUNT    = 5                   # keep this many rotated files
+LOG_DIR             = "logs"              # default directory for bot.log
+
+# Third-party loggers that flood the log at INFO (httpx logs every Telegram
+# getUpdates poll).  Each entry is logger name → minimum level to allow.
+NOISY_LOGGERS = {
+    "httpx":                       "WARNING",
+    "httpcore":                    "WARNING",
+    "telegram.ext.Updater":        "WARNING",
+    "telegram.vendor.ptb_urllib3": "WARNING",
+}
+
+# Per-module level overrides applied by bot.py at startup (previously a silent
+# hardcoded exception in bot.py).  Logger name → level.
+LOG_LEVEL_OVERRIDES = {
+    "strategy.decision": "DEBUG",
+    "strategy.sizer":    "DEBUG",
+}
+
+# ── Network / timeout / retry constants (Phase 20b + 20c) ─────────────────────
+# Deribit WebSocket connection parameters — shared by data/deribit_feed.py,
+# execution/executor.py, and execution/order_manager.py.
+DERIBIT_WS_PING_INTERVAL = 20                 # seconds between WS keepalive pings
+DERIBIT_WS_PING_TIMEOUT  = 20                 # seconds to wait for a pong before dropping
+DERIBIT_WS_OPEN_TIMEOUT  = 15                 # seconds to wait for the WS handshake
+DERIBIT_WS_MAX_SIZE      = 10 * 1024 * 1024   # 10 MB — large option-chain snapshots
+RPC_TIMEOUT_SEC          = 15                 # seconds to wait for a JSON-RPC response
+
+# Order execution (execution/executor.py)
+SLIPPAGE_LIMIT_PCT = 0.02        # reject fills deviating more than 2% from intended price
+ORDER_TIMEOUT_SEC  = 30          # seconds to wait for an order to fill before giving up
+MAX_ORDER_RETRIES  = 3           # submit attempts per leg on transient network errors
+ORDER_RETRY_DELAYS = [1, 3, 9]   # seconds between those attempts (len >= MAX_ORDER_RETRIES - 1)
+
+# Order lifecycle tracking (execution/order_manager.py)
+STUCK_ORDER_TIMEOUT_SEC = 120    # open orders older than this are flagged as stuck
+
+# Alerts (alerts/notifier.py)
+ALERT_COOLDOWN_SEC   = 300   # suppress duplicate alerts with the same key inside this window
+SMTP_TIMEOUT_SEC     = 10    # SMTP connection timeout
+TELEGRAM_TIMEOUT_SEC = 10    # Telegram Bot API request timeout
+
+# Data collector (backtest/data_collector.py, collect.py)
+COLLECTOR_INTERVAL_SEC = 300   # seconds between option-chain snapshots
+
+# ── Business-logic thresholds (Phase 20e) ─────────────────────────────────────
+# Strike increment lookup: (max_spot_exclusive, increment) rows, first match wins;
+# spots above the last row use STRIKE_INCREMENT_DEFAULT.  (core/pricing.py)
+STRIKE_INCREMENT_TABLE = [
+    (5,     0.50),
+    (20,    1.0),
+    (100,   5.0),
+    (500,   10.0),
+    (2_000, 50.0),
+]
+STRIKE_INCREMENT_DEFAULT = 100.0
+
+# Far-leg bid/ask spread model: (max_days_to_expiry, spread_pct of mid) rows,
+# first match wins; longer-dated legs use FAR_LEG_SPREAD_DEFAULT.  Beyond 30
+# days an extra liquidity penalty accrues per 30 days.  (core/pricing.py)
+FAR_LEG_SPREAD_TABLE = [
+    (7,  0.005),
+    (14, 0.010),
+    (30, 0.015),
+]
+FAR_LEG_SPREAD_DEFAULT           = 0.025
+FAR_LEG_LIQUIDITY_PENALTY_PER_30D = 0.005   # added per 30 days beyond 30d to expiry
+
+# Scanner DTE matching (strategy/scanner.py)
+NEAR_DAY_TOLERANCE = 3    # accept near legs within ±N days of each target
+FAR_DAY_TOLERANCE  = 7    # accept far legs within ±N days of each target
+EV_SAMPLE_COUNT    = 40   # spot-grid samples for the EV score integration
+
+# Breakeven scan (core/calendar_engine.py) — resolution and spot range of the
+# numeric breakeven search; the range is also the scanner's full-profit fallback.
+BREAKEVEN_SCAN_STEPS = 800
+BREAKEVEN_SCAN_RANGE = (0.50, 1.50)   # scan spot × [lo … hi]
+
+# Spread-status warning threshold: warn (no action) when the spread value falls
+# to this fraction of the debit paid; STOP_PCT remains the hard stop.
+SPREAD_WARN_PCT = 0.70
+
+# Decision engine (strategy/decision.py)
+ROLL_TRIGGER_DAYS          = 2   # days before near-leg expiry at which rolling is considered
+POSITION_FAILURE_RETRY_CAP = 3   # failed close/roll attempts before a position is marked stuck
+
+# Position sizing (strategy/sizer.py, execution/executor.py)
+MIN_CONTRACT_SIZE      = 0.1    # Deribit minimum option contract increment (BTC/ETH)
+STRIKE_CORRELATION_PCT = 0.05   # positions within ±5% of an open strike are correlated
+
+# Portfolio tracker (portfolio/tracker.py)
+RECONCILE_THRESHOLD_PCT = 0.10      # warn when Deribit vs DB margin diverge by more than 10%
+INITIAL_CAPITAL         = 10_000.0  # paper-mode starting equity for the DB-only portfolio
+
+# Default portfolio value used for sizing when no live tracker value or CLI
+# override is provided (bot.py --portfolio, executor, backtest engine).
+DEFAULT_PORTFOLIO_VALUE = 10_000.0
+
+# ── Paths / timezone / date format (Phase 20f) ────────────────────────────────
+# SQLite trade database.  BOT_DB_PATH (set by bot.py's --db pre-parser or the
+# instance's .env) overrides the default so parallel instances stay isolated.
+DB_PATH = _Path(_os.environ.get("BOT_DB_PATH", str(_Path(__file__).parent / "db" / "calendar_bot.db")))
+
+# DuckDB historical option-chain database written by the data collector.
+HISTORIC_DATA_DB_PATH = _Path(__file__).parent / "backtest" / "historic_data" / "options.duckdb"
+
+# Timezone for "today" boundaries in Telegram day queries (db/state.py).
+TIMEZONE = "Australia/Sydney"
+
+# Date format for DB date columns and chart axis labels (telegram_cmd/pnl_chart.py).
+DATE_FORMAT = "%Y-%m-%d"
 
 # Config override — exec a per-instance Python file (BOT_CONFIG_FILE env var,
 # set via --config CLI flag) so strategy parameters can differ between a

@@ -42,11 +42,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-_WS_PAPER = "wss://test.deribit.com/ws/api/v2"
-_WS_LIVE  = "wss://www.deribit.com/ws/api/v2"
-
 # Orders older than this that haven't filled are considered "stuck"
-STUCK_ORDER_TIMEOUT: int = getattr(config, "STUCK_ORDER_TIMEOUT_SEC", 120)
+STUCK_ORDER_TIMEOUT: int = config.STUCK_ORDER_TIMEOUT_SEC
 
 
 # ── Order state ───────────────────────────────────────────────────────────────
@@ -174,12 +171,21 @@ async def _fetch_deribit_open_orders(
     paper: bool,
     client_id: str,
     client_secret: str,
+    currencies: list[str] | None = None,
 ) -> list[dict]:
     """
     Fetch all open option orders from Deribit via a short-lived WS connection.
     Returns the raw list of order dicts from the Deribit API.
+
+    Orders are fetched for every currency in *currencies* (default:
+    config.ASSETS).  Previously this loop hardcoded BTC and ETH, so SOL
+    orders were never reconciled on restart (Phase 20d bug fix).
+
+    The endpoint always comes from config.DERIBIT_WS_URL — the *paper*
+    argument is kept for backwards API compatibility but the URL is
+    resolved by TRADING_MODE like every other module.
     """
-    endpoint = _WS_PAPER if paper else _WS_LIVE
+    endpoint = config.DERIBIT_WS_URL
     req_id = 0
     pending: dict[int, asyncio.Future] = {}
 
@@ -205,9 +211,15 @@ async def _fetch_deribit_open_orders(
         fut: asyncio.Future = loop.create_future()
         pending[req_id] = fut
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}))
-        return await asyncio.wait_for(fut, timeout=15)
+        return await asyncio.wait_for(fut, timeout=config.RPC_TIMEOUT_SEC)
 
-    async with websockets.connect(endpoint, ping_interval=20, open_timeout=15, max_size=10 * 1024 * 1024) as ws:
+    all_orders: list[dict] = []
+    async with websockets.connect(
+        endpoint,
+        ping_interval=config.DERIBIT_WS_PING_INTERVAL,
+        open_timeout=config.DERIBIT_WS_OPEN_TIMEOUT,
+        max_size=config.DERIBIT_WS_MAX_SIZE,
+    ) as ws:
         pump_task = asyncio.create_task(pump(ws))
         try:
             if client_id and client_secret:
@@ -216,16 +228,13 @@ async def _fetch_deribit_open_orders(
                     "client_id":     client_id,
                     "client_secret": client_secret,
                 })
-            result = await rpc(ws, "private/get_open_orders_by_currency", {
-                "currency": "BTC",  # we'll re-fetch for ETH too
-                "kind": "option",
-            })
-            btc_orders = result if isinstance(result, list) else []
-            result = await rpc(ws, "private/get_open_orders_by_currency", {
-                "currency": "ETH",
-                "kind": "option",
-            })
-            eth_orders = result if isinstance(result, list) else []
+            for currency in (currencies or config.ASSETS):
+                result = await rpc(ws, "private/get_open_orders_by_currency", {
+                    "currency": currency.upper(),
+                    "kind": "option",
+                })
+                if isinstance(result, list):
+                    all_orders.extend(result)
         finally:
             pump_task.cancel()
             try:
@@ -233,7 +242,7 @@ async def _fetch_deribit_open_orders(
             except asyncio.CancelledError:
                 pass
 
-    return btc_orders + eth_orders
+    return all_orders
 
 
 async def reconcile_with_deribit(

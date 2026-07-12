@@ -80,7 +80,10 @@ def _render(cache: ChainCache, assets: list[str], rows: int, start_time: float) 
 
 
 async def _run(assets: list[str], paper: bool, refresh: float, rows: int) -> None:
-    cache = ChainCache(ttl=60.0)
+    # TTL defaults to config.CHAIN_CACHE_TTL_SEC so the viewer's staleness
+    # matches the live bot's cache (previously an independently hardcoded 60s
+    # that could silently disagree — Phase 20d).
+    cache = ChainCache()
     start_time = time.time()
 
     async def on_ticker(snap: TickerSnapshot) -> None:
@@ -107,10 +110,9 @@ async def _run(assets: list[str], paper: bool, refresh: float, rows: int) -> Non
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.WARNING,  # suppress INFO noise while viewing the table
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    from core.logging_setup import setup_logging
+
+    setup_logging(level="WARNING")  # suppress INFO noise while viewing the table
 
     parser = argparse.ArgumentParser(description="Live Deribit feed debug viewer")
     parser.add_argument("--assets",  nargs="+", default=["BTC"],

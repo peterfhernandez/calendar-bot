@@ -1382,31 +1382,24 @@ Each new config key gets a short comment explaining what it controls and its saf
 
 | File | Change |
 | --- | --- |
-| `strategy/decision.py` | `_close_position()` returns `FAILED` on executor failure (no DB write, no stuck marking); new `_mark_stuck_and_notify()` helper replaces three duplicated retry-cap blocks; roll retry-cap close failure marks stuck; per-position try/except in `monitor_tick()` |
-| `alerts/notifier.py` | cooldown sentinel `0.0` → `None` in `send()` |
-| `telegram_cmd/handlers.py` | `/close` also clears `engine._close_roll_failures[trade_id]` |
-| `tests/test_decision.py` | date-robust `_make_stopped_pos`; + `TestClosePositionExecutorFailure` (3 tests), `TestMonitorTickIsolation` (1 test) |
-| `tests/test_notifier.py` | + `TestCooldownBootWindow` (2 tests) |
-| `tests/test_executor.py` | `TestForceClosePnLFix` updated to restored retry semantics |
-| `tests/test_telegram_cmd.py` | `/close` test asserts retry counter cleared |
-| `scratch/scratch_close_retry_stuck.py` | New — offline demo of retry ladder → stuck → `/close` reset, and the boot-window fix |
-
-### Status
-
-Complete — 530 tests passing. The retry ladder (3 attempts → mark stuck → one alert → excluded from monitoring → `/close` restarts fresh) is verified end-to-end by `scratch/scratch_close_retry_stuck.py`.
-| `config.py` | + `LOGGING` section, network/timeout constants, business-logic threshold constants, `DB_PATH`/`HISTORIC_DATA_DB_PATH`/`TIMEZONE`/`DATE_FORMAT`, missing `SMTP_FROM`, and the 6 previously-fake keys (`SLIPPAGE_LIMIT_PCT`, `ORDER_TIMEOUT_SEC`, `MAX_ORDER_RETRIES`, `STUCK_ORDER_TIMEOUT_SEC`, `INITIAL_CAPITAL`, `COLLECTOR_INTERVAL_SEC`) |
-| `monitor/loop.py`, `collect.py`, `backtest/data_collector.py`, `data/deribit_feed.py`, `data/debug_viewer.py` | Replace independent `logging.basicConfig` calls with a shared `setup_logging()` helper reading from `config.LOGGING` |
+| `config.py` | + `LOGGING` section (incl. `NOISY_LOGGERS` and `LOG_LEVEL_OVERRIDES`), network/timeout constants, business-logic threshold constants, `DB_PATH`/`HISTORIC_DATA_DB_PATH`/`TIMEZONE`/`DATE_FORMAT`, missing `SMTP_FROM`, and the 6 previously-fake keys (`SLIPPAGE_LIMIT_PCT`, `ORDER_TIMEOUT_SEC`, `MAX_ORDER_RETRIES`, `STUCK_ORDER_TIMEOUT_SEC`, `INITIAL_CAPITAL`, `COLLECTOR_INTERVAL_SEC`) |
+| `core/logging_setup.py` | New — shared `setup_logging()` helper and `SecretRedactor` filter reading from `config.LOG_*` |
+| `monitor/loop.py`, `collect.py`, `backtest/data_collector.py`, `data/deribit_feed.py`, `data/debug_viewer.py` | Replace independent `logging.basicConfig` calls with the shared `setup_logging()` helper; `monitor/loop.py::configure_logging` is now a thin backwards-compatible wrapper |
 | `alerts/notifier.py` | Import `config.SMTP_*` instead of re-reading env vars; use `config.ALERT_COOLDOWN_SEC`/`config.SMTP_TIMEOUT_SEC`/`config.TELEGRAM_TIMEOUT_SEC` |
-| `execution/order_manager.py` | Reconciliation loop iterates `config.ASSETS`; WS connect params sourced from `config.DERIBIT_WS_*` |
-| `execution/executor.py` | WS/RPC timeout constants sourced from config; redundant `getattr` fallbacks removed |
+| `execution/order_manager.py` | Reconciliation loop iterates `config.ASSETS` (SOL now reconciled); endpoint and WS connect params sourced from `config.DERIBIT_WS_URL`/`config.DERIBIT_WS_*` |
+| `execution/executor.py` | WS/RPC timeout constants sourced from config; redundant `getattr` fallbacks removed; min contract size and default portfolio value from config |
 | `data/chain_cache.py`, `data/debug_viewer.py` | Default TTL sourced from `config.CHAIN_CACHE_TTL_SEC` |
 | `data/deribit_feed.py`, `backtest/data_collector.py` | Dead duplicate WS-URL/hostname constants removed |
-| `core/pricing.py`, `core/calendar_engine.py` | Strike-increment table, spread model, breakeven-scan constants sourced from config |
+| `core/pricing.py`, `core/calendar_engine.py` | Strike-increment table, spread model, breakeven-scan constants, and warn threshold sourced from config |
 | `strategy/scanner.py`, `strategy/decision.py`, `strategy/sizer.py` | DTE tolerances, roll-trigger days, retry caps, EV sample count sourced from config; redundant matching `getattr` fallbacks removed |
-| `db/state.py` | `DB_PATH`/`TIMEZONE` sourced from config instead of a local `BOT_DB_PATH` env read and hardcoded `ZoneInfo("Australia/Sydney")` |
+| `portfolio/tracker.py` | `_RECONCILE_THRESHOLD` and paper-mode `INITIAL_CAPITAL` sourced from config |
+| `bot.py` | `--portfolio` default from `config.DEFAULT_PORTFOLIO_VALUE`; per-module DEBUG overrides from `config.LOG_LEVEL_OVERRIDES` |
+| `backtest/engine.py` | Default portfolio value from `config.DEFAULT_PORTFOLIO_VALUE` |
+| `db/state.py` | `DB_PATH`/`TIMEZONE` sourced from config instead of a local `BOT_DB_PATH` env read and hardcoded `ZoneInfo("Australia/Sydney")` (BOT_DB_PATH override still honoured via `config.DB_PATH`) |
 | `telegram_cmd/pnl_chart.py` | Date format sourced from `config.DATE_FORMAT` |
-| `tests/` | New/updated tests per sub-phase asserting the config-sourced values are actually used (see BOT_TODO.md Phase 19 checklist) |
+| `tests/test_config_centralization.py` | New — 35 tests asserting the config-sourced values are actually used, incl. the SOL-reconciliation and cache-TTL regression tests |
+| `scratch/scratch_config_centralization.py` | New — offline demo (22 checks): constants match config, SOL reconciliation fix, TTL fix, late-binding behaviour changes |
 
 ### Status
 
-Planned — not yet started. Checklist in BOT_TODO.md Phase 19.
+Complete — all six sub-phases implemented; 565 tests passing (530 existing + 35 new). Checklist in BOT_TODO.md Phase 20. Verified end-to-end by `python -m scratch.scratch_config_centralization` (no live orders) and a real `collect.py --once` snapshot run using the shared logging setup.

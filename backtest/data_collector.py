@@ -41,14 +41,13 @@ import config
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
+# Hostnames come from config.DERIBIT_REST_URL; the DuckDB path and poll
+# cadence come from config.py (Phase 20).
 
-_PAPER_HOST = "test.deribit.com"
-_LIVE_HOST  = "www.deribit.com"
-
-DB_PATH = Path(__file__).parent / "historic_data" / "options.duckdb"
+DB_PATH = config.HISTORIC_DATA_DB_PATH
 SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
 
-COLLECTOR_INTERVAL_SEC: int = getattr(config, "COLLECTOR_INTERVAL_SEC", 300)
+COLLECTOR_INTERVAL_SEC: int = config.COLLECTOR_INTERVAL_SEC
 COLLECTOR_ASSETS: list[str] = config.COLLECTOR_ASSETS
 
 
@@ -288,9 +287,7 @@ async def run_loop(
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    from core.logging_setup import setup_logging
+
+    setup_logging()
     asyncio.run(run_loop())

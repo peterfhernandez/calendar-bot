@@ -112,8 +112,12 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
     if drain:
         config.DRAIN_MODE = True
     configure_logging()
-    logging.getLogger("strategy.decision").setLevel(logging.DEBUG)
-    logging.getLogger("strategy.sizer").setLevel(logging.DEBUG)
+    # Per-module level overrides (e.g. DEBUG on strategy.decision/sizer) are
+    # configured in config.LOG_LEVEL_OVERRIDES rather than hardcoded here.
+    for _name, _level in config.LOG_LEVEL_OVERRIDES.items():
+        logging.getLogger(_name).setLevel(
+            getattr(logging, _level.upper(), logging.INFO) if isinstance(_level, str) else _level
+        )
 
     notifier = Notifier()
     try:
@@ -244,8 +248,11 @@ def main() -> None:
     parser.add_argument(
         "--portfolio",
         type=float,
-        default=10_000.0,
-        help="Portfolio value in USD used for position sizing (default: 10000)",
+        default=config.DEFAULT_PORTFOLIO_VALUE,
+        help=(
+            "Portfolio value in USD used for position sizing "
+            f"(default: config.DEFAULT_PORTFOLIO_VALUE = {config.DEFAULT_PORTFOLIO_VALUE:.0f})"
+        ),
     )
     parser.add_argument(
         "--collect",

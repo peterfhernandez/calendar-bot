@@ -4,7 +4,7 @@ alerts/notifier.py
 Alert dispatcher for the calendar spread bot.
 
 Supports two channels:
-  - Email  via smtplib (SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS env vars)
+  - Email  via smtplib (config.SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASSWORD / SMTP_FROM)
   - Telegram via the Bot API (TELEGRAM_TOKEN / TELEGRAM_CHAT config values)
 
 Both channels are optional: if credentials are absent the channel is silently
@@ -13,11 +13,12 @@ skipped.  Each channel is configured through config.py and the .env file.
 Deduplication
 -------------
 Each alert has a *key* (event_type + subject).  A cooldown window
-(default 300 s) prevents the same alert from being re-sent within that window.
+(default config.ALERT_COOLDOWN_SEC) prevents the same alert from being
+re-sent within that window.
 
 Public API
 ----------
-Notifier(cooldown_sec=300)
+Notifier(cooldown_sec=None)
     send(event_type, subject, body)  — dispatches to all configured channels
     send_stop_loss(instrument, pnl)
     send_take_profit(instrument, pnl)
@@ -44,15 +45,16 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── SMTP settings (read from .env / environment) ──────────────────────────────
+# ── SMTP settings (sourced from config.py — Phase 20c) ────────────────────────
+# Previously these re-read the env vars directly, which could silently diverge
+# from config.py's own SMTP_* values.  The module-level names are kept so
+# tests (and any caller) can still patch them.
 
-import os as _os
-
-_SMTP_HOST = _os.environ.get("SMTP_HOST", "smtp.gmail.com")
-_SMTP_PORT = int(_os.environ.get("SMTP_PORT", "587"))
-_SMTP_USER = _os.environ.get("SMTP_USER", "")
-_SMTP_PASS = _os.environ.get("SMTP_PASS", "")
-_SMTP_FROM = _os.environ.get("SMTP_FROM", _SMTP_USER)
+_SMTP_HOST = config.SMTP_HOST
+_SMTP_PORT = config.SMTP_PORT
+_SMTP_USER = config.SMTP_USER
+_SMTP_PASS = config.SMTP_PASSWORD
+_SMTP_FROM = config.SMTP_FROM
 
 
 class Notifier:
@@ -61,12 +63,13 @@ class Notifier:
 
     Parameters
     ----------
-    cooldown_sec : int
-        Minimum seconds between two alerts with the same (event_type, subject) key.
+    cooldown_sec : int | None
+        Minimum seconds between two alerts with the same (event_type, subject)
+        key.  Defaults to config.ALERT_COOLDOWN_SEC.
     """
 
-    def __init__(self, cooldown_sec: int = 300) -> None:
-        self._cooldown = cooldown_sec
+    def __init__(self, cooldown_sec: int | None = None) -> None:
+        self._cooldown = cooldown_sec if cooldown_sec is not None else config.ALERT_COOLDOWN_SEC
         self._sent_at: dict[str, float] = {}   # key → last-sent timestamp
         self._lock = threading.Lock()
 
@@ -319,7 +322,7 @@ class Notifier:
 
         try:
             context = ssl.create_default_context()
-            with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as smtp:
+            with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=config.SMTP_TIMEOUT_SEC) as smtp:
                 smtp.ehlo()
                 smtp.starttls(context=context)
                 smtp.login(_SMTP_USER, _SMTP_PASS)
@@ -377,7 +380,10 @@ class Notifier:
         for attempt in range(2):
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    async with session.post(
+                        url, json=payload,
+                        timeout=aiohttp.ClientTimeout(total=config.TELEGRAM_TIMEOUT_SEC),
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if data.get("ok"):

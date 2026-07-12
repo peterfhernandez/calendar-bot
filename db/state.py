@@ -1,5 +1,4 @@
 """SQLite state persistence for calendar spread trades."""
-import os as _os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -7,12 +6,18 @@ from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-_AEST = ZoneInfo("Australia/Sydney")
+import config
 
-# BOT_DB_PATH lets a separate bot instance (e.g. test mode) use its own DB
-# without touching the paper-mode database.  Set via --db CLI flag or directly
-# in the instance's .env file.
-DB_PATH = Path(_os.environ.get("BOT_DB_PATH", str(Path(__file__).parent / "calendar_bot.db")))
+# Timezone for "today" boundaries in the Telegram day queries — configurable
+# via config.TIMEZONE (Phase 20f).  The name _AEST is kept for readability
+# throughout this module.
+_AEST = ZoneInfo(config.TIMEZONE)
+
+# The DB path is resolved by config.py: config.DB_PATH honours the BOT_DB_PATH
+# env var (set via the --db CLI flag or the instance's .env file) so a separate
+# bot instance (e.g. test mode) can use its own DB without touching the
+# paper-mode database.
+DB_PATH = config.DB_PATH
 
 
 @dataclass

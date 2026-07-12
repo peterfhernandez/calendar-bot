@@ -138,7 +138,7 @@ def _ev_score(
     net_debit: float,
     opt_type: str,
     pop: float,
-    n_samples: int = 40,
+    n_samples: int = config.EV_SAMPLE_COUNT,
 ) -> float:
     """
     Estimate expected value score via a grid of P&L samples weighted by
@@ -229,8 +229,8 @@ def _eval_candidate(
     # returns (0, 0).  Treat this as a full-range profit: be_lo/be_hi span the
     # scan window so pop can still be computed accurately.
     if be_lo <= 0 and be_hi <= 0:
-        be_lo = spot * 0.50
-        be_hi = spot * 1.50
+        be_lo = spot * config.BREAKEVEN_SCAN_RANGE[0]
+        be_hi = spot * config.BREAKEVEN_SCAN_RANGE[1]
 
     T_near = near_dte / 365.0
     if T_near <= 0:
@@ -305,8 +305,8 @@ def scan(
     min_oi_far:         float | None = None,
     min_iv_contango:    float | None = None,
     min_pop:            float | None = None,
-    near_day_tolerance: int = 3,
-    far_day_tolerance:  int = 7,
+    near_day_tolerance: int | None = None,
+    far_day_tolerance:  int | None = None,
 ) -> list[CalendarCandidate]:
     """
     Scan the cache and return a ranked list of calendar spread candidates.
@@ -329,6 +329,7 @@ def scan(
         Minimum probability of profit (default: config.MIN_POP).
     near_day_tolerance / far_day_tolerance
         Acceptable DTE range around each target (±days).
+        Defaults: config.NEAR_DAY_TOLERANCE / config.FAR_DAY_TOLERANCE.
 
     Returns
     -------
@@ -338,6 +339,8 @@ def scan(
     assets            = [a.upper() for a in (assets            or config.ASSETS)]
     near_days_options = near_days_options or config.NEAR_DAYS_OPTIONS
     far_days_options  = far_days_options  or config.FAR_DAYS_OPTIONS
+    near_day_tolerance = near_day_tolerance if near_day_tolerance is not None else config.NEAR_DAY_TOLERANCE
+    far_day_tolerance  = far_day_tolerance  if far_day_tolerance  is not None else config.FAR_DAY_TOLERANCE
     # Preserve explicit call args (None means "use per-asset config inside the loop").
     _explicit_min_oi_near     = min_oi_near
     _explicit_min_oi_far      = min_oi_far
@@ -381,7 +384,7 @@ def scan(
                         continue
                     # 1d near legs are capped at a short far horizon —
                     # wider spreads are unusual and typically illiquid.
-                    _max_far = getattr(config, "MAX_FAR_DAYS_FOR_1D_NEAR", 14)
+                    _max_far = config.MAX_FAR_DAYS_FOR_1D_NEAR
                     if near_target == 1 and _max_far > 0 and far_target > _max_far:
                         continue
                     far_matches = [

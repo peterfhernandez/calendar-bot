@@ -40,113 +40,34 @@ from strategy.decision import BotState, DecisionEngine
 
 logger = logging.getLogger(__name__)
 
-_LOG_FORMAT = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
-_LOG_DATE   = "%Y-%m-%d %H:%M:%S"
-
 _logging_configured = False  # guard against double-init
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
-class _SecretRedactor(logging.Filter):
-    """
-    Scrubs sensitive values (Telegram token, chat ID) from log records before
-    they reach any handler.  Applied to the root logger so it covers both the
-    console and the rotating file.
-
-    Secrets are injected at configure_logging() time so the filter reads from
-    config once, not on every log record.
-    """
-
-    def __init__(self, secrets: list[str]) -> None:
-        super().__init__()
-        # Drop blank/whitespace-only strings so we don't accidentally redact every log line.
-        self._secrets = [s for s in secrets if s and s.strip()]
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if self._secrets:
-            try:
-                msg = record.getMessage()
-            except Exception:
-                return True
-            redacted = msg
-            for secret in self._secrets:
-                redacted = redacted.replace(secret, "<redacted>")
-            if redacted is not msg:
-                # Rewrite the pre-formatted message so handlers see the
-                # redacted version; clear args so Formatter doesn't re-expand.
-                record.msg = redacted
-                record.args = ()
-        return True
+# Backwards-compatible alias — the redactor implementation now lives in
+# core/logging_setup.py so every entry point shares it (Phase 20a).
+from core.logging_setup import SecretRedactor as _SecretRedactor  # noqa: E402
+from core.logging_setup import setup_logging as _setup_logging    # noqa: E402
 
 
 def configure_logging(
-    log_dir: str | Path = "logs",
-    level: int = logging.INFO,
+    log_dir: str | Path = config.LOG_DIR,
+    level: int | str | None = None,
 ) -> None:
     """
     Configure root logger with a console handler and a rotating file handler.
 
-    Also suppresses noisy third-party loggers (httpx, httpcore, telegram)
-    and installs a secret-redacting filter so Telegram tokens never appear
-    in log output.
+    Thin wrapper around core.logging_setup.setup_logging(); format, rotation
+    size, backup count, noisy-logger suppression, and secret redaction all
+    come from config.py (Phase 20a).
 
     Safe to call multiple times — extra calls are no-ops.
     """
     global _logging_configured
     if _logging_configured:
         return
-
-    root = logging.getLogger()
-    root.setLevel(level)
-
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATE)
-
-    # Console
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    root.addHandler(ch)
-
-    # Rotating file — BOT_LOG_FILE env var lets a separate instance write to its
-    # own file (e.g. logs/bot_test.log) so paper and test logs don't interleave.
-    import os as _os
-    _log_override = _os.environ.get("BOT_LOG_FILE", "")
-    _log_full = Path(_log_override) if _log_override else Path(log_dir) / "bot.log"
-    _log_full.parent.mkdir(parents=True, exist_ok=True)
-    fh = logging.handlers.RotatingFileHandler(
-        _log_full,
-        maxBytes=10 * 1024 * 1024,  # 10 MB
-        backupCount=5,
-        encoding="utf-8",
-    )
-    fh.setFormatter(formatter)
-    root.addHandler(fh)
-
-    # Silence high-frequency third-party loggers that add no operational value.
-    # httpx logs every HTTP request at INFO, flooding the log with getUpdates
-    # polling calls from python-telegram-bot.
-    for noisy in ("httpx", "httpcore", "telegram.ext.Updater",
-                  "telegram.vendor.ptb_urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    # Redact secrets from all log output.  Import here to avoid circular imports
-    # at module load time (config is imported before monitor.loop in some paths).
-    try:
-        import config as _cfg
-        secrets: list[str] = [
-            getattr(_cfg, "TELEGRAM_TOKEN",             ""),
-            str(getattr(_cfg, "TELEGRAM_CHAT",          "") or ""),
-            getattr(_cfg, "DERIBIT_TEST_CLIENT_ID",     ""),
-            getattr(_cfg, "DERIBIT_TEST_CLIENT_SECRET", ""),
-            getattr(_cfg, "DERIBIT_LIVE_CLIENT_ID",     ""),
-            getattr(_cfg, "DERIBIT_LIVE_CLIENT_SECRET", ""),
-            getattr(_cfg, "SMTP_USER", ""),
-            getattr(_cfg, "SMTP_PASS", ""),
-        ]
-        root.addFilter(_SecretRedactor(secrets))
-    except Exception:
-        pass  # never let logging setup crash the bot
-
+    _setup_logging(level=level, log_dir=log_dir, force=True)
     _logging_configured = True
 
 

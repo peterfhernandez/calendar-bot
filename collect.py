@@ -50,9 +50,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import logging.handlers
 import signal
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,29 +68,14 @@ from backtest.data_collector import (
 
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
+# Format, rotation size, and backup count come from config.py via the shared
+# setup_logging() helper (Phase 20a).
+
+from core.logging_setup import setup_logging as _setup_logging_shared
+
 
 def _setup_logging(level: str, log_file: str | None) -> None:
-    fmt = logging.Formatter(
-        "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(fmt)
-    root.addHandler(handler)
-
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=10 * 1024 * 1024,  # 10 MB per file
-            backupCount=5,
-            encoding="utf-8",
-        )
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+    _setup_logging_shared(level=level, log_file=log_file)
 
 
 logger = logging.getLogger("collect")
