@@ -507,24 +507,24 @@ New Telegram command that renders the bot's full trading history as an equity-cu
 
 ### `db/state.py`
 
-- [ ] Add `get_all_closed_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]` — all rows with `date_close IS NOT NULL`, ordered by `date_close ASC, id ASC`
+- [x] Add `get_all_closed_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]` — all rows with `date_close IS NOT NULL`, ordered by `date_close ASC, id ASC`
 
 ### `telegram_cmd/pnl_chart.py` (new module)
 
-- [ ] `matplotlib.use("Agg")` set at import time, before `pyplot` is imported
-- [ ] `build_cumulative_series(closed_trades) -> list[tuple[datetime, float]]` — pure function, running sum of `t.pnl` ordered by `date_close`
-- [ ] `compute_unrealized(open_trades, cache: ChainCache) -> tuple[float, int]` — returns `(total_unrealized_pnl, open_count)`; reuses the mid-price / `last_spread_value` fallback logic already in `telegram_cmd/handlers.py` (factor the shared bits out to a helper rather than duplicating, e.g. move `_mid()` and the stale-cache fallback into a shared `telegram_cmd/_pnl_common.py` or keep the calc in `handlers.py` and import it)
-- [ ] `render_pnl_chart(closed_trades, open_trades, cache) -> io.BytesIO` — builds the black realized-PnL line, appends the dotted green unrealized segment when `open_count > 0`, draws a y=0 reference line, formats the y-axis as `$X`, rotates/thins x-axis date labels for readability with many trades, returns a seeked-to-0 `BytesIO` containing PNG bytes
+- [x] `matplotlib.use("Agg")` set at import time, before `pyplot` is imported
+- [x] `build_cumulative_series(closed_trades) -> list[tuple[datetime, float]]` — pure function, running sum of `t.pnl` ordered by `date_close`
+- [x] `compute_unrealized(open_trades, cache: ChainCache) -> tuple[float, int]` — returns `(total_unrealized_pnl, open_count)`; reuses the mid-price / `last_spread_value` fallback logic already in `telegram_cmd/handlers.py` (factor the shared bits out to a helper rather than duplicating, e.g. move `_mid()` and the stale-cache fallback into a shared `telegram_cmd/_pnl_common.py` or keep the calc in `handlers.py` and import it)
+- [x] `render_pnl_chart(closed_trades, open_trades, cache) -> io.BytesIO` — builds the black realized-PnL line, appends the dotted green unrealized segment when `open_count > 0`, draws a y=0 reference line, formats the y-axis as `$X`, rotates/thins x-axis date labels for readability with many trades, returns a seeked-to-0 `BytesIO` containing PNG bytes
 
 ### `telegram_cmd/handlers.py`
 
-- [ ] `handle_pnl(update, context, cache, db_path)` — fetches `get_all_closed_trades()` and `get_open_trades()`, calls `render_pnl_chart()`, sends via `update.message.reply_photo(photo=buf, caption=...)`; caption includes total realized PnL, total unrealized PnL, open trade count, and the combined total
-- [ ] Reply with a plain text message instead of a photo when there is no history at all (no closed trades and no open trades)
+- [x] `handle_pnl(update, context, cache, db_path)` — fetches `get_all_closed_trades()` and `get_open_trades()`, calls `render_pnl_chart()`, sends via `update.message.reply_photo(photo=buf, caption=...)`; caption includes total realized PnL, total unrealized PnL, open trade count, and the combined total
+- [x] Reply with a plain text message instead of a photo when there is no history at all (no closed trades and no open trades)
 
 ### `telegram_cmd/listener.py`
 
-- [ ] Add `("pnl", "Equity curve: realized PnL (black) + unrealized PnL (dotted green), N open trades")` to `COMMAND_REGISTRY`
-- [ ] Wrap and register `cmd_pnl` the same way as `cmd_positions` (needs `cache` injected, no `engine` dependency)
+- [x] Add `("pnl", "Equity curve: realized PnL (black) + unrealized PnL (dotted green), N open trades")` to `COMMAND_REGISTRY`
+- [x] Wrap and register `cmd_pnl` the same way as `cmd_positions` (needs `cache` injected, no `engine` dependency)
 
 ### `requirements.txt`
 
@@ -532,10 +532,10 @@ New Telegram command that renders the bot's full trading history as an equity-cu
 
 ### Tests and scratch
 
-- [ ] `tests/test_state.py` — `TestGetAllClosedTrades`: returns only closed trades, ordered by `date_close`, empty list when none closed
-- [ ] `tests/test_telegram_cmd.py` — `TestHandlePnl`: mocks `reply_photo`; verifies it is called with PNG bytes (`b"\x89PNG"` header) when history exists; verifies caption contains realized/unrealized/open-count figures; verifies the no-history case falls back to `reply_text`; verifies the dotted unrealized segment is omitted when there are no open positions
-- [ ] Unit tests for `build_cumulative_series` and `compute_unrealized` directly (no rendering involved) covering: single trade, multiple same-day closes, mixed win/loss sequence, zero open positions, stale-cache fallback
-- [ ] `scratch/scratch_pnl_chart.py` — loads real (or, if empty, synthetic) closed trades from the paper DB, renders the chart, and saves it to `scratch/pnl_chart_preview.png` for visual inspection. Aborts if `TRADING_MODE == "live"` (per project convention: scratch files never run against live trading). Run with `python -m scratch.scratch_pnl_chart` from the repo root.
+- [x] `tests/test_state.py` — `TestGetAllClosedTrades`: returns only closed trades, ordered by `date_close`, empty list when none closed
+- [x] `tests/test_telegram_cmd.py` — `TestHandlePnl`: mocks `reply_photo`; verifies it is called with PNG bytes (`b"\x89PNG"` header) when history exists; verifies caption contains realized/unrealized/open-count figures; verifies the no-history case falls back to `reply_text`; verifies the dotted unrealized segment is omitted when there are no open positions
+- [x] Unit tests for `build_cumulative_series` and `compute_unrealized` directly (no rendering involved) covering: single trade, multiple same-day closes, mixed win/loss sequence, zero open positions, stale-cache fallback
+- [x] `scratch/scratch_pnl_chart.py` — loads real (or, if empty, synthetic) closed trades from the paper DB, renders the chart, and saves it to `scratch/pnl_chart_preview.png` for visual inspection. Aborts if `TRADING_MODE == "live"` (per project convention: scratch files never run against live trading). Run with `python -m scratch.scratch_pnl_chart` from the repo root.
 
 ---
 
@@ -599,7 +599,7 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 
 ### Scratch scripts
 
-- [ ] `scratch/scratch_margin_gate.py` — end-to-end demonstration (optional, can be added later if needed)
+- [x] `scratch/scratch_margin_gate.py` — end-to-end demonstration
 
 ---
 
@@ -1013,41 +1013,41 @@ In paper mode, the bot should be completely isolated from Deribit. All portfolio
 
 ### Implementation
 
-- [ ] **Item 1: Import TRADING_MODE** — Add `TRADING_MODE` from config to `portfolio/tracker.py`
-  - [ ] Import statement at top of file
-  - [ ] Use in trading-mode checks
+- [x] **Item 1: Import TRADING_MODE** — Add `TRADING_MODE` from config to `portfolio/tracker.py`
+  - [x] Import statement at top of file
+  - [x] Use in trading-mode checks
 
-- [ ] **Item 2: Skip API in paper mode** — Modify `refresh()` to return early if `TRADING_MODE == "paper"`, after calculating SQLite values but before any Deribit API calls
-  - [ ] Check `TRADING_MODE == "paper"` before calling `_refresh_from_api()`
-  - [ ] Ensure SQLite calculations (`_used_margin`, `_realized_pnl_today`, `_open_position_count`, `_fees_paid_today`, `_fees_paid_total`) always run
-  - [ ] Skip reconciliation entirely in paper mode
+- [x] **Item 2: Skip API in paper mode** — Modify `refresh()` to return early if `TRADING_MODE == "paper"`, after calculating SQLite values but before any Deribit API calls
+  - [x] Check `TRADING_MODE == "paper"` before calling `_refresh_from_api()`
+  - [x] Ensure SQLite calculations (`_used_margin`, `_realized_pnl_today`, `_open_position_count`, `_fees_paid_today`, `_fees_paid_total`) always run
+  - [x] Skip reconciliation entirely in paper mode
 
-- [ ] **Item 3: Calculate unrealized P&L from cache in paper mode** — Implement `_calculate_unrealized_pnl_from_cache()` that:
-  - [ ] Queries open positions from SQLite
-  - [ ] Fetches live spread values from `ChainCache` for each position
-  - [ ] Sums `(spread_value - net_debit * qty)` per position
-  - [ ] Falls back to 0.0 if cache unavailable (consistent with current behavior)
-  - [ ] Called in paper mode when Deribit API is skipped
+- [x] **Item 3: Calculate unrealized P&L from cache in paper mode** — Implement `_calculate_unrealized_pnl_from_cache()` that:
+  - [x] Queries open positions from SQLite
+  - [x] Fetches live spread values from `ChainCache` for each position
+  - [x] Sums `(spread_value - net_debit * qty)` per position
+  - [x] Falls back to 0.0 if cache unavailable (consistent with current behavior)
+  - [x] Called in paper mode when Deribit API is skipped
 
-- [ ] **Item 4: Implement DB-only portfolio calculation** — Create `_calculate_db_only_portfolio()` that:
-  - [ ] Computes `equity_usd` from: initial capital + realized P&L today + unrealized P&L from cache
-  - [ ] Computes `available_cash` from DB-only metrics (no Deribit API call)
-  - [ ] Returns dict with equity, available_cash, and unrealized_pnl
-  - [ ] Called in paper mode after skipping API calls
+- [x] **Item 4: Implement DB-only portfolio calculation** — Create `_calculate_db_only_portfolio()` that:
+  - [x] Computes `equity_usd` from: initial capital + realized P&L today + unrealized P&L from cache
+  - [x] Computes `available_cash` from DB-only metrics (no Deribit API call)
+  - [x] Returns dict with equity, available_cash, and unrealized_pnl
+  - [x] Called in paper mode after skipping API calls
 
-- [ ] **Item 5: Add safety guards and docstrings** 
-  - [ ] Add explicit `if TRADING_MODE != "paper"` check at start of `_refresh_from_api()` as belt-and-suspenders
-  - [ ] Add explicit `if TRADING_MODE != "paper"` guard in `simulate_margin()` for clarity
-  - [ ] Update class docstring to document paper vs test/live behavior
-  - [ ] Update method docstrings noting which are test/live only
+- [x] **Item 5: Add safety guards and docstrings** 
+  - [x] Add explicit `if TRADING_MODE != "paper"` check at start of `_refresh_from_api()` as belt-and-suspenders
+  - [x] Add explicit `if TRADING_MODE != "paper"` guard in `simulate_margin()` for clarity
+  - [x] Update class docstring to document paper vs test/live behavior
+  - [x] Update method docstrings noting which are test/live only
 
 ### Test Coverage
 
-- [ ] `TestPaperModePortfolioIsolation::test_no_deribit_api_calls_in_paper_mode` — verify zero REST API calls to Deribit in paper mode
-- [ ] `TestPaperModePortfolioIsolation::test_no_reconciliation_warning_in_paper_mode` — verify no RECONCILE MISMATCH warnings logged
-- [ ] `TestPaperModePortfolioIsolation::test_equity_calculated_from_db_in_paper_mode` — verify non-zero equity from DB calculation
-- [ ] `TestPaperModePortfolioIsolation::test_unrealized_pnl_from_cache_in_paper_mode` — verify unrealized P&L calculated from live cache prices
-- [ ] `TestPaperModePortfolioIsolation::test_test_mode_still_uses_deribit_api` — regression: verify test/live modes still call Deribit API
+- [x] `TestPaperModePortfolioIsolation::test_no_deribit_api_calls_in_paper_mode` — verify zero REST API calls to Deribit in paper mode
+- [x] `TestPaperModePortfolioIsolation::test_no_reconciliation_warning_in_paper_mode` — verify no RECONCILE MISMATCH warnings logged
+- [x] `TestPaperModePortfolioIsolation::test_equity_calculated_from_db_in_paper_mode` — verify non-zero equity from DB calculation
+- [x] `TestPaperModePortfolioIsolation::test_unrealized_pnl_from_cache_in_paper_mode` — verify unrealized P&L calculated from live cache prices
+- [x] `TestPaperModePortfolioIsolation::test_test_mode_still_uses_deribit_api` — regression: verify test/live modes still call Deribit API
 
 ### Expected Results
 

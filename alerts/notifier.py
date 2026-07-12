@@ -282,8 +282,12 @@ class Notifier:
         now = time.monotonic()
 
         with self._lock:
-            last = self._sent_at.get(key, 0.0)
-            if now - last < self._cooldown:
+            # A missing key means "never sent" — it must be None, not 0.0:
+            # time.monotonic() is typically seconds since system boot, so with
+            # a 0.0 sentinel every first alert would be silently suppressed
+            # whenever the bot starts within cooldown_sec of boot.
+            last = self._sent_at.get(key)
+            if last is not None and now - last < self._cooldown:
                 remaining = int(self._cooldown - (now - last))
                 logger.debug(
                     "Alert suppressed (cooldown %ds remaining): %s", remaining, subject

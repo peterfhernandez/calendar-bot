@@ -268,3 +268,29 @@ class TestTelegramDispatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCooldownBootWindow(unittest.TestCase):
+    """
+    Phase 19 regression: time.monotonic() is typically seconds since system
+    boot, so a 0.0 "never sent" sentinel silently suppressed every first
+    alert whenever the bot started within cooldown_sec of boot.
+    """
+
+    def test_first_send_passes_shortly_after_boot(self):
+        n = Notifier(cooldown_sec=300)
+        with patch("alerts.notifier.time.monotonic", return_value=42.0), \
+             patch.object(n, "_dispatch_email") as em, \
+             patch.object(n, "_dispatch_telegram") as tg:
+            n.send("stop_loss", "subject", "body")
+            em.assert_called_once()
+            tg.assert_called_once()
+
+    def test_duplicate_still_suppressed_within_cooldown(self):
+        n = Notifier(cooldown_sec=300)
+        with patch("alerts.notifier.time.monotonic", return_value=42.0), \
+             patch.object(n, "_dispatch_email") as em, \
+             patch.object(n, "_dispatch_telegram"):
+            n.send("stop_loss", "subject", "body")
+            n.send("stop_loss", "subject", "body")  # same key → suppressed
+            assert em.call_count == 1

@@ -479,9 +479,9 @@ calendar-bot/
 | Risk | Mitigation |
 | --- | --- |
 | Leg risk on entry (one leg fills, other doesn't) | Use Deribit combo orders; individual-leg fallback only when both legs are liquid and cancels near leg immediately on far-leg failure |
-| Leg risk on close (one leg fills, other times out) | Close operations unwind partial fills: if near fills but far times out, reverse-sell near at market; if far fills but near times out, reverse-buy far at market. Deribit API errors on close are caught and retried up to 3 times; on 4th failure, position is force-closed to prevent naked leg accumulation |
-| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then **intended to** force-close/mark-stuck on 4th failure. **Known gap (Phase 18, not yet fixed):** the "mark as stuck" branches reset `_close_roll_failures` to zero immediately after marking, and `get_open_trades()` never filters out `close_status == 'close_stuck'` positions, so the position keeps being monitored and the same failing close keeps retrying indefinitely rather than actually stopping. Confirmed in test-mode logs: trade_id=3 re-marked "stuck" 40 times over ~29 hours; trade_id=5 stuck 6+ days before a manual `/close_manually`. |
-| Close order rejected by exchange (`-32602 Invalid params`) | **Known gap (Phase 18, not yet fixed):** `execution/executor.py` blanket-rounds every order price to 4 decimals and never fetches an instrument's actual Deribit tick size (`tick_size_steps` scales with option premium). Far-leg close orders — typically priced higher than the near leg — land in a coarser tick band and get rejected by Deribit's JSON-RPC layer before any business-logic check runs. Confirmed in test-mode logs: 636 occurrences of `Deribit error -32602: Invalid params`, 100% on far-leg close submissions, 0% on near-leg. See Phase 18 below for the fix design. |
+| Leg risk on close (one leg fills, other times out) | Close operations unwind partial fills: if near fills but far times out, reverse-sell near at market; if far fills but near times out, reverse-buy far at market. Deribit API errors on close are caught and retried up to 3 times; on 4th failure, position is marked `close_stuck` with a single operator alert and excluded from monitoring until manually cleared (Phase 19) |
+| Unbounded retry on failed close/roll (naked leg accumulation) | Track failed close/roll attempts per position in `_close_roll_failures` dict; cap at 3 retries, then mark `close_stuck` on the 4th failure with a single operator alert. Fixed in Phase 18 (`get_open_trades()` excludes `close_stuck` positions from routine monitoring) and Phase 19 (retry ladder restored after a regression; counter cleared on mark-stuck and on `/close` so operator retries start fresh). |
+| Close order rejected by exchange (`-32602 Invalid params`) | Fixed in Phase 18: `execution/executor.py` fetches and caches each instrument's tick size and rounds every submitted order price to a valid tick (previously a blanket 4-decimal round caused 636 `-32602 Invalid params` rejections, 100% on far-leg close submissions). |
 | IV collapse after entry | Check IV term structure before entering; set max IV drop stop |
 | Liquidity gaps on crypto calendars | Two-stage liquidity filter: OI in scanner, bid/ask size + spread in decision gate |
 | Overfitting scanner to recent market | Backtest across at least 2 vol regimes |
@@ -721,8 +721,8 @@ The filter never raises — if the config import fails for any reason, the filte
 | **Secret leak prevention in logs (11)** | **< 0.5 day** | **Done** |
 | **Parallel mode isolation — --env/--db/--log/--config (12)** | **< 0.5 day** | **Done** |
 | **Fee-inclusive PnL display (13)** | **< 0.5 day** | **Done** |
-| **`/pnl` equity-curve chart (16)** | **1–1.5 days** | **Not started** |
-| **Cross Portfolio Margin entry gate (17)** | **2–3.5 days** | **Not started** |
+| **`/pnl` equity-curve chart (16)** | **1–1.5 days** | **Done** |
+| **Cross Portfolio Margin entry gate (17)** | **2–3.5 days** | **Done** |
 | Testing + paper trading validation | 3–5 days | Not started |
 | **Total remaining** | **~6–8.5 days** | |
 
@@ -1382,6 +1382,18 @@ Each new config key gets a short comment explaining what it controls and its saf
 
 | File | Change |
 | --- | --- |
+| `strategy/decision.py` | `_close_position()` returns `FAILED` on executor failure (no DB write, no stuck marking); new `_mark_stuck_and_notify()` helper replaces three duplicated retry-cap blocks; roll retry-cap close failure marks stuck; per-position try/except in `monitor_tick()` |
+| `alerts/notifier.py` | cooldown sentinel `0.0` → `None` in `send()` |
+| `telegram_cmd/handlers.py` | `/close` also clears `engine._close_roll_failures[trade_id]` |
+| `tests/test_decision.py` | date-robust `_make_stopped_pos`; + `TestClosePositionExecutorFailure` (3 tests), `TestMonitorTickIsolation` (1 test) |
+| `tests/test_notifier.py` | + `TestCooldownBootWindow` (2 tests) |
+| `tests/test_executor.py` | `TestForceClosePnLFix` updated to restored retry semantics |
+| `tests/test_telegram_cmd.py` | `/close` test asserts retry counter cleared |
+| `scratch/scratch_close_retry_stuck.py` | New — offline demo of retry ladder → stuck → `/close` reset, and the boot-window fix |
+
+### Status
+
+Complete — 530 tests passing. The retry ladder (3 attempts → mark stuck → one alert → excluded from monitoring → `/close` restarts fresh) is verified end-to-end by `scratch/scratch_close_retry_stuck.py`.
 | `config.py` | + `LOGGING` section, network/timeout constants, business-logic threshold constants, `DB_PATH`/`HISTORIC_DATA_DB_PATH`/`TIMEZONE`/`DATE_FORMAT`, missing `SMTP_FROM`, and the 6 previously-fake keys (`SLIPPAGE_LIMIT_PCT`, `ORDER_TIMEOUT_SEC`, `MAX_ORDER_RETRIES`, `STUCK_ORDER_TIMEOUT_SEC`, `INITIAL_CAPITAL`, `COLLECTOR_INTERVAL_SEC`) |
 | `monitor/loop.py`, `collect.py`, `backtest/data_collector.py`, `data/deribit_feed.py`, `data/debug_viewer.py` | Replace independent `logging.basicConfig` calls with a shared `setup_logging()` helper reading from `config.LOGGING` |
 | `alerts/notifier.py` | Import `config.SMTP_*` instead of re-reading env vars; use `config.ALERT_COOLDOWN_SEC`/`config.SMTP_TIMEOUT_SEC`/`config.TELEGRAM_TIMEOUT_SEC` |
