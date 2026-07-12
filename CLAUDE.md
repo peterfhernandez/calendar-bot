@@ -32,10 +32,15 @@ Make sure the Readme.md file is up to date as well.
 
 Each time you complete a task from BOT_TODO, make sure to update progress.
 
+### Configuration Variables
+
+Configuration variables must be set in config.py, not within the modules.
+
 ### Commiting changes
 
 - do not commit changes to git unless explicitly asked
 - when asked to commit, the comment must not contain your name, the name of any model, or any reference to AI
 - when asked to commit and you have been working on a separate branch, asking if that branch should be merged into the main branch
-- do not sign commits with <noreply@anthropic.com> credentials, any reference yourself or any email address at all
+- do not sign commits with <noreply@anthropic.com> or <*@*.claude.io> credentials, any reference to yourself or any email address at all
 - PR comments must not include references to Claude, AI, Anthropic or anything of that nature
+- there must be no reference anywhere to Claude. You cannot add links to <*claude.io> or <*anthropic.com>
