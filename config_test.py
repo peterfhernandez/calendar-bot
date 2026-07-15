@@ -177,3 +177,106 @@ TELEGRAM_TOKEN      = _os.environ.get("TELEGRAM_TOKEN",      "")  # bot token (T
 TELEGRAM_BOT_TOKEN  = TELEGRAM_TOKEN                               # alias for compatibility
 TELEGRAM_CHAT       = _os.environ.get("TELEGRAM_CHAT",       "")  # chat ID  (TELEGRAM_CHAT in .env)
 TELEGRAM_CHAT_ID    = TELEGRAM_CHAT                                # alias for compatibility
+SMTP_FROM           = _os.environ.get("SMTP_FROM", "") or SMTP_USER  # sender address (defaults to SMTP_USER)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parity backfill (Phase 21f) — every key below mirrors config.py exactly.
+# config_test.py is a full standalone config exec'd into config.py's namespace,
+# so these must be present explicitly (not silently inherited) to keep this file
+# honest about what the test-mode instance actually runs with.  Values match
+# config.py's defaults unless a deliberate, commented test-mode override is made.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Cross Portfolio Margin (X:PM) entry gate (Phase 17) ───────────────────────
+MAX_MARGIN_UTILIZATION_PCT = 0.80   # ceiling on maintenance_margin / equity
+MARGIN_GATE_ENABLED        = True   # kill switch for the whole gate
+MARGIN_GATE_REQUIRED_LIVE  = True   # test/live: missing margin data blocks entry (fail closed)
+
+# ── Phase 21 — deep-ITM/OTM churn guards ──────────────────────────────────────
+EV_SCORE_RANKING_CAP        = 2.0    # above-cap ev_scores are demoted in ranking
+MAX_MONEYNESS_PCT           = 0.15   # reject strikes > 15% from spot
+MARKET_SV_REQUIRE_TWO_SIDED = True   # require bid>0 AND ask>0 before trusting a live mark
+CLOSE_CONFIRM_TICKS         = 2      # consecutive stop/TP ticks required before closing
+REENTRY_COOLDOWN_SEC        = 1800   # block re-entry of a just-auto-closed instrument
+
+# ── Logging (Phase 20a) ───────────────────────────────────────────────────────
+LOG_LEVEL          = "INFO"
+LOG_FORMAT         = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+LOG_DATE_FORMAT    = "%Y-%m-%d %H:%M:%S"
+LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT   = 5
+LOG_DIR            = "logs"
+NOISY_LOGGERS = {
+    "httpx":                       "WARNING",
+    "httpcore":                    "WARNING",
+    "telegram.ext.Updater":        "WARNING",
+    "telegram.vendor.ptb_urllib3": "WARNING",
+}
+LOG_LEVEL_OVERRIDES = {
+    "strategy.decision": "DEBUG",
+    "strategy.sizer":    "DEBUG",
+}
+
+# ── Network / timeout / retry constants (Phase 20b + 20c) ─────────────────────
+DERIBIT_WS_PING_INTERVAL = 20
+DERIBIT_WS_PING_TIMEOUT  = 20
+DERIBIT_WS_OPEN_TIMEOUT  = 15
+DERIBIT_WS_MAX_SIZE      = 10 * 1024 * 1024
+RPC_TIMEOUT_SEC          = 15
+
+SLIPPAGE_LIMIT_PCT = 0.02
+ORDER_TIMEOUT_SEC  = 30
+MAX_ORDER_RETRIES  = 3
+ORDER_RETRY_DELAYS = [1, 3, 9]
+
+STUCK_ORDER_TIMEOUT_SEC = 120
+
+ALERT_COOLDOWN_SEC   = 300
+SMTP_TIMEOUT_SEC     = 10
+TELEGRAM_TIMEOUT_SEC = 10
+
+COLLECTOR_INTERVAL_SEC = 300
+
+# ── Business-logic thresholds (Phase 20e) ─────────────────────────────────────
+STRIKE_INCREMENT_TABLE = [
+    (5,     0.50),
+    (20,    1.0),
+    (100,   5.0),
+    (500,   10.0),
+    (2_000, 50.0),
+]
+STRIKE_INCREMENT_DEFAULT = 100.0
+
+FAR_LEG_SPREAD_TABLE = [
+    (7,  0.005),
+    (14, 0.010),
+    (30, 0.015),
+]
+FAR_LEG_SPREAD_DEFAULT            = 0.025
+FAR_LEG_LIQUIDITY_PENALTY_PER_30D = 0.005
+
+NEAR_DAY_TOLERANCE = 3
+FAR_DAY_TOLERANCE  = 7
+EV_SAMPLE_COUNT    = 40
+
+BREAKEVEN_SCAN_STEPS = 800
+BREAKEVEN_SCAN_RANGE = (0.50, 1.50)
+
+SPREAD_WARN_PCT = 0.70
+
+ROLL_TRIGGER_DAYS          = 2
+POSITION_FAILURE_RETRY_CAP = 3
+
+MIN_CONTRACT_SIZE      = 0.1
+STRIKE_CORRELATION_PCT = 0.05
+
+RECONCILE_THRESHOLD_PCT = 0.10
+INITIAL_CAPITAL         = 10_000.0
+DEFAULT_PORTFOLIO_VALUE = 10_000.0
+
+# ── Paths / timezone / date format (Phase 20f) ────────────────────────────────
+from pathlib import Path as _Path
+DB_PATH = _Path(_os.environ.get("BOT_DB_PATH", str(_Path(__file__).parent / "db" / "calendar_bot.db")))
+HISTORIC_DATA_DB_PATH = _Path(__file__).parent / "backtest" / "historic_data" / "options.duckdb"
+TIMEZONE    = "Australia/Sydney"
+DATE_FORMAT = "%Y-%m-%d"

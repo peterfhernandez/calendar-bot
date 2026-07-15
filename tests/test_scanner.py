@@ -672,3 +672,112 @@ class TestFeeAdjustedEV:
         result = size_candidate(c, portfolio_value=100_000.0, open_positions=[], max_loss_pct=0.02)
         assert result.qty > 0.0
         assert result.estimated_fees > 0.0, "Sizer must return non-zero estimated_fees"
+
+
+# ── Phase 21a: EV-ranking cap ─────────────────────────────────────────────────
+
+class TestEvRankingCap:
+    """
+    A near-zero-debit candidate produces an ev_net/net_debit ratio orders of
+    magnitude above any legitimate setup.  scan() must not let it out-rank a
+    real candidate — above-cap ev_scores are demoted below in-range ones.
+    """
+
+    def _snaps_two_strikes(self) -> list[TickerSnapshot]:
+        # Two (strike, type) groups so scan() calls _eval_candidate twice.
+        return [
+            _make_snap("BTC", 7,  100_000, "C", mark_iv=0.90, bid=4800, ask=5200, open_interest=600),
+            _make_snap("BTC", 30, 100_000, "C", mark_iv=0.75, bid=8200, ask=8800, open_interest=600),
+            _make_snap("BTC", 7,  95_000,  "C", mark_iv=0.90, bid=4800, ask=5200, open_interest=600),
+            _make_snap("BTC", 30, 95_000,  "C", mark_iv=0.75, bid=8200, ask=8800, open_interest=600),
+        ]
+
+    def test_above_cap_candidate_demoted(self):
+        import config as cfg
+        cap = cfg.EV_SCORE_RANKING_CAP
+        # Build candidates directly and exercise scan()'s exact ranking key.
+        degenerate = _dummy_candidate(strike=100_000.0, net_debit=0.02, ev_score=17.0)
+        normal     = _dummy_candidate(strike=95_000.0,  net_debit=140.0, ev_score=0.4)
+        ranked = sorted([degenerate, normal], key=lambda c: (c.ev_score > cap, -c.ev_score))
+        assert ranked[0] is normal, "in-range candidate must rank ahead of the above-cap degenerate"
+        assert ranked[-1] is degenerate
+
+    def test_two_above_cap_keep_relative_order(self):
+        import config as cfg
+        cap = cfg.EV_SCORE_RANKING_CAP
+        # Two degenerates above the cap; a legit one below it must still win.
+        d1 = _dummy_candidate(strike=100_000.0, net_debit=0.02, ev_score=17.0)
+        d2 = _dummy_candidate(strike=99_000.0,  net_debit=0.05, ev_score=9.0)
+        legit = _dummy_candidate(strike=95_000.0, net_debit=140.0, ev_score=0.4)
+        ranked = sorted([d1, d2, legit], key=lambda c: (c.ev_score > cap, -c.ev_score))
+        assert ranked[0] is legit
+
+    def test_scan_ranks_via_capped_key(self, monkeypatch):
+        """End-to-end: scan() applies the capped ranking key, not raw ev_score."""
+        import strategy.scanner as scanner_mod
+        cache = _make_cache(self._snaps_two_strikes())
+        # Force _eval_candidate to yield a degenerate then a normal candidate.
+        crafted = [
+            _dummy_candidate(strike=100_000.0, net_debit=0.02, ev_score=17.0),
+            _dummy_candidate(strike=95_000.0,  net_debit=140.0, ev_score=0.4),
+        ]
+        calls = {"i": 0}
+
+        def fake_eval(*a, **k):
+            i = calls["i"]
+            calls["i"] += 1
+            return crafted[i] if i < len(crafted) else None
+
+        monkeypatch.setattr(scanner_mod, "_eval_candidate", fake_eval)
+        results = scan(cache, assets=["BTC"], near_days_options=[7], far_days_options=[30])
+        assert len(results) == 2
+        assert results[0].ev_score == 0.4, "the legitimate candidate must rank first"
+
+
+# ── Phase 21b: Moneyness entry filter ─────────────────────────────────────────
+
+class TestMoneynessFilter:
+    """
+    Deep ITM/OTM strikes have converged near/far pricing (near-zero net_debit),
+    so _eval_candidate rejects strikes more than MAX_MONEYNESS_PCT from spot.
+    """
+
+    def _eval(self, strike: float, spot: float = 100_000.0):
+        from strategy.scanner import _eval_candidate
+        near = _make_snap("BTC", 7,  int(strike), "C", mark_iv=0.90, bid=4800, ask=5200, open_interest=600, spot=spot)
+        far  = _make_snap("BTC", 30, int(strike), "C", mark_iv=0.75, bid=8200, ask=8800, open_interest=600, spot=spot)
+        return _eval_candidate(
+            "BTC", strike, "Call", 7, near, 30, far, spot,
+            min_oi_near=100, min_oi_far=100, min_iv_contango=0.02, min_pop=0.01,
+        )
+
+    def test_near_atm_passes(self):
+        # 100k strike at 100k spot = 0% moneyness → passes the filter.
+        assert self._eval(strike=100_000.0) is not None
+
+    def test_within_window_passes(self):
+        # 110k strike at 100k spot = 10% < 15% → passes.
+        assert self._eval(strike=110_000.0) is not None
+
+    def test_deep_otm_rejected(self):
+        # 130k strike at 100k spot = 30% > 15% → rejected.
+        assert self._eval(strike=130_000.0) is None
+
+    def test_deep_itm_rejected(self):
+        # 60k strike at 100k spot = 40% > 15% → rejected.
+        assert self._eval(strike=60_000.0) is None
+
+    def test_per_asset_override(self, monkeypatch):
+        import config as cfg
+        from strategy.scanner import _eval_candidate
+        # Same 118k-strike candidate at 100k spot = 18% away.  Only the moneyness
+        # threshold changes between the two calls, isolating the override effect.
+        near = _make_snap("BTC", 7,  118_000, "C", mark_iv=0.90, bid=4800, ask=5200, open_interest=600)
+        far  = _make_snap("BTC", 30, 118_000, "C", mark_iv=0.75, bid=8200, ask=8800, open_interest=600)
+        args = ("BTC", 118_000.0, "Call", 7, near, 30, far, 100_000.0)
+        kw = dict(min_oi_near=100, min_oi_far=100, min_iv_contango=0.02, min_pop=0.01)
+        # Default MAX_MONEYNESS_PCT=0.15 → 18% away is rejected.
+        assert _eval_candidate(*args, **kw) is None
+        # Per-asset override loosens BTC to 30% → now within the window.
+        monkeypatch.setitem(cfg.ASSET_OVERRIDES, "BTC", {"MAX_MONEYNESS_PCT": 0.30})
+        assert _eval_candidate(*args, **kw) is not None

@@ -1458,4 +1458,34 @@ Six independently-shippable sub-phases. 21a and 21b are the primary fix for the 
 
 ### Status
 
-Not started.
+Complete — all six sub-phases implemented. `config.py` gains the five new Phase 21
+keys (`EV_SCORE_RANKING_CAP`, `MAX_MONEYNESS_PCT`, `MARKET_SV_REQUIRE_TWO_SIDED`,
+`CLOSE_CONFIRM_TICKS`, `REENTRY_COOLDOWN_SEC`).
+
+- **21a** — `strategy/scanner.py::scan()` ranks by `(ev_score > EV_SCORE_RANKING_CAP, -ev_score)`,
+  demoting above-cap (near-zero-debit) candidates below every in-range one; the uncapped
+  `ev_score` still gates `MIN_EV`. A plain `min(ev_score, cap)` was rejected because it would
+  still let a capped degenerate (2.0) out-rank a legitimate 0.4 candidate.
+- **21b** — `_eval_candidate` rejects strikes more than `MAX_MONEYNESS_PCT` from spot,
+  overridable per-asset via `ASSET_OVERRIDES`.
+- **21c** — `_get_market_spread_value` returns `None` (forcing the logged B-S fallback) when a
+  leg lacks a genuine two-sided quote under `MARKET_SV_REQUIRE_TWO_SIDED`; a per-`trade_id`
+  `_pending_close` counter requires `CLOSE_CONFIRM_TICKS` consecutive stop/TP ticks before
+  `_close_position` is called, reset on any tick the condition clears.
+- **21d** — `_close_position` records auto-close (stop/TP only) timestamps per
+  `(asset, strike, option_type)` in `_recent_auto_closes`; `size_candidate` gains a
+  `recent_auto_closes`/`reentry_cooldown_sec` check that rejects re-entry within the window.
+- **21e** — `close_calendar_trade()` now sets `close_status = 'closed'`;
+  `scratch/scratch_backfill_close_status.py` corrects historical rows.
+- **21f** — `config_test.py` backfilled with every Phase 17/20/21 key (exact parity with
+  `config.py`, verified by `tests/test_config_centralization.py::TestConfigTestParity`).
+
+Also fixed a regression from the prior commit that switched `core/calendar_engine.py` from
+late-binding `config.SPREAD_WARN_PCT`/`config.BREAKEVEN_SCAN_RANGE` to early imports, which
+broke `config`-override at runtime — restored to `config.X` access at the use sites.
+
+Verified by `python -m scratch.scratch_deep_itm_churn` (10 offline checks, no live orders) and
+27 new unit tests across `test_scanner.py`, `test_sizer.py`, `test_decision.py`, `test_state.py`,
+and `test_config_centralization.py`. Full suite: 588 passing (4 pre-existing Windows
+SQLite temp-dir `PermissionError` failures in `test_telegram_cmd.py` are environmental and
+unrelated).

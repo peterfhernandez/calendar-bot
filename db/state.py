@@ -235,7 +235,8 @@ def close_calendar_trade(
             """
             UPDATE calendar_trades
             SET date_close = ?, spot_close = ?, pnl = ?, result = ?,
-                close_fees = ?, notes = COALESCE(?, notes)
+                close_fees = ?, notes = COALESCE(?, notes),
+                close_status = 'closed'
             WHERE id = ?
             """,
             (date_close.isoformat(), spot_close, pnl, result, close_fees, notes, trade_id),

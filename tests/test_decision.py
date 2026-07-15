@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import config
 from data.deribit_feed import TickerSnapshot
 from strategy.decision import (
     BotState,
@@ -30,6 +31,21 @@ from strategy.scanner import CalendarCandidate
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _confirm_ticks_one():
+    """
+    Run the close/PnL/notify/retry mechanics tests at CLOSE_CONFIRM_TICKS=1,
+    which reproduces the pre-Phase-21 single-tick close behaviour those tests
+    were written against.  The Phase 21c debounce (production default: 2) is
+    exercised separately in TestCloseConfirmDebounce, which overrides this.
+    """
+    original = config.CLOSE_CONFIRM_TICKS
+    config.CLOSE_CONFIRM_TICKS = 1
+    try:
+        yield
+    finally:
+        config.CLOSE_CONFIRM_TICKS = original
 
 def _future_label(days: int) -> str:
     """Return a Deribit-style expiry label N days from today."""
@@ -2559,3 +2575,177 @@ class TestMonitorTickIsolation:
         # The failure is surfaced in the tick summary, and the tick completed
         assert "ERROR" in status.message
         assert engine._unrealized_pnl == 5.0
+
+
+# ── Phase 21c: two-sided-quote requirement for market_sv ──────────────────────
+
+class TestTwoSidedQuoteRequirement:
+    """
+    _get_market_spread_value must not trust a lone mark_price as a live mark for
+    stop/TP when MARKET_SV_REQUIRE_TWO_SIDED is on — a thin testnet book's
+    mark_price is often stale/synthetic and caused the 2026-07-14 instant churn.
+    """
+
+    def _pos(self, near_instr: str, far_instr: str) -> dict:
+        return {
+            "trade_id": 1, "asset": "BTC", "option_type": "Call", "strike": 90_000.0,
+            "expiry_near": _future_label(10), "expiry_far": _future_label(35),
+            "qty": 1.0, "net_debit": 0.02,
+            "near_instrument": near_instr, "far_instrument": far_instr,
+            "open_fees": 0.0, "close_fees": 0.0,
+        }
+
+    def _cache(self, near_snap, far_snap) -> MagicMock:
+        cache = MagicMock()
+        cache.get_spot.return_value = 90_000.0
+        cache.get_chain.return_value = [near_snap, far_snap]
+        return cache
+
+    def test_one_sided_leg_not_trusted(self, monkeypatch):
+        monkeypatch.setattr(config, "MARKET_SV_REQUIRE_TWO_SIDED", True)
+        near_instr, far_instr = "BTC-N-90000-C", "BTC-F-90000-C"
+        # Far leg has ask=0 (one-sided) but a large mark_price — must be ignored.
+        near_snap = _make_snap(near_instr, bid=0.02, ask=0.03)
+        far_snap  = _make_snap(far_instr,  bid=0.05, ask=0.0)   # mark_price=0.025 in _make_snap
+        engine, _ = _make_engine(cache=self._cache(near_snap, far_snap))
+        assert engine._get_market_spread_value(self._pos(near_instr, far_instr)) is None
+
+    def test_two_sided_legs_trusted(self, monkeypatch):
+        monkeypatch.setattr(config, "MARKET_SV_REQUIRE_TWO_SIDED", True)
+        near_instr, far_instr = "BTC-N-90000-C", "BTC-F-90000-C"
+        near_snap = _make_snap(near_instr, bid=0.02, ask=0.03)   # mid=0.025
+        far_snap  = _make_snap(far_instr,  bid=0.05, ask=0.06)   # mid=0.055
+        engine, _ = _make_engine(cache=self._cache(near_snap, far_snap))
+        sv = engine._get_market_spread_value(self._pos(near_instr, far_instr))
+        assert sv == pytest.approx((0.055 - 0.025) * 1.0)
+
+    def test_mark_price_used_when_flag_disabled(self, monkeypatch):
+        monkeypatch.setattr(config, "MARKET_SV_REQUIRE_TWO_SIDED", False)
+        near_instr, far_instr = "BTC-N-90000-C", "BTC-F-90000-C"
+        # Both legs one-sided but with mark_price (0.025) — trusted when flag off.
+        near_snap = _make_snap(near_instr, bid=0.0, ask=0.0)
+        far_snap  = _make_snap(far_instr,  bid=0.0, ask=0.0)
+        engine, _ = _make_engine(cache=self._cache(near_snap, far_snap))
+        sv = engine._get_market_spread_value(self._pos(near_instr, far_instr))
+        # far_mark - near_mark = 0.025 - 0.025 = 0 → clamped to 0.0 (not None)
+        assert sv == pytest.approx(0.0)
+
+
+# ── Phase 21c: close-confirmation debounce ────────────────────────────────────
+
+class TestCloseConfirmDebounce:
+    """
+    A stop/TP condition must hold on CLOSE_CONFIRM_TICKS consecutive monitor
+    ticks before _close_position is called, so a single noisy quote can't
+    instantly liquidate a position.
+    """
+
+    def _pos(self) -> dict:
+        return {
+            "trade_id": 7, "status": "Open", "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0,
+            "expiry_near": _future_label(10), "expiry_far": _future_label(35),
+            "qty": 1.0, "net_debit": 0.02, "spot_open": 90_000.0,
+            "near_days": 10, "far_days": 35,
+            "near_instrument": "BTC-N-90000-C", "far_instrument": "BTC-F-90000-C",
+            "open_fees": 0.0, "close_fees": 0.0,
+        }
+
+    def _engine(self):
+        engine, _ = _make_engine()
+        engine._get_iv = MagicMock(return_value=0.80)
+        engine._cache.get_spot.return_value = 90_000.0
+        engine._get_market_spread_value = MagicMock(return_value=0.005)
+        return engine
+
+    def test_single_stop_tick_defers(self, monkeypatch):
+        monkeypatch.setattr(config, "CLOSE_CONFIRM_TICKS", 2)
+        engine = self._engine()
+        engine._close_position = MagicMock(return_value="closed")
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")):
+            action, _ = engine._monitor_position(self._pos())
+        engine._close_position.assert_not_called()
+        assert engine._pending_close.get(7) == 1
+
+    def test_confirmed_stop_closes(self, monkeypatch):
+        monkeypatch.setattr(config, "CLOSE_CONFIRM_TICKS", 2)
+        engine = self._engine()
+        engine._close_position = MagicMock(return_value="closed")
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")):
+            engine._monitor_position(self._pos())   # tick 1: defer
+            engine._monitor_position(self._pos())   # tick 2: confirm -> close
+        engine._close_position.assert_called_once()
+
+    def test_tp_debounced_same_way(self, monkeypatch):
+        monkeypatch.setattr(config, "CLOSE_CONFIRM_TICKS", 2)
+        engine = self._engine()
+        engine._close_position = MagicMock(return_value="closed")
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("tp", 0.05, 1.8, "TP")):
+            engine._monitor_position(self._pos())
+            engine._close_position.assert_not_called()
+            engine._monitor_position(self._pos())
+        engine._close_position.assert_called_once()
+
+    def test_counter_resets_when_condition_clears(self, monkeypatch):
+        monkeypatch.setattr(config, "CLOSE_CONFIRM_TICKS", 2)
+        engine = self._engine()
+        engine._close_position = MagicMock(return_value="closed")
+        pos = self._pos()
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")):
+            engine._monitor_position(pos)                       # stop -> pending=1
+        assert engine._pending_close.get(7) == 1
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.0, "OK")):
+            engine._monitor_position(pos)                       # ok -> counter reset
+        assert 7 not in engine._pending_close
+        engine._close_position.assert_not_called()
+
+    def test_confirm_ticks_one_closes_immediately(self, monkeypatch):
+        monkeypatch.setattr(config, "CLOSE_CONFIRM_TICKS", 1)
+        engine = self._engine()
+        engine._close_position = MagicMock(return_value="closed")
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("stop", 0.005, 0.25, "STOP")):
+            engine._monitor_position(self._pos())
+        engine._close_position.assert_called_once()
+
+
+# ── Phase 21d: auto-close timestamp recorded for re-entry cooldown ────────────
+
+class TestAutoCloseTimestampRecorded:
+    """
+    _close_position must record a (asset, strike, option_type) -> timestamp entry
+    for stop/TP closes (feeding the sizer's re-entry cooldown), but NOT for
+    expiry/roll/drain closes.
+    """
+
+    def _pos(self) -> dict:
+        return {
+            "trade_id": 9, "status": "Open", "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0,
+            "expiry_near": _future_label(10), "expiry_far": _future_label(35),
+            "qty": 1.0, "net_debit": 0.02, "spot_open": 90_000.0,
+            "near_days": 10, "far_days": 35,
+            "near_instrument": "BTC-N-90000-C", "far_instrument": "BTC-F-90000-C",
+            "open_fees": 0.0, "close_fees": 0.0,
+        }
+
+    def test_stop_close_records_timestamp(self):
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.005
+        engine, _ = _make_engine(executor=executor)
+        with patch("strategy.decision.close_calendar_trade"):
+            engine._close_position(self._pos(), 90_000.0, "Stop-loss (25% of debit)", 0.005)
+        assert ("BTC", 90_000.0, "Call") in engine._recent_auto_closes
+
+    def test_expiry_close_does_not_record(self):
+        executor = MagicMock()
+        executor.close_spread.return_value = 0.02
+        engine, _ = _make_engine(executor=executor)
+        with patch("strategy.decision.close_calendar_trade"):
+            engine._close_position(self._pos(), 90_000.0, "Near leg expired", None)
+        assert ("BTC", 90_000.0, "Call") not in engine._recent_auto_closes

@@ -399,3 +399,34 @@ class TestPathsTimezoneDateFormat:
         finally:
             monkeypatch.delenv("BOT_DB_PATH")
             importlib.reload(config)
+
+
+# ── 21f — config_test.py parity with config.py ────────────────────────────────
+
+class TestConfigTestParity:
+    """
+    config_test.py is a full standalone config exec'd into config.py's namespace.
+    Every public UPPER_CASE constant in config.py must also be defined in
+    config_test.py so the file stays honest about what the test-mode instance
+    runs with (Phase 21f) and never silently drifts as new keys are added.
+    """
+
+    def _upper_names(self, module) -> set[str]:
+        return {k for k in dir(module) if k.isupper() and not k.startswith("_")}
+
+    def test_config_test_defines_every_config_key(self):
+        import config_test
+
+        missing = self._upper_names(config) - self._upper_names(config_test)
+        assert not missing, f"config_test.py is missing config.py keys: {sorted(missing)}"
+
+    def test_phase21_keys_present_in_both(self):
+        import config_test
+
+        for key in (
+            "EV_SCORE_RANKING_CAP", "MAX_MONEYNESS_PCT",
+            "MARKET_SV_REQUIRE_TWO_SIDED", "CLOSE_CONFIRM_TICKS",
+            "REENTRY_COOLDOWN_SEC",
+        ):
+            assert hasattr(config, key), f"config.py missing {key}"
+            assert hasattr(config_test, key), f"config_test.py missing {key}"

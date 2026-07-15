@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import config
 from core.fees import round_trip_fees
@@ -40,12 +41,14 @@ class SizeResult:
 
 
 def size_candidate(
-    candidate:          CalendarCandidate,
-    portfolio_value:    float,
-    open_positions:     list[dict],
-    max_loss_pct:       float | None = None,
-    max_positions:      int   | None = None,
-    max_total_risk_pct: float | None = None,
+    candidate:           CalendarCandidate,
+    portfolio_value:     float,
+    open_positions:      list[dict],
+    max_loss_pct:        float | None = None,
+    max_positions:       int   | None = None,
+    max_total_risk_pct:  float | None = None,
+    recent_auto_closes:  dict[tuple[str, float, str], float] | None = None,
+    reentry_cooldown_sec: float | None = None,
 ) -> SizeResult:
     """
     Compute the approved contract quantity for a calendar spread candidate.
@@ -66,6 +69,13 @@ def size_candidate(
     max_total_risk_pct
         Hard cap on total capital-at-risk across all open positions as a fraction
         of portfolio value (default: config.MAX_TOTAL_RISK_PCT).
+    recent_auto_closes
+        Optional map of (asset, strike, option_type) → UTC timestamp of the most
+        recent stop/take-profit auto-close.  A candidate matching a key that
+        closed within ``reentry_cooldown_sec`` is rejected (Phase 21d), the same
+        way a candidate correlated with a currently-open position is rejected.
+    reentry_cooldown_sec
+        Cooldown window in seconds (default: config.REENTRY_COOLDOWN_SEC).
 
     Returns
     -------
@@ -75,6 +85,9 @@ def size_candidate(
     max_loss_pct       = max_loss_pct       if max_loss_pct       is not None else config.MAX_LOSS_PCT
     max_positions      = max_positions      if max_positions       is not None else config.MAX_POSITIONS
     max_total_risk_pct = max_total_risk_pct if max_total_risk_pct is not None else config.MAX_TOTAL_RISK_PCT
+    reentry_cooldown_sec = (
+        reentry_cooldown_sec if reentry_cooldown_sec is not None else config.REENTRY_COOLDOWN_SEC
+    )
 
     # ── Concurrent position limit ─────────────────────────────────────────────
     if len(open_positions) >= max_positions:
@@ -82,6 +95,28 @@ def size_candidate(
             qty=0.0,
             reason=f"Max positions reached ({len(open_positions)}/{max_positions})",
         )
+
+    # ── Re-entry cooldown (Phase 21d) ─────────────────────────────────────────
+    # Block re-selecting an instrument that just auto-closed (stop/TP).  Combined
+    # with the correlation check below, this stops the runaway churn loop where a
+    # near-zero-debit position trips a false stop/TP and is immediately reopened
+    # on the next scan (the correlation check alone can't catch it, since it only
+    # inspects currently-*open* positions and the churned one has already closed).
+    if recent_auto_closes and reentry_cooldown_sec > 0:
+        key = (candidate.asset, float(candidate.strike), candidate.option_type)
+        closed_ts = recent_auto_closes.get(key)
+        if closed_ts is not None:
+            elapsed = datetime.now(timezone.utc).timestamp() - closed_ts
+            if elapsed < reentry_cooldown_sec:
+                return SizeResult(
+                    qty=0.0,
+                    reason=(
+                        f"Re-entry cooldown active: {candidate.asset} "
+                        f"{candidate.option_type} strike={candidate.strike:.0f} "
+                        f"auto-closed {elapsed:.0f}s ago "
+                        f"(< {reentry_cooldown_sec:.0f}s cooldown)"
+                    ),
+                )
 
     # ── Correlation check ─────────────────────────────────────────────────────
     for pos in open_positions:

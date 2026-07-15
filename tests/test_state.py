@@ -95,6 +95,23 @@ class TestCloseCalendarTrade:
         assert closed.spot_close == 101_000.0
         assert closed.close_fees == 5.0
 
+    def test_sets_close_status_closed(self, db):
+        """Phase 21e: the normal auto-close path must set close_status='closed'
+        (previously only mark_position_manually_closed did, so auto-closed trades
+        wrongly kept close_status='open')."""
+        trade = _open_trade(db)
+        assert trade.close_status == "open"
+        closed = close_calendar_trade(
+            trade_id=trade.id,
+            date_close=date(2026, 6, 7),
+            spot_close=101_000.0,
+            pnl=150.0,
+            result="Win (Auto TP)",
+            close_fees=5.0,
+            db_path=db,
+        )
+        assert closed.close_status == "closed"
+
     def test_raises_for_unknown_id(self, db):
         with pytest.raises(ValueError, match="not found"):
             close_calendar_trade(
