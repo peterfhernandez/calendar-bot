@@ -218,6 +218,8 @@ class DecisionEngine:
         self._rolled_this_tick: set[int] = set()  # trade IDs rolled in the current monitor tick; prevents double-roll within one pass
         self._close_roll_failures: dict[int, int] = {}  # trade_id → attempt count; prevents unbounded close/roll retry loops
         self._notified_stuck: set[int] = set()  # trade IDs already notified about being stuck; prevents spam
+        self._pending_close: dict[int, int] = {}  # trade_id → consecutive stop/TP signals; debounces single-tick noise (Phase 21c)
+        self._recent_auto_closes: dict[tuple[str, float, str], float] = {}  # (asset, strike, option_type) → UTC ts of last auto-close; feeds re-entry cooldown (Phase 21d)
         self._paused: bool = False
         self._start_time: datetime = datetime.now(timezone.utc)
 
@@ -352,7 +354,12 @@ class DecisionEngine:
                 )
                 continue
 
-            size = size_candidate(candidate, self._portfolio_value, open_positions)
+            size = size_candidate(
+                candidate,
+                self._portfolio_value,
+                open_positions,
+                recent_auto_closes=self._recent_auto_closes,
+            )
             if size.qty <= 0:
                 logger.debug("RANK skip: %s", size.reason)
                 continue
@@ -428,6 +435,7 @@ class DecisionEngine:
             self._just_entered.clear()
             self._rolled_this_tick.clear()
             self._close_roll_failures.clear()  # no open positions, clear all failure counters
+            self._pending_close.clear()        # and any pending close-confirmation counters
             return self._status("Monitor: no open positions.", [])
 
         self._state = BotState.MONITOR
@@ -464,9 +472,12 @@ class DecisionEngine:
 
         # Clean up stale failure counters for closed positions
         open_trade_ids = {p.get("trade_id") for p in open_positions if p.get("trade_id")}
-        closed_trades = set(self._close_roll_failures.keys()) - open_trade_ids
+        closed_trades = (
+            set(self._close_roll_failures.keys()) | set(self._pending_close.keys())
+        ) - open_trade_ids
         for trade_id in closed_trades:
             self._close_roll_failures.pop(trade_id, None)
+            self._pending_close.pop(trade_id, None)
         self._state = BotState.IDLE if not open_positions else BotState.MONITOR
 
         if skipped_no_iv and not actions:
@@ -800,33 +811,53 @@ class DecisionEngine:
             except Exception as exc:
                 logger.debug("Failed to update last_spread_value for trade_id=%d: %s", trade_id, exc)
 
-        if status == "stop":
+        if status in ("stop", "tp"):
+            # Debounce (Phase 21c): a stop/TP condition must hold on
+            # CLOSE_CONFIRM_TICKS consecutive monitor ticks before the position
+            # is actually closed, so a single noisy quote can no longer instantly
+            # liquidate it.  The counter is reset on any tick where neither
+            # condition fires (see the held/roll paths below) and cleared on close.
+            confirm_ticks = config.CLOSE_CONFIRM_TICKS
+            pending = self._pending_close.get(trade_id, 0) + 1
+            if pending < confirm_ticks:
+                self._pending_close[trade_id] = pending
+                logger.info(
+                    "trade_id=%d %s signal %d/%d — deferring close pending confirmation",
+                    trade_id, status, pending, confirm_ticks,
+                )
+                # Position still held — report MTM so daily_pnl stays accurate.
+                unrealized = (
+                    sv
+                    - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
+                    - pos.get("open_fees", 0.0)
+                )
+                return None, unrealized
+
+            # Confirmed over consecutive ticks — clear the counter and close.
+            self._pending_close.pop(trade_id, None)
+
+            if status == "stop":
+                reason, intended, label = f"Stop-loss ({pct*100:.0f}% of debit)", "Stop-loss trigger", "stop-loss"
+            else:
+                reason, intended, label = f"Take-profit ({pct*100:.0f}% of debit)", "Take-profit trigger", "take-profit"
+
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
                 return self._mark_stuck_and_notify(
-                    pos, "Stop-loss trigger", "stop-loss", failure_count
+                    pos, intended, label, failure_count
                 ), 0.0
 
-            result = self._close_position(pos, spot, f"Stop-loss ({pct*100:.0f}% of debit)", sv)
+            result = self._close_position(pos, spot, reason, sv)
             if "FAILED" in result:
                 self._close_roll_failures[trade_id] = failure_count + 1
             else:
                 self._close_roll_failures.pop(trade_id, None)
             return result, 0.0
 
-        if status == "tp":
-            failure_count = self._close_roll_failures.get(trade_id, 0)
-            if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
-                return self._mark_stuck_and_notify(
-                    pos, "Take-profit trigger", "take-profit", failure_count
-                ), 0.0
-
-            result = self._close_position(pos, spot, f"Take-profit ({pct*100:.0f}% of debit)", sv)
-            if "FAILED" in result:
-                self._close_roll_failures[trade_id] = failure_count + 1
-            else:
-                self._close_roll_failures.pop(trade_id, None)
-            return result, 0.0
+        # Neither stop nor TP fired this tick — reset the close-confirmation
+        # counter so any future close signal must again be confirmed over
+        # consecutive ticks (Phase 21c).
+        self._pending_close.pop(trade_id, None)
 
         # Roll trigger: near leg approaching expiry and no exit signal yet.
         # In drain mode, skip rolling and close instead.
@@ -1022,8 +1053,21 @@ class DecisionEngine:
             except Exception as exc:
                 logger.error("⚠️  NOTIFICATION FAILED on close of trade_id=%s: %s", trade_id, exc)
 
+        # Record auto-close (stop/TP) timestamp for the re-entry cooldown
+        # (Phase 21d) so the scanner can't immediately reopen the same
+        # degenerate instrument on the next scan.  Expiry/roll-fail/drain closes
+        # are excluded — they are not signals of a false-trigger churn loop.
+        if "Stop-loss" in reason or "Take-profit" in reason:
+            key = (
+                str(pos.get("asset", "")),
+                float(pos.get("strike", 0.0) or 0.0),
+                str(pos.get("option_type", "Call")),
+            )
+            self._recent_auto_closes[key] = datetime.now(timezone.utc).timestamp()
+
         # Clear any accumulated roll/close failure count for this position
         self._close_roll_failures.pop(trade_id, None)
+        self._pending_close.pop(trade_id, None)
         return f"trade_id={trade_id} {result} pnl={pnl:+.2f} ({reason})"
 
     def _try_roll(self, pos: dict, spot: float) -> bool:
@@ -1230,18 +1274,26 @@ class DecisionEngine:
         if not near_instrument or not far_instrument:
             return None
 
+        # Require genuine two-sided quotes before trusting a live mark for
+        # stop/TP (Phase 21c).  On a thin testnet book a lone mark_price is often
+        # stale or synthetic; substituting it produced the 2026-07-14 spurious
+        # instant-TP/stop churn.  When require_two_sided is on and either leg
+        # lacks bid > 0 AND ask > 0, return None so the logged Black-Scholes
+        # fallback is used instead.
+        require_two_sided = config.MARKET_SV_REQUIRE_TWO_SIDED
+
         chain = self._cache.get_chain(pos["asset"])
         near_mid = far_mid = None
         for snap in chain:
             if snap.instrument == near_instrument:
                 if snap.bid > 0 and snap.ask > 0:
                     near_mid = (snap.bid + snap.ask) / 2
-                elif snap.mark_price > 0:
+                elif not require_two_sided and snap.mark_price > 0:
                     near_mid = snap.mark_price
             elif snap.instrument == far_instrument:
                 if snap.bid > 0 and snap.ask > 0:
                     far_mid = (snap.bid + snap.ask) / 2
-                elif snap.mark_price > 0:
+                elif not require_two_sided and snap.mark_price > 0:
                     far_mid = snap.mark_price
 
         if near_mid is None or far_mid is None:

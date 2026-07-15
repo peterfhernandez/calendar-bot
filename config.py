@@ -47,6 +47,42 @@ MIN_EV          = 0.25   # minimum expected value as a fraction of net_debit.
                          # e.g. a candidate with net_debit=0.02 BTC and ev_score=0.25
                          # has an expected profit of 25% of the debit (0.005 BTC per contract).
 
+# ── Phase 21 — deep-ITM/OTM churn guards ──────────────────────────────────────
+# A calendar spread struck deep in- or out-of-the-money has almost no time-value
+# difference between its two legs, so net_debit collapses toward zero.  The EV
+# ranking (ev_net / net_debit) then blows up to values orders of magnitude above
+# any real candidate, and the tiny debit makes percentage-of-debit stop/TP
+# thresholds hypersensitive to ordinary quote noise.  These parameters bound
+# both effects.  See BOT_PLAN.md / BOT_TODO.md Phase 21.
+
+# Ceiling on the value used to *sort* candidates in strategy/scanner.py::scan().
+# The uncapped ev_score is still what MIN_EV compares against for accept/reject —
+# this only stops a near-zero-debit singularity from out-ranking legitimate
+# near-the-money setups.
+EV_SCORE_RANKING_CAP = 2.0
+
+# Reject candidates whose strike is more than this fraction away from spot.
+# Deep ITM/OTM strikes have converged near/far pricing, so the near/far theta
+# differential the strategy harvests doesn't meaningfully exist there.
+# Overridable per-asset via ASSET_OVERRIDES.
+MAX_MONEYNESS_PCT = 0.15
+
+# When True, _get_market_spread_value requires a genuine two-sided quote
+# (bid > 0 AND ask > 0) on both legs before trusting a live mark for stop/TP;
+# otherwise it returns None and the logged Black-Scholes fallback is used.
+# On a thin testnet book a lone mark_price is often stale or synthetic.
+MARKET_SV_REQUIRE_TWO_SIDED = True
+
+# A stop/TP condition must be observed on this many consecutive monitor ticks
+# before the position is actually closed — debounces a single noisy quote from
+# instantly liquidating a position.
+CLOSE_CONFIRM_TICKS = 2
+
+# After an auto-close (stop or take-profit), block re-entry of the same
+# (asset, strike, option_type) for this many seconds so a fast false stop/TP
+# cannot immediately reopen the same degenerate instrument on the next scan.
+REENTRY_COOLDOWN_SEC = 1800
+
 # Per-asset threshold overrides.
 # Any key present here takes precedence over the corresponding global default
 # for that specific asset.  SOL options are significantly thinner than BTC/ETH:

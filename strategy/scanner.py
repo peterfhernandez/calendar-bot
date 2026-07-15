@@ -186,6 +186,21 @@ def _eval_candidate(
     """
     Evaluate a single near/far pair. Returns None if any filter fails.
     """
+    # ── Moneyness filter (Phase 21b) ──────────────────────────────────────────
+    # Reject strikes too far from spot: deep ITM/OTM calendar spreads have
+    # converged near/far pricing (near-zero net_debit), so the theta differential
+    # the strategy harvests doesn't meaningfully exist and the near-zero debit
+    # destabilises both EV ranking and percentage-of-debit stop/TP thresholds.
+    if spot > 0:
+        max_moneyness = config.asset_config(asset, "MAX_MONEYNESS_PCT")
+        moneyness = abs(strike - spot) / spot
+        if moneyness > max_moneyness:
+            logger.debug(
+                "%s %s strike=%.0f rejected: moneyness %.3f > %.3f (spot=%.0f)",
+                asset, opt_type, strike, moneyness, max_moneyness, spot,
+            )
+            return None
+
     # ── Coarse liquidity filter ───────────────────────────────────────────────
     # Reject instruments with no quoted market — zero bid or zero ask means
     # no real liquidity and entry cost cannot be estimated reliably.
@@ -406,6 +421,17 @@ def scan(
                     if result is not None:
                         candidates.append(result)
 
-    candidates.sort(key=lambda c: c.ev_score, reverse=True)
+    # Rank by EV score, but treat an ev_score above EV_SCORE_RANKING_CAP as the
+    # tell-tale of a near-zero-debit degeneracy (its ev_net/net_debit ratio blows
+    # up two to three orders of magnitude) rather than a genuinely superb setup.
+    # Such candidates are demoted below every in-range candidate so they can no
+    # longer win the scan, while in-range candidates keep their normal
+    # highest-EV-first order.  The uncapped ev_score is left untouched — MIN_EV
+    # in the decision engine still gates accept/reject against the true value;
+    # only ranking order changes here.
+    cap = config.EV_SCORE_RANKING_CAP
+    # Sort key (ascending): (above_cap?, -ev_score) — in-range (False) before
+    # suspected-degenerate (True); within each tier, higher ev_score first.
+    candidates.sort(key=lambda c: (c.ev_score > cap, -c.ev_score))
     logger.info("Scan complete: %d candidates across %s", len(candidates), assets)
     return candidates
