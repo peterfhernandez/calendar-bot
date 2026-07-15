@@ -22,8 +22,8 @@ check_calendar_status(spot, iv, near_days_left, far_days_left, op)
     Evaluate stop / take-profit / warn conditions for an open position.
 """
 
-import config
-from config import RISK_FREE_RATE, STOP_PCT, TAKE_PROFIT_PCT
+from config import BREAKEVEN_SCAN_STEPS, BREAKEVEN_SCAN_RANGE, SPREAD_WARN_PCT, RISK_FREE_RATE, STOP_PCT, TAKE_PROFIT_PCT 
+ 
 from core.pricing import bs_call, bs_put
 
 
@@ -93,7 +93,7 @@ def find_breakevens(
     qty: float,
     net_debit: float,
     option_type: str,
-    n_steps: int = config.BREAKEVEN_SCAN_STEPS,
+    n_steps: int = BREAKEVEN_SCAN_STEPS,
 ) -> tuple[float, float]:
     """
     Numerically locate lower and upper breakeven prices at near-leg expiry.
@@ -101,8 +101,8 @@ def find_breakevens(
     Scans spot * config.BREAKEVEN_SCAN_RANGE for sign changes in P&L.
     Returns (be_lo, be_hi); both are 0.0 if no crossings are found.
     """
-    lo = spot * config.BREAKEVEN_SCAN_RANGE[0]
-    hi = spot * config.BREAKEVEN_SCAN_RANGE[1]
+    lo = spot * BREAKEVEN_SCAN_RANGE[0]
+    hi = spot * BREAKEVEN_SCAN_RANGE[1]
     step = (hi - lo) / n_steps
     prices = [lo + i * step for i in range(n_steps + 1)]
     pnls = [
@@ -184,7 +184,7 @@ def check_calendar_status(
         )
         return "tp", sv, pct, msg
 
-    if pct <= config.SPREAD_WARN_PCT:
+    if pct <= SPREAD_WARN_PCT:
         msg = (
             f"WARN  spread worth ${sv:.2f} ({pct*100:.0f}% of debit).  "
             f"Hard stop at {STOP_PCT*100:.0f}%."

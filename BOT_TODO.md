@@ -1169,3 +1169,55 @@ In **test/live mode**:
 - [x] Update `telegram_cmd/pnl_chart.py` to source its date format from `config.DATE_FORMAT`
 - [x] Confirm `bot.py`'s `--env`/`--db`/`--log`/`--config` pre-parser env-var bootstrap (`BOT_ENV_FILE`/`BOT_DB_PATH`/`BOT_LOG_FILE`/`BOT_CONFIG_FILE`) still works unchanged — this shim intentionally predates config.py's import and is not part of the bypass being fixed
 - [x] Update/add tests for `db/state.py` path/timezone sourcing
+
+## Phase 21 — Fix Runaway Deep-ITM Calendar Churn & Close-Status Tracking Bug
+
+**Status:** Not started. Root-cause detail in BOT_PLAN.md Phase 21. Found by analysing the 2026-07-14 paper-mode run (`db/calendar_bot.db`, `logs/bot.log`): 131 trades opened and closed same-day (91 on ETH 1400 Call, 23 on two deep-ITM BTC put strikes), net phantom paper P&L +$224,247. Cause: `strategy/scanner.py`'s EV ranking divides by `net_debit`, which is near-zero for deep ITM/OTM calendar spreads, producing ratios 2-3 orders of magnitude above real candidates and always winning the ranking; those same near-zero-debit positions then trip the percentage-of-debit stop/TP thresholds on ordinary quote noise within a single 60-second monitor tick, close, and get re-entered on the very next 5-minute scan since the correlation gate only checks currently-open positions. A separate, unrelated bug was also found: `db/state.py::close_calendar_trade()` (the normal auto-close path) never sets `close_status`, so every auto-closed trade still shows `close_status='open'` in the database despite `result`/`date_close`/`pnl` being correct. Also found in passing: `config_test.py` was never updated for Phase 20 and is missing ~45 config keys that phase added to `config.py` (harmless today since `config_test.py` is `exec`'d into `config.py`'s namespace and missing keys just inherit, but it's drifted from the parity the file's own header comment implies).
+
+### 21a — Cap the EV ranking sort key
+
+- [ ] Add `EV_SCORE_RANKING_CAP` to `config.py` (e.g. `2.0`)
+- [ ] In `strategy/scanner.py::scan()`, sort candidates by `min(c.ev_score, config.EV_SCORE_RANKING_CAP)` instead of raw `c.ev_score`
+- [ ] Confirm the `MIN_EV` accept/reject gate in `strategy/decision.py` still compares against the uncapped `ev_score` — only ranking order changes
+- [ ] Add a regression test: a synthetic near-zero-debit candidate with `ev_ratio=17.0` must not sort ahead of a normal candidate with `ev_ratio=0.4`
+
+### 21b — Add a moneyness entry filter
+
+- [ ] Add `MAX_MONEYNESS_PCT` to `config.py` (e.g. `0.15`)
+- [ ] In `strategy/scanner.py::_eval_candidate`, reject candidates whose `abs(strike - spot) / spot` exceeds `config.asset_config(asset, "MAX_MONEYNESS_PCT")`
+- [ ] Confirm the filter is overridable per-asset via the existing `ASSET_OVERRIDES` mechanism
+- [ ] Add regression tests: a deep-ITM/OTM candidate is rejected; a near-ATM candidate still passes
+
+### 21c — Require two-sided quotes for mark-to-market trust, and debounce close triggers
+
+- [ ] Add `MARKET_SV_REQUIRE_TWO_SIDED` (default `True`) and `CLOSE_CONFIRM_TICKS` (default `2`) to `config.py`
+- [ ] Update `strategy/decision.py::_get_market_spread_value` to return `None` (forcing the existing, logged B-S fallback) when either leg lacks a genuine `bid > 0 and ask > 0` quote, instead of substituting `mark_price`, unless `MARKET_SV_REQUIRE_TWO_SIDED` is `False`
+- [ ] Add a per-`trade_id` pending-confirmation counter in the decision engine: a stop/TP condition must hold on `CLOSE_CONFIRM_TICKS` consecutive monitor ticks before `_close_position` is called; reset the counter on any tick where the condition doesn't hold
+- [ ] Add regression tests: a single-tick spurious stop/TP reading does not close the position; the same reading held for `CLOSE_CONFIRM_TICKS` ticks does; a one-sided quote (bid=0 or ask=0) is not trusted as `market_sv`
+
+### 21d — Per-instrument re-entry cooldown
+
+- [ ] Add `REENTRY_COOLDOWN_SEC` to `config.py` (default `1800`)
+- [ ] Record the timestamp of each auto-close (stop or take-profit) per `(asset, strike, option_type)` in `strategy/decision.py`
+- [ ] Update `strategy/sizer.py::size_candidate` to reject a candidate matching a recently auto-closed `(asset, strike, option_type)` within the cooldown window, alongside the existing correlated-open-position check
+- [ ] Add a regression test: a candidate matching an instrument auto-closed 5 minutes ago is rejected; the same candidate after the cooldown window has elapsed is accepted
+
+### 21e — Fix `close_status` and backfill historical rows
+
+- [ ] Update `db/state.py::close_calendar_trade()` to set `close_status = 'closed'` alongside the fields it already updates
+- [ ] Add `scratch/scratch_backfill_close_status.py` — one-off script that sets `close_status = 'closed'` for existing rows where `result` is a terminal status but `close_status` is still `'open'`
+- [ ] Run the backfill once against `db/calendar_bot.db` to correct the 2026-07-14 backlog
+- [ ] Add a regression test asserting `close_calendar_trade()` sets `close_status = 'closed'`
+- [ ] Add `scratch/scratch_deep_itm_churn.py` — offline demo reproducing the 2026-07-14 failure against the pre-fix logic and showing 21a–21d each independently prevent it
+
+### 21f — Backport Phase 20 config keys into `config_test.py`
+
+- [ ] Add the `LOGGING` section keys to `config_test.py`: `LOG_LEVEL`, `LOG_FORMAT`, `LOG_DATE_FORMAT`, `LOG_FILE_MAX_BYTES`, `LOG_BACKUP_COUNT`, `LOG_DIR`, `NOISY_LOGGERS`, `LOG_LEVEL_OVERRIDES`
+- [ ] Add the network/timeout/retry/alert keys to `config_test.py`: `DERIBIT_WS_PING_INTERVAL`, `DERIBIT_WS_PING_TIMEOUT`, `DERIBIT_WS_OPEN_TIMEOUT`, `DERIBIT_WS_MAX_SIZE`, `RPC_TIMEOUT_SEC`, `ORDER_RETRY_DELAYS`, `ALERT_COOLDOWN_SEC`, `SMTP_TIMEOUT_SEC`, `TELEGRAM_TIMEOUT_SEC`, `SMTP_FROM`
+- [ ] Add the 6 previously-fake keys (now real in `config.py`) to `config_test.py`: `SLIPPAGE_LIMIT_PCT`, `ORDER_TIMEOUT_SEC`, `MAX_ORDER_RETRIES`, `STUCK_ORDER_TIMEOUT_SEC`, `INITIAL_CAPITAL`, `COLLECTOR_INTERVAL_SEC`
+- [ ] Add the business-logic magic-number keys to `config_test.py`: `STRIKE_INCREMENT_TABLE`, `STRIKE_INCREMENT_DEFAULT`, `FAR_LEG_SPREAD_TABLE`, `FAR_LEG_SPREAD_DEFAULT`, `FAR_LEG_LIQUIDITY_PENALTY_PER_30D`, `NEAR_DAY_TOLERANCE`, `FAR_DAY_TOLERANCE`, `ROLL_TRIGGER_DAYS`, `POSITION_FAILURE_RETRY_CAP`, `RECONCILE_THRESHOLD_PCT`, `MIN_CONTRACT_SIZE`, `DEFAULT_PORTFOLIO_VALUE`, `EV_SAMPLE_COUNT`, `BREAKEVEN_SCAN_STEPS`, `BREAKEVEN_SCAN_RANGE`, `SPREAD_WARN_PCT`, `STRIKE_CORRELATION_PCT`
+- [ ] Add the paths/timezone/date-format keys to `config_test.py`: `DB_PATH`, `HISTORIC_DATA_DB_PATH`, `TIMEZONE`, `DATE_FORMAT`
+- [ ] Set every backported value to match `config.py`'s default exactly unless there is a specific, commented test-mode reason to diverge (consistent with the file's existing header comment documenting its handful of intentional overrides)
+- [ ] Once 21a–21d land, add their new keys (`EV_SCORE_RANKING_CAP`, `MAX_MONEYNESS_PCT`, `MARKET_SV_REQUIRE_TWO_SIDED`, `CLOSE_CONFIRM_TICKS`, `REENTRY_COOLDOWN_SEC`) to `config_test.py` too, so it launches in sync with `config.py` from the start
+- [ ] Add a test to `tests/test_config_centralization.py` asserting every key defined in `config.py` is also defined in `config_test.py` (module-level name diff), to catch this drift automatically in future phases
+- [ ] Note (no action needed): `MAX_MARGIN_UTILIZATION_PCT`, `MARGIN_GATE_ENABLED`, `MARGIN_GATE_REQUIRED_LIVE` (Phase 17) are also missing from `config_test.py` but predate Phase 20 and are out of scope here
