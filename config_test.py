@@ -267,6 +267,11 @@ SPREAD_WARN_PCT = 0.70
 ROLL_TRIGGER_DAYS          = 2
 POSITION_FAILURE_RETRY_CAP = 3
 
+# ── Phase 22 — close/roll price rejection + premature-roll guards ──────────────
+CLOSE_PRICE_CROSS_BUFFER_PCT = 0.02   # buffer when crossing bid/ask to close/roll
+TICK_SIZE_FETCH_RETRIES      = 1      # extra tick-size fetch attempts before fallback
+MIN_ROLL_NEAR_FAR_GAP_DAYS   = 1      # new near expiry must precede far by this many days
+
 MIN_CONTRACT_SIZE      = 0.1
 STRIKE_CORRELATION_PCT = 0.05
 

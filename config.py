@@ -313,6 +313,26 @@ SPREAD_WARN_PCT = 0.70
 ROLL_TRIGGER_DAYS          = 2   # days before near-leg expiry at which rolling is considered
 POSITION_FAILURE_RETRY_CAP = 3   # failed close/roll attempts before a position is marked stuck
 
+# ── Phase 22 — close/roll price rejection + premature-roll guards ──────────────
+# Buffer applied when crossing the order book to close or roll a leg.  Close
+# prices are derived from the live best bid/ask (lift the ask to buy back the
+# short near leg, hit the bid to sell the long far leg) plus/minus this buffer
+# so the marketable limit fills reliably — replacing the old synthetic
+# mid × 1.02 / mid × 0.98 prices that produced off-tick "-32602 Invalid params"
+# rejections (execution/executor.py).
+CLOSE_PRICE_CROSS_BUFFER_PCT = 0.02
+
+# Number of extra attempts to fetch an instrument's tick size before falling
+# back to generic 4-decimal rounding.  A tick-size fetch failure is logged loud
+# (naming the instrument) rather than swallowed (execution/executor.py).
+TICK_SIZE_FETCH_RETRIES = 1
+
+# A roll candidate's new near-leg expiry must be earlier than the position's own
+# far-leg expiry by at least this many days.  Guards against rolling into a
+# same-expiry (zero-width) calendar spread that collapses to $0.00 and instantly
+# trips a large stop-loss (strategy/decision.py::_try_roll, Phase 22f).
+MIN_ROLL_NEAR_FAR_GAP_DAYS = 1
+
 # Position sizing (strategy/sizer.py, execution/executor.py)
 MIN_CONTRACT_SIZE      = 0.1    # Deribit minimum option contract increment (BTC/ETH)
 STRIKE_CORRELATION_PCT = 0.05   # positions within ±5% of an open strike are correlated

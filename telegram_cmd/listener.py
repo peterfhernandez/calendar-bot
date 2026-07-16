@@ -196,6 +196,26 @@ class TelegramCommandListener:
         app.add_handler(CommandHandler("pnl",               cmd_pnl))
         app.add_handler(CommandHandler("help",              cmd_help))
 
+        # Global error handler (Phase 22c): python-telegram-bot's default for an
+        # unhandled exception raised inside a command callback is to log it and
+        # send NO reply, leaving the operator with silence.  Register a handler
+        # so any future handler bug results in a generic reply instead.
+        async def _on_error(update, context) -> None:
+            logger.error(
+                "Unhandled error in Telegram command handler: %s",
+                context.error,
+                exc_info=context.error,
+            )
+            try:
+                if update is not None and getattr(update, "effective_message", None) is not None:
+                    await update.effective_message.reply_text(
+                        "Something went wrong processing that command."
+                    )
+            except Exception as exc:  # pragma: no cover — reply failure is non-fatal
+                logger.warning("Failed to send error reply: %s", exc)
+
+        app.add_error_handler(_on_error)
+
         return app
 
     async def start(self) -> None:

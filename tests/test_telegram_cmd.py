@@ -201,7 +201,7 @@ class TestHandlePositions:
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trade = _make_trade(ev_score=0.25)
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[trade]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -222,7 +222,7 @@ class TestHandlePositions:
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trade = _make_trade(ev_score_initial=0.0)
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[trade]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -237,7 +237,7 @@ class TestHandlePositions:
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trade_put = _make_trade(option_type="Put")
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade_put]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[trade_put]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -253,7 +253,7 @@ class TestHandlePositions:
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
         trade = _make_trade()
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[trade]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -273,7 +273,7 @@ class TestHandlePositions:
         # spread_val = (0.0325 - 0.0125) * 1.0 = 0.02
         # unr_pnl = 0.02 - 0.025 = -0.005
         trade = _make_trade(net_debit=0.02, qty=1.0, open_fees=0.005)
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[trade]):
             await handlers.handle_positions(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -514,7 +514,7 @@ class TestHandlePortfolio:
         db_path = Path(tempfile.mktemp(suffix=".db"))
         init_db(db_path)
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[]):
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0].lower()
@@ -528,7 +528,7 @@ class TestHandlePortfolio:
         cache   = _make_cache()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[_make_trade(ev_score=0.30)]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[_make_trade(ev_score=0.30)]):
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -546,7 +546,7 @@ class TestHandlePortfolio:
         cache   = _make_cache()
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[_make_trade()]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[_make_trade()]):
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -561,7 +561,7 @@ class TestHandlePortfolio:
         cache.get.return_value = None
         db_path = Path(tempfile.mktemp(suffix=".db"))
 
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[_make_trade()]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[_make_trade()]):
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -579,7 +579,7 @@ class TestHandlePortfolio:
         # net_debit=0.02, qty=1.0, open_fees=0.005
         # pnl = 0.02 - 0.02*1.0 - 0.005 = -0.005
         trade = _make_trade(net_debit=0.02, qty=1.0, open_fees=0.005)
-        with patch("telegram_cmd.handlers.get_open_trades", return_value=[trade]):
+        with patch("telegram_cmd.handlers.get_visible_positions", return_value=[trade]):
             await handlers.handle_portfolio(update, context, cache, db_path)
 
         text = update.message.reply_text.call_args[0][0]
@@ -1355,3 +1355,130 @@ class TestHandlePnl:
         assert "Unrealized" in caption
         assert "Total" in caption
         assert "1 open" in caption
+
+
+# ── Phase 22b — stuck-position visibility in /positions and /portfolio ─────────
+
+def _make_stuck_trade(trade_id: int = 11, reason: str = "far close rejected") -> CalendarTrade:
+    t = _make_trade(trade_id=trade_id)
+    t.close_status = "close_stuck"
+    t.close_error_reason = reason
+    return t
+
+
+class TestStuckPositionVisibility:
+    @pytest.mark.asyncio
+    async def test_positions_flags_stuck(self):
+        update, context, cache = _make_update(), _make_context(), _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        with patch("telegram_cmd.handlers.get_visible_positions",
+                   return_value=[_make_stuck_trade()]):
+            await handlers.handle_positions(update, context, cache, db_path)
+        text = update.message.reply_text.call_args[0][0]
+        assert "STUCK" in text
+        assert "far close rejected" in text
+
+    @pytest.mark.asyncio
+    async def test_portfolio_flags_stuck(self):
+        update, context, cache = _make_update(), _make_context(), _make_cache()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        with patch("telegram_cmd.handlers.get_visible_positions",
+                   return_value=[_make_stuck_trade()]):
+            await handlers.handle_portfolio(update, context, cache, db_path)
+        text = update.message.reply_text.call_args[0][0]
+        assert "STUCK" in text
+        assert "far close rejected" in text
+
+
+# ── Phase 22c — /info hardening and global error handler ──────────────────────
+
+class TestHandleInfoHardening:
+    @pytest.mark.asyncio
+    async def test_info_zero_cost_basis_replies_not_silent(self):
+        """A trade with cost_basis == 0 must not ZeroDivisionError into silence."""
+        from db.state import create_calendar_trade, get_connection
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            init_db(db_path)
+            trade_id = create_calendar_trade(
+                asset="BTC",
+                date_open=datetime.now(timezone.utc).date(),
+                option_type="Call",
+                strike=95_000.0,
+                expiry_near="2026-07-03",
+                expiry_far="2026-07-31",
+                near_days=3,
+                far_days=31,
+                qty=1.0,
+                spot_open=100_000.0,
+                near_prem=0.0,
+                far_prem=0.0,
+                net_debit=0.0,       # cost_basis = net_debit*qty + open_fees = 0
+                near_instrument="BTC-3JUL26-95000-C",
+                far_instrument="BTC-31JUL26-95000-C",
+                open_fees=0.0,
+                db_path=db_path,
+            ).id
+
+            update = _make_update()
+            context = _make_context(args=[f"trade_id={trade_id}"])
+
+            near_snap = MagicMock(bid=0.014, ask=0.016)
+            far_snap = MagicMock(bid=0.024, ask=0.026)
+            cache = MagicMock()
+            cache.get.side_effect = lambda inst: near_snap if "3JUL" in inst else far_snap
+
+            await handlers.handle_info(update, context, cache, db_path)
+
+            update.message.reply_text.assert_called_once()
+            response = update.message.reply_text.call_args[0][0]
+            # A real reply is sent (no silent ZeroDivisionError).
+            assert "cost basis is $0.00" in response
+            try:
+                get_connection(db_path).close()
+            except Exception:
+                pass
+
+
+class TestGlobalErrorHandler:
+    @pytest.mark.asyncio
+    async def test_error_handler_registered_and_replies(self, monkeypatch):
+        """_build_app registers a global error handler that replies instead of
+        staying silent when a command handler raises (Phase 22c)."""
+        monkeypatch.setattr(config, "TELEGRAM_TOKEN", "fake-token")
+
+        engine = _make_engine()
+        cache = _make_cache()
+        listener = TelegramCommandListener(engine, cache, Path(tempfile.mktemp(suffix=".db")))
+
+        mock_app = MagicMock()
+        mock_app.add_handler = MagicMock()
+        mock_app.add_error_handler = MagicMock()
+
+        class MockBuilder:
+            def token(self, t):                       return self
+            def get_updates_connect_timeout(self, v): return self
+            def get_updates_read_timeout(self, v):    return self
+            def build(self):                          return mock_app
+
+        mock_app_cls = MagicMock()
+        mock_app_cls.builder.return_value = MockBuilder()
+        mock_ext = MagicMock()
+        mock_ext.Application = mock_app_cls
+        mock_ext.CommandHandler = MagicMock()
+
+        with patch("config.TELEGRAM_TOKEN", "fake-token"), \
+             patch.dict("sys.modules", {"telegram.ext": mock_ext}):
+            listener._build_app()
+
+        mock_app.add_error_handler.assert_called_once()
+        error_handler = mock_app.add_error_handler.call_args[0][0]
+
+        # Route a simulated unhandled exception through it — a reply must be sent.
+        update = _make_update()
+        update.effective_message = update.message
+        ctx = MagicMock()
+        ctx.error = ValueError("boom")
+        await error_handler(update, ctx)
+        update.message.reply_text.assert_awaited()

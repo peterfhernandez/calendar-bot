@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import config
 from db.state import (
     get_open_trades,
+    get_visible_positions,
     get_trades_closed_today_aest,
     get_trades_closed_since,
     get_trades_opened_today_aest,
@@ -72,7 +73,10 @@ async def handle_positions(
     db_path: Path = DB_PATH,
 ) -> None:
     """Open trades: ev, strike/type, expiry range, entry cost, current value, PnL (separated by roll)."""
-    trades = get_open_trades(db_path)
+    # Use the stuck-inclusive query (Phase 22b) so positions marked close_stuck
+    # after a "MANUAL ACTION REQUIRED" alert are shown (flagged) rather than
+    # silently omitted — they are exactly the ones the operator needs to see.
+    trades = get_visible_positions(db_path)
     if not trades:
         await update.message.reply_text("No open positions.")
         return
@@ -118,10 +122,14 @@ async def handle_positions(
         if t.ev_score_at_roll != 0.0:
             ev_display += f"  ev_roll={_fmt_ev(t.ev_score_at_roll)}"
 
-        lines.append(
-            f"#{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
+        prefix = "⚠️ STUCK — " if t.close_status == "close_stuck" else ""
+        line = (
+            f"{prefix}#{t.id} {t.asset} {t.strike:.0f} {opt_type}  {near_date}→{far_date}"
             f"   entry=${t.net_debit * t.qty:.2f}  {val_note}   {ev_display}"
         )
+        if t.close_status == "close_stuck" and t.close_error_reason:
+            line += f"\n   ↳ {t.close_error_reason}"
+        lines.append(line)
 
     await update.message.reply_text("\n\n".join(lines))
 
@@ -238,7 +246,8 @@ async def handle_portfolio(
     db_path: Path = DB_PATH,
 ) -> None:
     """Open trades with asset, strike, expiry range, debit, fees, EV at entry & roll, total PnL."""
-    trades = get_open_trades(db_path)
+    # Stuck-inclusive query (Phase 22b) so stuck positions are shown, flagged.
+    trades = get_visible_positions(db_path)
     if not trades:
         await update.message.reply_text("No open positions.")
         return
@@ -267,12 +276,16 @@ async def handle_portfolio(
         if t.ev_score_at_roll != 0.0:
             ev_line += f"  EV_roll: {_fmt_ev(t.ev_score_at_roll)}"
 
-        lines.append(
-            f"#{t.id} {t.asset} {opt_type} {t.strike:.0f}  {near_date}→{far_date}\n"
+        prefix = "⚠️ STUCK — " if t.close_status == "close_stuck" else ""
+        block = (
+            f"{prefix}#{t.id} {t.asset} {opt_type} {t.strike:.0f}  {near_date}→{far_date}\n"
             f"  Debit: ${t.net_debit * t.qty:.2f}  Fees: ${t.open_fees:.2f}  Roll PnL: ${t.roll_pnl:+.2f}\n"
             f"{ev_line}\n"
             f"  Value: {val_str}"
         )
+        if t.close_status == "close_stuck" and t.close_error_reason:
+            block += f"\n  ↳ {t.close_error_reason}"
+        lines.append(block)
 
     await update.message.reply_text("\n\n".join(lines))
 
@@ -440,60 +453,75 @@ async def handle_info(
         await update.message.reply_text("Usage: /info trade_id=42")
         return
 
-    # Fetch trade from DB
-    import sqlite3
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
-    ).fetchone()
-    conn.close()
+    # Wrap the whole body (Phase 22c): without this, any exception here — a
+    # missing cache row, a ZeroDivisionError from a zero cost basis, a bad DB
+    # column — bubbles up to python-telegram-bot, which logs it and sends NO
+    # reply at all, leaving the operator staring at silence.  Reply with an
+    # error message instead of failing silently.
+    try:
+        # Fetch trade from DB
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        conn.close()
 
-    if not row:
-        await update.message.reply_text(f"Trade #{trade_id} not found in database")
-        return
+        if not row:
+            await update.message.reply_text(f"Trade #{trade_id} not found in database")
+            return
 
-    # Fetch live prices from cache
-    near_snap = cache.get(row["near_instrument"])
-    far_snap = cache.get(row["far_instrument"])
+        # Fetch live prices from cache
+        near_snap = cache.get(row["near_instrument"])
+        far_snap = cache.get(row["far_instrument"])
 
-    parts = [f"*Trade #{trade_id} Status*"]
-    parts.append(f"{row['asset']} {row['option_type']} strike={row['strike']:.0f}")
-    parts.append(f"Expiry: {row['expiry_near']} → {row['expiry_far']}")
-    parts.append(f"Qty: {row['qty']}")
-    parts.append(f"Entry debit: ${row['net_debit'] * row['qty']:.4f}")
-    parts.append("")
-    parts.append("*Current Market Prices (from Deribit):*")
-
-    if near_snap:
-        near_mid = _mid(near_snap.bid, near_snap.ask)
-        mid_str = f"{near_mid:.4f}" if near_mid is not None else "N/A"
-        parts.append(f"Near leg: bid={near_snap.bid:.4f} ask={near_snap.ask:.4f} mid={mid_str}")
-    else:
-        parts.append(f"Near leg: NOT IN CACHE (stale or not subscribed)")
-
-    if far_snap:
-        far_mid = _mid(far_snap.bid, far_snap.ask)
-        far_mid_str = f"{far_mid:.4f}" if far_mid is not None else "N/A"
-        parts.append(f"Far leg:  bid={far_snap.bid:.4f} ask={far_snap.ask:.4f} mid={far_mid_str}")
-    else:
-        parts.append(f"Far leg: NOT IN CACHE (stale or not subscribed)")
-
-    if near_snap and far_snap and _mid(near_snap.bid, near_snap.ask) and _mid(far_snap.bid, far_snap.ask):
-        sv = (_mid(far_snap.bid, far_snap.ask) - _mid(near_snap.bid, near_snap.ask)) * row['qty']
-        cost_basis = row['net_debit'] * row['qty'] + row['open_fees']
-        unrealized = sv - cost_basis
+        parts = [f"*Trade #{trade_id} Status*"]
+        parts.append(f"{row['asset']} {row['option_type']} strike={row['strike']:.0f}")
+        parts.append(f"Expiry: {row['expiry_near']} → {row['expiry_far']}")
+        parts.append(f"Qty: {row['qty']}")
+        parts.append(f"Entry debit: ${row['net_debit'] * row['qty']:.4f}")
         parts.append("")
-        parts.append(f"*Unrealized P&L:* ${unrealized:+.4f} ({unrealized/cost_basis*100:+.1f}%)")
-    else:
-        parts.append("")
-        parts.append("⚠️  Cannot calculate current P&L — cache data incomplete")
+        parts.append("*Current Market Prices (from Deribit):*")
 
-    parts.append(f"\nDB Status: {row['close_status']}")
-    if row['close_error_reason']:
-        parts.append(f"Error: {row['close_error_reason']}")
+        if near_snap:
+            near_mid = _mid(near_snap.bid, near_snap.ask)
+            mid_str = f"{near_mid:.4f}" if near_mid is not None else "N/A"
+            parts.append(f"Near leg: bid={near_snap.bid:.4f} ask={near_snap.ask:.4f} mid={mid_str}")
+        else:
+            parts.append(f"Near leg: NOT IN CACHE (stale or not subscribed)")
 
-    await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+        if far_snap:
+            far_mid = _mid(far_snap.bid, far_snap.ask)
+            far_mid_str = f"{far_mid:.4f}" if far_mid is not None else "N/A"
+            parts.append(f"Far leg:  bid={far_snap.bid:.4f} ask={far_snap.ask:.4f} mid={far_mid_str}")
+        else:
+            parts.append(f"Far leg: NOT IN CACHE (stale or not subscribed)")
+
+        if near_snap and far_snap and _mid(near_snap.bid, near_snap.ask) and _mid(far_snap.bid, far_snap.ask):
+            sv = (_mid(far_snap.bid, far_snap.ask) - _mid(near_snap.bid, near_snap.ask)) * row['qty']
+            cost_basis = row['net_debit'] * row['qty'] + row['open_fees']
+            unrealized = sv - cost_basis
+            parts.append("")
+            # Guard cost_basis == 0 (Phase 22c): a manually-adjusted or
+            # partially-filled position can have net_debit*qty + open_fees == 0,
+            # which would otherwise raise ZeroDivisionError and silence the reply.
+            if cost_basis:
+                parts.append(f"*Unrealized P&L:* ${unrealized:+.4f} ({unrealized/cost_basis*100:+.1f}%)")
+            else:
+                parts.append(f"*Unrealized P&L:* ${unrealized:+.4f} (cost basis is $0.00)")
+        else:
+            parts.append("")
+            parts.append("⚠️  Cannot calculate current P&L — cache data incomplete")
+
+        parts.append(f"\nDB Status: {row['close_status']}")
+        if row['close_error_reason']:
+            parts.append(f"Error: {row['close_error_reason']}")
+
+        await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"Error fetching info for trade #{trade_id}: {exc}")
+        logger.error("handle_info failed for trade_id=%s: %s", trade_id, exc)
 
 
 async def handle_close(

@@ -331,7 +331,11 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
             "ev_score_at_roll":   trade.ev_score_at_roll,
         }
         for trade in trades
-        if trade.result in _OPEN_STATUSES
+        # Exclude close_stuck positions from the monitor's read path (Phase 22a):
+        # once marked stuck they must be left alone until the operator clears them
+        # via /close or /close_manually, otherwise the engine re-attempts the same
+        # failing close every tick and re-queues the stuck notification forever.
+        if trade.result in _OPEN_STATUSES and trade.close_status != "close_stuck"
     ]
 
     return {
@@ -400,6 +404,26 @@ def get_open_trades(db_path: Path = DB_PATH) -> list[CalendarTrade]:
         rows = conn.execute(
             f"SELECT * FROM calendar_trades WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))}) "
             f"AND close_status != 'close_stuck' ORDER BY date_open",
+            _OPEN_STATUSES,
+        ).fetchall()
+    return [_row_to_trade(r) for r in rows]
+
+
+def get_visible_positions(db_path: Path = DB_PATH) -> list[CalendarTrade]:
+    """Return every open position (result IN _OPEN_STATUSES) regardless of close_status.
+
+    Unlike get_open_trades() — which excludes close_status='close_stuck' so the
+    monitor stops retrying stuck positions — this query *includes* stuck
+    positions so the Telegram /positions and /portfolio handlers can display
+    them (flagged) after a "MANUAL ACTION REQUIRED" alert.  Stuck positions are
+    exactly the ones an operator most needs to see, so hiding them from those
+    commands (the pre-Phase-22 behaviour) was the reported bug.
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM calendar_trades WHERE result IN ({','.join('?'*len(_OPEN_STATUSES))}) "
+            f"ORDER BY date_open",
             _OPEN_STATUSES,
         ).fetchall()
     return [_row_to_trade(r) for r in rows]
@@ -628,6 +652,25 @@ def get_stuck_positions(db_path: Path = DB_PATH) -> list[CalendarTrade]:
             "SELECT * FROM calendar_trades WHERE close_status = 'close_stuck' ORDER BY date_open DESC"
         ).fetchall()
     return [_row_to_trade(r) for r in rows]
+
+
+def get_close_status(trade_id: int, db_path: Path = DB_PATH) -> Optional[str]:
+    """Return a trade's current close_status, or None if the trade does not exist.
+
+    Used by the decision engine to make stuck-position notification idempotent
+    across a process restart (Phase 22e): a position already marked
+    ``close_stuck`` in the DB has, by definition, already been alerted once, so
+    it must not be re-notified even if the in-memory dedup set was cleared by a
+    restart.
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT close_status FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return row["close_status"] if row["close_status"] is not None else "open"
 
 
 def reset_close_stuck_position(trade_id: int, db_path: Path = DB_PATH) -> None:

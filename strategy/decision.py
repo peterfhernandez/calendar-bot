@@ -44,6 +44,7 @@ from db.state import (
     close_calendar_trade,
     create_calendar_trade,
     get_calendar_stats,
+    get_close_status,
     list_assets_with_open_positions,
     load_calendar_state,
     mark_position_close_stuck,
@@ -861,7 +862,15 @@ class DecisionEngine:
 
         # Roll trigger: near leg approaching expiry and no exit signal yet.
         # In drain mode, skip rolling and close instead.
-        if near_days_left <= _ROLL_TRIGGER_DAYS:
+        #
+        # Require genuine decay (Phase 22f): a freshly-opened short-dated near leg
+        # (e.g. near_days=1) has near_days_left <= ROLL_TRIGGER_DAYS from its very
+        # first tick, which used to make it roll-eligible immediately regardless
+        # of real elapsed time.  Gate on near_days_left < the near tenor recorded
+        # at entry so the leg must actually have decayed closer to expiry than it
+        # was when entered before a roll/close is considered.
+        near_days_at_entry = int(pos.get("near_days", near_days_left) or near_days_left)
+        if near_days_left <= _ROLL_TRIGGER_DAYS and near_days_left < near_days_at_entry:
             if config.DRAIN_MODE or config.DRAIN_AND_NEW_MODE:
                 logger.info(
                     "DRAIN MODE — trade_id=%d near leg expires in %d day(s), closing instead of rolling",
@@ -924,6 +933,14 @@ class DecisionEngine:
         re-marked stuck.
         """
         trade_id = pos["trade_id"]
+
+        # Restart-safe dedup (Phase 22e): if the position is already close_stuck
+        # in the DB, it has already been alerted once — don't notify again even
+        # if the in-memory _notified_stuck set was cleared by a process restart.
+        # (Once 22a excludes stuck positions from the monitor's read path this
+        # branch is rarely reached, but it hard-guards the restart edge case.)
+        already_stuck = get_close_status(trade_id, db_path=self._db_path) == "close_stuck"
+
         logger.error(
             "trade_id=%d %s close failed %d times — marking as stuck for manual intervention",
             trade_id, reason, failure_count,
@@ -939,8 +956,9 @@ class DecisionEngine:
         )
         self._close_roll_failures.pop(trade_id, None)
 
-        # Notify user about stuck position (only once, not every monitor tick)
-        if trade_id not in self._notified_stuck and self._notifier:
+        # Notify user about stuck position (only once, not every monitor tick,
+        # and not again after a restart if it was already stuck — Phase 22e).
+        if trade_id not in self._notified_stuck and not already_stuck and self._notifier:
             try:
                 self._notifier.notify_close_stuck(
                     trade_id=trade_id,
@@ -1081,14 +1099,24 @@ class DecisionEngine:
         candidates = scan(self._cache, assets=[pos["asset"]])
         target_strike = pos["strike"]
         opt_type      = pos.get("option_type", "Call")
+        far_instr     = pos.get("far_instrument")
+        # Match against the position's OWN far leg (Phase 22f), not just
+        # strike/option_type across every scanned tenor pairing.  scan() returns
+        # candidates for many (near, far) pairings on the same strike; taking any
+        # of them let the winning candidate carry a near leg from a different
+        # pairing whose expiry could match — or exceed — the position's real far
+        # leg, producing a zero-width calendar that collapses to $0.00 and trips a
+        # large stop-loss (paper trade #207).
         matches = [
             c for c in candidates
-            if c.strike == target_strike and c.option_type == opt_type
+            if c.strike == target_strike
+            and c.option_type == opt_type
+            and c.far_instrument == far_instr
         ]
         if not matches:
             logger.info(
-                "Roll: no matching candidate for asset=%s strike=%.0f",
-                pos["asset"], target_strike,
+                "Roll: no matching candidate for asset=%s strike=%.0f far=%s",
+                pos["asset"], target_strike, far_instr,
             )
             return False
 
@@ -1101,6 +1129,19 @@ class DecisionEngine:
             logger.info(
                 "Roll: new near instrument (%s) is the same as current — skipping",
                 new_candidate.near_instrument,
+            )
+            return False
+
+        # Reject a new near leg that does not expire strictly before the far leg
+        # by at least MIN_ROLL_NEAR_FAR_GAP_DAYS (Phase 22f).  This is the direct
+        # guard against rolling into a same-expiry (or later) near/far pair.
+        gap_days = _expiry_gap_days(new_candidate.near_instrument, far_instr)
+        if gap_days is not None and gap_days < config.MIN_ROLL_NEAR_FAR_GAP_DAYS:
+            logger.info(
+                "Roll: new near %s expires within %d day(s) of far %s "
+                "(< MIN_ROLL_NEAR_FAR_GAP_DAYS=%d) — skipping to avoid a zero-width spread",
+                new_candidate.near_instrument, gap_days, far_instr,
+                config.MIN_ROLL_NEAR_FAR_GAP_DAYS,
             )
             return False
 
@@ -1371,3 +1412,29 @@ def _instrument_expiry_label(instrument: str) -> str:
     """Extract the expiry label from a Deribit instrument name, e.g. 'BTC-27JUN25-100000-C' → '27JUN25'."""
     parts = instrument.split("-")
     return parts[1] if len(parts) >= 2 else ""
+
+
+def _parse_expiry_label(label: str) -> datetime | None:
+    """Parse a Deribit expiry label (e.g. '28AUG26') to a UTC datetime, or None."""
+    try:
+        return datetime.strptime(label.upper(), "%d%b%y").replace(hour=8, tzinfo=timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _expiry_gap_days(near_instrument: str | None, far_instrument: str | None) -> int | None:
+    """
+    Days by which *near_instrument* expires before *far_instrument*.
+
+    Positive when the near leg expires earlier than the far leg (the only valid
+    calendar-spread orientation).  Zero or negative means the near leg expires on
+    the same day as, or after, the far leg — a degenerate/zero-width spread.
+    Returns None if either expiry label can't be parsed.
+    """
+    if not near_instrument or not far_instrument:
+        return None
+    near_dt = _parse_expiry_label(_instrument_expiry_label(near_instrument))
+    far_dt  = _parse_expiry_label(_instrument_expiry_label(far_instrument))
+    if near_dt is None or far_dt is None:
+        return None
+    return int((far_dt - near_dt).days)
