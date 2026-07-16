@@ -21,11 +21,20 @@ The important files that define this paper mode are:
 
 We launch this bot using a service setup with servy. The launch command is `python -m bot --portfolio=10000`
 
+#### Telegram
+
+The paper bot interacts with a telegram chatbot:
+
+- telegram chatbot named: `PFH Notifications`
+- Chatbot username is `pfh_notifications_bot`
+- Chatbot Id: `8909494838`
+- Url is `https://web.telegram.org/a/#8909494838`
+
 ### Test mode
 
 We run a test mode bot to test the behaviour of the bot when interaction with the broker. We get a sense for trade execution, trading fees and margin managemenet.
 
-#### Files
+#### Test mode files
 
 The important files that define this paper mode are:
 
@@ -34,9 +43,18 @@ The important files that define this paper mode are:
 - `db\calendar_bot_test.db` is the database file
 - `logs\bot_test.logs` a rotating log file
 
-#### Command
+#### Test mode Command
 
 We launch this bot using a service setup with servy. The launch command is `python -m bot --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log`
+
+#### Test Telegram
+
+The paper bot interacts with a telegram chatbot:
+
+- telegram chatbot named: `PFH Test Notifications`
+- Chatbot username is `pfh_test_notifications_bot`
+- Chatbot Id: `8719768449`
+- Url is `https://web.telegram.org/a/#8719768449`
 
 ## Cash setup
 
