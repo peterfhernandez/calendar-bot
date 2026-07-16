@@ -1221,3 +1221,56 @@ In **test/live mode**:
 - [x] Once 21a–21d land, add their new keys (`EV_SCORE_RANKING_CAP`, `MAX_MONEYNESS_PCT`, `MARKET_SV_REQUIRE_TWO_SIDED`, `CLOSE_CONFIRM_TICKS`, `REENTRY_COOLDOWN_SEC`) to `config_test.py` too, so it launches in sync with `config.py` from the start
 - [x] Add a test to `tests/test_config_centralization.py` asserting every key defined in `config.py` is also defined in `config_test.py` (module-level name diff), to catch this drift automatically in future phases
 - [x] `MAX_MARGIN_UTILIZATION_PCT`, `MARGIN_GATE_ENABLED`, `MARGIN_GATE_REQUIRED_LIVE` (Phase 17) — although noted as out of scope, these were also added to `config_test.py` so the parity test (`TestConfigTestParity`) is exact rather than carrying a hardcoded exclusion list
+
+## Phase 22 — Stuck-Position Visibility, Silent Telegram Failures, and Close-Order Price Rejections
+
+**Status:** Planned — not yet started. Full root-cause detail in BOT_PLAN.md Phase 22. Found via a test-mode Telegram session (trades #11/#12): `/positions` and `/info trade_id=N` both went silent/empty right after "MANUAL ACTION REQUIRED" alerts, and the same alert fired twice across a service restart. Root causes: (1) `get_open_trades()` (used by Telegram) excludes `close_status='close_stuck'` rows, hiding exactly the positions the operator needs to see; (2) `handle_info` has no `try/except` and `telegram_cmd/listener.py` registers no PTB error handler, so any exception (e.g. a `cost_basis==0` divide-by-zero) is completely silent; (3) the monitor loop's actual read path (`_load_all_open_positions` → `load_calendar_state`) was never updated to exclude `close_stuck` positions — only the Telegram-facing `get_open_trades()` was — so the engine keeps retrying (and eventually re-notifying about) a stuck position forever, and a restart just resets the in-memory notification-dedup set that was papering over it; (4) the underlying close/roll order rejection (`-32602 Invalid params`) is still live: `execution/executor.py` derives close/roll prices from a synthetic `mid * 1.02`/`mid * 0.98` instead of a real quote, and silently swallows tick-size fetch failures. A fifth item was found mid-phase from a paper-mode report: trades #206/#207 (`near_days=1`) were entered and rolled/closed roughly a minute later — `ROLL_TRIGGER_DAYS=2` makes any freshly-opened 1-day-near position immediately roll-eligible with zero regard for actual elapsed time, and `_try_roll()` matched a same-expiry-as-far-leg candidate for trade #207 (no check that the new near leg's expiry precedes the position's own far leg), collapsing its spread value to `$0.00` and tripping a large stop-loss — the same failure family as Phase 21's churn, through the roll path instead of the entry-ranking path.
+
+### 22a — Stop the monitor from retrying `close_stuck` positions
+
+- [ ] Update `db/state.py::load_calendar_state()` (or add a dedicated `get_monitorable_positions()`) so its `open_positions` list excludes `close_status == 'close_stuck'`, matching `get_open_trades()`
+- [ ] Update `strategy/decision.py::_load_all_open_positions()` to use the corrected/new query
+- [ ] Add a regression test: once a position is marked `close_stuck`, a subsequent `monitor_tick()` does not attempt to close/roll it again and does not increment `_close_roll_failures` for it
+
+### 22b — Show stuck positions in `/positions` and `/portfolio`, flagged
+
+- [ ] Add `db/state.py::get_visible_positions()` (or equivalent) returning `result IN _OPEN_STATUSES` rows regardless of `close_status`
+- [ ] Update `handle_positions`/`handle_portfolio` in `telegram_cmd/handlers.py` to use it, prefixing stuck rows with a clear marker (e.g. `⚠️ STUCK —`) and including `close_error_reason`
+- [ ] Confirm `get_open_trades()` itself is unchanged (still excludes stuck positions — needed by 22a's monitor-side fix)
+- [ ] Add regression tests: `/positions` and `/portfolio` include a flagged stuck position instead of omitting it
+
+### 22c — Harden Telegram handlers against silent failures
+
+- [ ] Wrap `handle_info`'s body in `try/except`, replying with an error message on failure (matching `handle_close`/`handle_close_manually`)
+- [ ] Guard the `cost_basis == 0` case in `handle_info`'s P&L calculation instead of dividing by it
+- [ ] Register `application.add_error_handler(...)` in `telegram_cmd/listener.py::_build_app()` so any unhandled command-handler exception logs and replies with a generic error message instead of staying silent
+- [ ] Add regression tests: `/info` on a trade with `cost_basis == 0` replies with a message (not silence); a simulated handler exception triggers the global error handler's reply
+
+### 22d — Fix the close/roll order price rejection at its source
+
+- [ ] In `execution/executor.py`, derive `_async_close_spread`'s near/far close prices and `_async_roll_near_leg`'s close price from live best bid/ask (crossing the spread with a small configurable buffer) instead of `mid * 1.02`/`mid * 0.98`
+- [ ] Add `config.CLOSE_PRICE_CROSS_BUFFER_PCT` for the buffer
+- [ ] Make tick-size fetch failure loud: log a warning naming the instrument, and either retry once or abort per a new `config` knob, instead of silently falling back to generic 4-decimal rounding
+- [ ] Read `tick_size_steps` from the instrument metadata (not just the flat `tick_size`) so the correct tick is used for the instrument's current price band
+- [ ] Round in tick-count integer/`Decimal` space rather than `float` division, so the result can't drift off-grid due to floating-point representation error
+- [ ] Add regression tests: close/roll prices are derived from bid/ask, not a synthetic mid; a rounded price stays on the correct tick grid across several `tick_size_steps` fixtures; a tick-size fetch failure is logged and handled per the new config knob
+- [ ] Add `scratch/scratch_close_price_rounding.py` — offline demo reproducing the old synthetic-mid rejection and showing the fix lands on the correct tick grid
+
+### 22e — Persist stuck-position notification state (restart-safe)
+
+- [ ] Update `strategy/decision.py::_mark_stuck_and_notify` to check DB `close_status == 'close_stuck'` (not just the in-memory `_notified_stuck` set) before calling `notify_close_stuck`
+- [ ] Add a regression test: simulating a fresh `DecisionEngine` (empty `_notified_stuck`, as after a restart) against an already-`close_stuck` position does not re-notify
+
+### 22f — Fix the premature roll trigger and degenerate same-expiry roll (trades #206/#207)
+
+- [ ] In `strategy/decision.py::_monitor_position`, require `near_days_left < pos.get("near_days", near_days_left)` in addition to `near_days_left <= config.ROLL_TRIGGER_DAYS` before considering a roll, so a freshly-opened short-dated near leg isn't roll-eligible on its first post-entry tick
+- [ ] In `_try_roll()`, restrict candidate matching to `c.far_instrument == pos["far_instrument"]` instead of `strike`/`option_type` alone across all scanned tenor pairings
+- [ ] Add `config.MIN_ROLL_NEAR_FAR_GAP_DAYS` (e.g. `1`) and reject (log + return `False`) any roll candidate whose near-leg expiry isn't strictly earlier than the position's far-leg expiry by at least that gap
+- [ ] Add regression tests: a `near_days=1` position is not roll-eligible on the tick immediately after entry; `_try_roll` rejects a candidate whose near expiry matches or exceeds the position's own far-leg expiry
+- [ ] Add `scratch/scratch_premature_roll.py` — offline demo reproducing trades #206/#207 against the pre-fix logic and showing both fixes independently prevent it
+
+### 22g — Verification
+
+- [ ] Run the full test suite; confirm no regressions in existing Phase 18/20/21 tests around `close_status`, `get_open_trades()`, and roll behaviour
+- [ ] Update README.md's Known Issues section once implemented
+- [ ] Update this file's checkboxes as each sub-phase lands
