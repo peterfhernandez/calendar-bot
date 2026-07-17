@@ -1008,6 +1008,131 @@ class TestTickSizeRounding:
         asyncio.run(test_rounding())
 
 
+# ── Phase 22d: close/roll price derivation + tick_size_steps rounding ─────────
+
+class TestClosePriceDerivation:
+    """Close/roll prices must come from live best bid/ask (crossed with a buffer),
+    not a synthetic mid × 1.02 / mid × 0.98 that lands off-tick."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_close_prices_derived_from_bid_ask(self):
+        position = _make_position()
+        mock_client = _MockRPCClient(
+            place_order_results=[
+                _submitted_order_result("close-near-1", 0.0015),
+                _submitted_order_result("close-far-1",  0.0055),
+            ],
+            order_states={
+                "close-near-1": [_filled_order_state("close-near-1", 0.0015)],
+                "close-far-1":  [_filled_order_state("close-far-1",  0.0055)],
+            },
+            ticker_results={
+                "BTC-07JUN25-100000-C": {"best_bid_price": 0.0014, "best_ask_price": 0.0016},
+                "BTC-07JUL25-100000-C": {"best_bid_price": 0.0054, "best_ask_price": 0.0056},
+            },
+        )
+
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            self._run(
+                _async_close_spread(
+                    position, client_id="", client_secret="",
+                    order_manager=OrderManager(),
+                )
+            )
+
+        buf = config.CLOSE_PRICE_CROSS_BUFFER_PCT
+        near_order = next(o for o in mock_client.placed_orders if o["instrument"].endswith("JUN25-100000-C"))
+        far_order  = next(o for o in mock_client.placed_orders if o["instrument"].endswith("JUL25-100000-C"))
+        # Buy back near: lift the ask (0.0016) + buffer
+        assert near_order["direction"] == "buy"
+        assert near_order["price"] == pytest.approx(0.0016 * (1 + buf))
+        # Sell far: hit the bid (0.0054) − buffer — NOT far_mid * 0.98
+        assert far_order["direction"] == "sell"
+        assert far_order["price"] == pytest.approx(0.0054 * (1 - buf))
+
+    def test_roll_close_price_derived_from_ask(self):
+        position  = _make_position()
+        candidate = _make_candidate()
+        mock_client = _MockRPCClient(
+            place_order_results=[
+                _submitted_order_result("roll-close-1", 0.0015),
+                _submitted_order_result("roll-open-1",  0.0020),
+            ],
+            order_states={
+                "roll-close-1": [_filled_order_state("roll-close-1", 0.0015)],
+                "roll-open-1":  [_filled_order_state("roll-open-1",  0.0020)],
+            },
+            ticker_results={
+                "BTC-07JUN25-100000-C": {"best_bid_price": 0.0014, "best_ask_price": 0.0016},
+            },
+        )
+
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            ok = self._run(
+                _async_roll_near_leg(
+                    position, candidate, client_id="", client_secret="",
+                    order_manager=OrderManager(),
+                )
+            )
+
+        assert ok is True
+        buf = config.CLOSE_PRICE_CROSS_BUFFER_PCT
+        close_order = mock_client.placed_orders[0]
+        assert close_order["direction"] == "buy"
+        assert close_order["price"] == pytest.approx(0.0016 * (1 + buf))
+
+
+class TestTickSizeSteps:
+    """Rounding must honour Deribit's per-price-band tick_size_steps and stay on-grid."""
+
+    def test_effective_tick_size_uses_band(self):
+        from execution.executor import _effective_tick_size
+        steps = [{"above_price": 0.1, "tick_size": 0.0005}]
+        # Below the band threshold — base tick applies
+        assert _effective_tick_size(0.05, 0.0001, steps) == 0.0001
+        # At/above the band threshold — the coarser tick applies
+        assert _effective_tick_size(0.20, 0.0001, steps) == 0.0005
+
+    def test_round_to_tick_with_steps_stays_on_grid(self):
+        from execution.executor import _round_to_tick
+        steps = [{"above_price": 0.1, "tick_size": 0.0005}]
+        # Price 0.12345 is above 0.1 → 0.0005 tick.  0.12345/0.0005 = 246.9 → 247 → 0.1235
+        result = _round_to_tick(0.12345, "BTC-X-60000-C", tick_size=0.0001, tick_size_steps=steps)
+        assert result == pytest.approx(0.1235)
+        # Must be an exact multiple of the effective tick (on-grid, no float drift)
+        assert abs(round(result / 0.0005) * 0.0005 - result) < 1e-9
+
+    def test_round_to_tick_no_float_drift(self):
+        from execution.executor import _round_to_tick
+        # A value known to produce float drift with naive division rounding.
+        result = _round_to_tick(0.0003, "BTC-X-60000-C", tick_size=0.0001)
+        assert result == pytest.approx(0.0003)
+        # Exactly on-grid.
+        assert (result / 0.0001) == pytest.approx(round(result / 0.0001))
+
+
+class TestTickFetchFailureLoud:
+    """A tick-size fetch failure is logged (not swallowed) and falls back safely."""
+
+    def test_fetch_tick_info_failure_returns_none_and_warns(self, caplog):
+        import logging
+        from execution.executor import _DeribitRPCClient
+
+        async def run():
+            client = _DeribitRPCClient("id", "secret")
+            with patch.object(client, "_rpc", new_callable=AsyncMock) as mock_rpc:
+                mock_rpc.side_effect = RuntimeError("boom")
+                with caplog.at_level(logging.WARNING, logger="execution.executor"):
+                    tick, steps = await client._fetch_tick_info("BTC-3JAN26-60000-C")
+            return tick, steps
+
+        tick, steps = asyncio.run(run())
+        assert tick is None and steps is None
+        assert any("BTC-3JAN26-60000-C" in r.message for r in caplog.records)
+
+
 # ── Phase 18: Stuck-position retry loop fix ──────────────────────────────────
 
 class TestStuckPositionRetryFix:

@@ -13,6 +13,9 @@ from db.state import (
     update_near_leg,
     get_all_closed_trades,
     get_open_instrument_names,
+    get_visible_positions,
+    get_close_status,
+    get_open_trades,
     mark_position_close_stuck,
 )
 
@@ -455,3 +458,66 @@ class TestGetOpenInstrumentNames:
 
     def test_empty_db_returns_empty_list(self, db):
         assert get_open_instrument_names(db_path=db) == []
+
+
+# ── Phase 22 — stuck-position visibility & monitor exclusion ──────────────────
+
+class TestStuckPositionVisibility:
+    def test_load_calendar_state_excludes_close_stuck(self, db):
+        """22a: the monitor's read path must not re-surface a stuck position."""
+        t = _open_trade(db)
+        mark_position_close_stuck(t.id, error_reason="timeout", db_path=db)
+        state = load_calendar_state("BTC", db_path=db)
+        assert state["open_positions"] == []
+
+    def test_load_calendar_state_includes_healthy_open(self, db):
+        _open_trade(db)
+        state = load_calendar_state("BTC", db_path=db)
+        assert len(state["open_positions"]) == 1
+
+    def test_get_visible_positions_includes_close_stuck(self, db):
+        """22b: /positions and /portfolio must still SEE the stuck position."""
+        t = _open_trade(db)
+        mark_position_close_stuck(t.id, error_reason="timeout", db_path=db)
+        visible = get_visible_positions(db_path=db)
+        assert len(visible) == 1
+        assert visible[0].close_status == "close_stuck"
+        assert visible[0].close_error_reason == "timeout"
+
+    def test_get_open_trades_still_excludes_stuck(self, db):
+        """get_open_trades() must keep excluding stuck rows (22a depends on it)."""
+        t = _open_trade(db)
+        mark_position_close_stuck(t.id, error_reason="timeout", db_path=db)
+        assert get_open_trades(db_path=db) == []
+        # But the stuck-inclusive query still shows it.
+        assert len(get_visible_positions(db_path=db)) == 1
+
+    def test_get_visible_positions_excludes_closed(self, db):
+        t = _open_trade(db)
+        close_calendar_trade(
+            t.id, date_close=date(2026, 6, 7),
+            spot_close=101_000.0, pnl=10.0, result="Win", db_path=db,
+        )
+        assert get_visible_positions(db_path=db) == []
+
+
+class TestGetCloseStatus:
+    def test_open_position(self, db):
+        t = _open_trade(db)
+        assert get_close_status(t.id, db_path=db) == "open"
+
+    def test_stuck_position(self, db):
+        t = _open_trade(db)
+        mark_position_close_stuck(t.id, error_reason="boom", db_path=db)
+        assert get_close_status(t.id, db_path=db) == "close_stuck"
+
+    def test_closed_position(self, db):
+        t = _open_trade(db)
+        close_calendar_trade(
+            t.id, date_close=date(2026, 6, 7),
+            spot_close=101_000.0, pnl=10.0, result="Win", db_path=db,
+        )
+        assert get_close_status(t.id, db_path=db) == "closed"
+
+    def test_missing_trade_returns_none(self, db):
+        assert get_close_status(9999, db_path=db) is None

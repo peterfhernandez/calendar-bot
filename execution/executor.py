@@ -35,6 +35,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 import websockets
@@ -53,7 +54,8 @@ MAX_RETRIES:        int   = config.MAX_ORDER_RETRIES
 _RETRY_DELAYS = config.ORDER_RETRY_DELAYS   # seconds between retry attempts
 
 # ── Tick-size cache for price rounding ─────────────────────────────────────────
-_TICK_SIZE_CACHE: dict[str, float] = {}  # instrument_name → tick_size
+_TICK_SIZE_CACHE: dict[str, float] = {}          # instrument_name → base tick_size
+_TICK_STEPS_CACHE: dict[str, list] = {}          # instrument_name → tick_size_steps (per-price-band overrides)
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -175,6 +177,44 @@ class _DeribitRPCClient:
         """Fetch instrument metadata including tick_size for price rounding."""
         return await self._rpc("public/get_instruments", {"instrument_name": instrument})
 
+    async def _fetch_tick_info(self, instrument: str) -> tuple[float | None, list | None]:
+        """
+        Fetch and cache an instrument's ``tick_size`` and ``tick_size_steps``.
+
+        Retries up to ``config.TICK_SIZE_FETCH_RETRIES`` extra times on failure.
+        A failure is logged loudly (naming the instrument) rather than silently
+        swallowed — an off-tick price is the deterministic cause of the
+        "-32602 Invalid params" close/roll rejections (Phase 22d).  Returns
+        ``(None, None)`` when the tick size cannot be obtained, so the caller
+        falls back to 4-decimal rounding.
+        """
+        attempts = config.TICK_SIZE_FETCH_RETRIES + 1
+        for attempt in range(attempts):
+            try:
+                instr_data = await self._rpc(
+                    "public/get_instruments", {"instrument_name": instrument}
+                )
+                instruments = instr_data.get("instruments", [])
+                if instruments and isinstance(instruments, list):
+                    meta = instruments[0]
+                    tick_size = meta.get("tick_size")
+                    tick_steps = meta.get("tick_size_steps") or []
+                    if tick_size:
+                        _TICK_SIZE_CACHE[instrument] = tick_size
+                        _TICK_STEPS_CACHE[instrument] = tick_steps
+                        return tick_size, tick_steps
+            except Exception as exc:
+                logger.warning(
+                    "Tick-size fetch failed for %s (attempt %d/%d): %s",
+                    instrument, attempt + 1, attempts, exc,
+                )
+        logger.warning(
+            "Could not obtain tick size for %s after %d attempt(s) — falling back "
+            "to 4-decimal rounding; the order price may be rejected as off-tick",
+            instrument, attempts,
+        )
+        return None, None
+
     async def place_order(
         self,
         instrument: str,
@@ -183,23 +223,16 @@ class _DeribitRPCClient:
         price:      float,  # limit price in Deribit index fraction
         label:      str = "",
     ) -> dict:
-        # Round price to instrument's valid tick size to prevent "-32602 Invalid params" errors
-        # Tick size varies with option price level (tick_size_steps); try cache first, then fetch
+        # Round price to instrument's valid tick size to prevent "-32602 Invalid
+        # params" errors.  Tick size varies with option price level
+        # (tick_size_steps); try cache first, then fetch (loud on failure).
         tick_size = _TICK_SIZE_CACHE.get(instrument)
+        tick_steps = _TICK_STEPS_CACHE.get(instrument)
         if tick_size is None:
-            try:
-                # Fetch instrument metadata to get tick_size
-                instr_data = await self._rpc("public/get_instruments", {"instrument_name": instrument})
-                instruments = instr_data.get("instruments", [])
-                if instruments and isinstance(instruments, list):
-                    tick_size = instruments[0].get("tick_size")
-                    if tick_size:
-                        _TICK_SIZE_CACHE[instrument] = tick_size
-            except Exception:
-                pass  # Fall back to default rounding below
+            tick_size, tick_steps = await self._fetch_tick_info(instrument)
 
         # Round to the valid tick (or default 4 decimals)
-        rounded_price = _round_to_tick(price, instrument, tick_size)
+        rounded_price = _round_to_tick(price, instrument, tick_size, tick_steps)
 
         method = f"private/{direction}"
         params = {
@@ -275,13 +308,44 @@ def _contract_amount(spot: float, asset: str, portfolio_value: float, max_loss_p
     return float(max(1, int(qty_usd)))
 
 
-def _round_to_tick(price: float, instrument: str, tick_size: float | None = None) -> float:
+def _effective_tick_size(price: float, base_tick: float, tick_size_steps: list | None) -> float:
+    """
+    Resolve the tick size that applies at *price*, honouring Deribit's per-band
+    ``tick_size_steps`` overrides.
+
+    Each step is a dict ``{"above_price": X, "tick_size": Y}`` meaning that once
+    the price is >= X, tick Y applies instead of the base tick.  Steps are
+    ascending by ``above_price``; the last matching step wins.  Reading these
+    (rather than only the flat ``tick_size``) prevents an off-grid price for an
+    instrument trading above its first tick threshold (Phase 22d).
+    """
+    tick = base_tick
+    if tick_size_steps:
+        for step in tick_size_steps:
+            try:
+                above = step.get("above_price")
+                step_tick = step.get("tick_size")
+            except AttributeError:
+                continue
+            if above is not None and step_tick and price >= above:
+                tick = step_tick
+    return tick
+
+
+def _round_to_tick(
+    price: float,
+    instrument: str,
+    tick_size: float | None = None,
+    tick_size_steps: list | None = None,
+) -> float:
     """
     Round a price to the instrument's valid tick size (Deribit's minimum price increment).
 
     Deribit's options use variable tick sizes that scale with price (tick_size_steps).
-    This function rounds the price to the nearest valid tick to prevent order rejections
-    with "-32602 Invalid params" errors when Deribit's JSON-RPC layer validates the price.
+    Rounding is done in tick-count space using ``Decimal`` (not float division) so the
+    result cannot drift off-grid due to floating-point representation error — that drift,
+    combined with the old synthetic mid-based close prices, reproduced the
+    "-32602 Invalid params" rejections (Phase 22d).
 
     Parameters
     ----------
@@ -290,7 +354,9 @@ def _round_to_tick(price: float, instrument: str, tick_size: float | None = None
     instrument : str
         The instrument name (e.g., "BTC-3JAN26-60000-C").
     tick_size : float | None
-        Explicit tick size. If None, attempts to fetch from cache or uses a safe default.
+        Explicit base tick size. If None, attempts to fetch from cache or uses a safe default.
+    tick_size_steps : list | None
+        Optional per-price-band tick overrides. If None, falls back to the cached steps.
 
     Returns
     -------
@@ -300,6 +366,8 @@ def _round_to_tick(price: float, instrument: str, tick_size: float | None = None
     # If tick_size not provided, try to fetch from cache
     if tick_size is None:
         tick_size = _TICK_SIZE_CACHE.get(instrument)
+    if tick_size_steps is None:
+        tick_size_steps = _TICK_STEPS_CACHE.get(instrument)
 
     # If still no tick size, use a conservative default
     # (Deribit typically uses 0.0001 or larger increments for options)
@@ -309,9 +377,14 @@ def _round_to_tick(price: float, instrument: str, tick_size: float | None = None
     if tick_size <= 0:
         return price  # Safeguard
 
-    # Round to nearest tick: floor for buys (conservative), ceil for sells (conservative)
-    # For a generic approach, we round to the nearest tick
-    return round(price / tick_size) * tick_size
+    # Resolve the tick applicable at this price band, then round in integer
+    # tick-count space with Decimal to avoid float drift off the grid.
+    eff_tick = _effective_tick_size(price, tick_size, tick_size_steps)
+    if eff_tick <= 0:
+        eff_tick = tick_size
+    tick_dec = Decimal(str(eff_tick))
+    steps = (Decimal(str(price)) / tick_dec).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return float(steps * tick_dec)
 
 
 def _check_slippage(fill_price_usd: float, intended_usd: float, limit_pct: float) -> None:
@@ -689,22 +762,36 @@ async def _async_close_spread(
     far_instr  = position["far_instrument"]
     amount     = position["qty"]
 
+    buffer = config.CLOSE_PRICE_CROSS_BUFFER_PCT
+
     async with _DeribitRPCClient(client_id, client_secret) as client:
-        # Get current mid prices for slippage reference
+        # Get current best bid/ask so we can cross the spread with a real quote
+        # rather than a synthetic mid × multiplier (Phase 22d).
         try:
             near_ticker = await client.get_ticker(near_instr)
             far_ticker  = await client.get_ticker(far_instr)
-            near_mid    = (near_ticker.get("best_bid_price", 0) + near_ticker.get("best_ask_price", 0)) / 2
-            far_mid     = (far_ticker.get("best_bid_price",  0) + far_ticker.get("best_ask_price",  0)) / 2
+            near_bid = near_ticker.get("best_bid_price", 0) or 0.0
+            near_ask = near_ticker.get("best_ask_price", 0) or 0.0
+            far_bid  = far_ticker.get("best_bid_price",  0) or 0.0
+            far_ask  = far_ticker.get("best_ask_price",  0) or 0.0
         except Exception:
-            near_mid = far_mid = 0.0
+            near_bid = near_ask = far_bid = far_ask = 0.0
 
-        # Close near leg: buy back the short (we sold it at entry)
-        near_close_price = near_mid * 1.02 if near_mid > 0 else 0.001  # pay a little to close
+        near_mid = (near_bid + near_ask) / 2 if (near_bid > 0 and near_ask > 0) else 0.0
+        far_mid  = (far_bid + far_ask) / 2 if (far_bid > 0 and far_ask > 0) else 0.0
+
+        # Close near leg: buy back the short — lift the ask (plus buffer) so the
+        # marketable limit fills; fall back to bid, then a tiny price.
+        if near_ask > 0:
+            near_close_price = near_ask * (1 + buffer)
+        elif near_bid > 0:
+            near_close_price = near_bid * (1 + buffer)
+        else:
+            near_close_price = 0.001
         near_close_id = None
         try:
             near_result = await client.place_order(
-                near_instr, "buy", amount, round(near_close_price, 4),
+                near_instr, "buy", amount, near_close_price,
                 label=f"CLOSE-NEAR-{asset}",
             )
             near_close_id = near_result["order"]["order_id"]
@@ -717,12 +804,18 @@ async def _async_close_spread(
             logger.error("Failed to submit near close order: %s", exc)
             return None
 
-        # Close far leg: sell back the long (we bought it at entry)
-        far_close_price = far_mid * 0.98 if far_mid > 0 else 0.001
+        # Close far leg: sell back the long — hit the bid (minus buffer) so the
+        # marketable limit fills; fall back to ask, then a tiny price.
+        if far_bid > 0:
+            far_close_price = far_bid * (1 - buffer)
+        elif far_ask > 0:
+            far_close_price = far_ask * (1 - buffer)
+        else:
+            far_close_price = 0.001
         far_close_id = None
         try:
             far_result = await client.place_order(
-                far_instr, "sell", amount, round(far_close_price, 4),
+                far_instr, "sell", amount, far_close_price,
                 label=f"CLOSE-FAR-{asset}",
             )
             far_close_id = far_result["order"]["order_id"]
@@ -774,9 +867,15 @@ async def _async_close_spread(
                 "Near leg close filled but far leg failed — unwinding near leg to avoid leg risk"
             )
             try:
-                unwind_price = near_mid * 0.98 if near_mid > 0 else 0.001
+                # Sell the near leg we just bought back — hit the bid (minus buffer).
+                if near_bid > 0:
+                    unwind_price = near_bid * (1 - buffer)
+                elif near_mid > 0:
+                    unwind_price = near_mid * (1 - buffer)
+                else:
+                    unwind_price = 0.001
                 await client.place_order(
-                    near_instr, "sell", amount, round(unwind_price, 4),
+                    near_instr, "sell", amount, unwind_price,
                     label=f"UNWIND-NEAR-{asset}",
                 )
                 logger.info("Unwound near leg")
@@ -789,9 +888,15 @@ async def _async_close_spread(
                 "Far leg close filled but near leg failed — unwinding far leg to avoid leg risk"
             )
             try:
-                unwind_price = far_mid * 1.02 if far_mid > 0 else 0.001
+                # Buy back the far leg we just sold — lift the ask (plus buffer).
+                if far_ask > 0:
+                    unwind_price = far_ask * (1 + buffer)
+                elif far_mid > 0:
+                    unwind_price = far_mid * (1 + buffer)
+                else:
+                    unwind_price = 0.001
                 await client.place_order(
-                    far_instr, "buy", amount, round(unwind_price, 4),
+                    far_instr, "buy", amount, unwind_price,
                     label=f"UNWIND-FAR-{asset}",
                 )
                 logger.info("Unwound far leg")
@@ -838,16 +943,27 @@ async def _async_roll_near_leg(
     amount     = position["qty"]
     new_near   = new_candidate.near_instrument
 
+    buffer = config.CLOSE_PRICE_CROSS_BUFFER_PCT
+
     async with _DeribitRPCClient(client_id, client_secret) as client:
-        # Buy back old near leg
+        # Buy back old near leg — lift the ask (plus buffer) to cross the book,
+        # rather than a synthetic mid × 1.02 that lands off-tick (Phase 22d).
         try:
             ticker = await client.get_ticker(near_instr)
-            close_price = (ticker.get("best_bid_price", 0) + ticker.get("best_ask_price", 0)) / 2 * 1.02
+            near_bid = ticker.get("best_bid_price", 0) or 0.0
+            near_ask = ticker.get("best_ask_price", 0) or 0.0
         except Exception:
+            near_bid = near_ask = 0.0
+
+        if near_ask > 0:
+            close_price = near_ask * (1 + buffer)
+        elif near_bid > 0:
+            close_price = near_bid * (1 + buffer)
+        else:
             close_price = 0.001
 
         close_result = await client.place_order(
-            near_instr, "buy", amount, round(max(close_price, 0.0001), 4),
+            near_instr, "buy", amount, max(close_price, 0.0001),
             label=f"ROLL-CLOSE-{asset}",
         )
         close_id = close_result["order"]["order_id"]
@@ -976,6 +1092,7 @@ class CalendarExecutor:
                     tick_size = instr.get("tick_size")
                     if tick_size is not None:
                         _TICK_SIZE_CACHE[instrument] = tick_size
+                        _TICK_STEPS_CACHE[instrument] = instr.get("tick_size_steps") or []
                         logger.debug("Cached tick_size for %s: %s", instrument, tick_size)
                     return tick_size
             except Exception as e:

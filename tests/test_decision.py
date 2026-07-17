@@ -24,6 +24,7 @@ from strategy.decision import (
     DryRunExecutor,
     EngineStatus,
     _days_left,
+    _expiry_gap_days,
     _instrument_expiry_label,
     _trade_to_position,
 )
@@ -394,7 +395,8 @@ class TestMonitorTick:
         executor.roll_near_leg.return_value = True
 
         engine, _ = _make_engine(executor=executor)
-        pos = self._open_pos(near_days=2)  # at roll trigger threshold
+        pos = self._open_pos(near_days=2)  # 2 days to expiry — inside roll window
+        pos["near_days"] = 7  # entered as a 7d near leg; has decayed to 2 (Phase 22f)
 
         with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
              patch("strategy.decision.check_calendar_status",
@@ -413,6 +415,7 @@ class TestMonitorTick:
 
         engine, _ = _make_engine(executor=executor)
         pos = self._open_pos(near_days=2)
+        pos["near_days"] = 7  # decayed from a 7d near leg to 2 days left (Phase 22f)
 
         with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
              patch("strategy.decision.check_calendar_status",
@@ -2048,6 +2051,7 @@ class TestDrainMode:
         engine, db_path = _make_engine(cache=cache, executor=executor)
 
         pos = self._open_pos(near_days=1, far_days=30)
+        pos["near_days"] = 7  # entered as a 7d near leg, now decayed to 1 day (Phase 22f)
 
         with patch("strategy.decision.check_calendar_status", return_value=("hold", 0.022, 1.1, "OK")), \
              patch("strategy.decision.close_calendar_trade") as mock_close:
@@ -2482,6 +2486,8 @@ class TestClosePositionExecutorFailure:
             "far_instrument": f"BTC-{far_label}-50000-C",
             "expiry_near": near_label,
             "expiry_far": far_label,
+            "near_days": 10,
+            "far_days": 38,
             "net_debit": 0.0086,
             "qty": 1.0,
             "open_fees": 0.00012,
@@ -2749,3 +2755,104 @@ class TestAutoCloseTimestampRecorded:
         with patch("strategy.decision.close_calendar_trade"):
             engine._close_position(self._pos(), 90_000.0, "Near leg expired", None)
         assert ("BTC", 90_000.0, "Call") not in engine._recent_auto_closes
+
+
+# ── Phase 22 — stuck-position restart safety & premature-roll guards ──────────
+
+class TestStuckNotificationRestartSafe:
+    """22e: a position already close_stuck in the DB must not be re-notified,
+    even when the in-memory _notified_stuck set is empty (as after a restart)."""
+
+    def _pos(self):
+        return {
+            "trade_id": 11, "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0, "near_days": 10, "far_days": 35,
+            "expiry_near": _future_label(1), "expiry_far": _future_label(35),
+            "near_instrument": "BTC-N-90000-C", "far_instrument": "BTC-F-90000-C",
+            "qty": 1.0, "net_debit": 0.02, "open_fees": 0.0,
+        }
+
+    def test_already_stuck_in_db_does_not_renotify(self):
+        notifier = MagicMock()
+        engine, _ = _make_engine()
+        engine._notifier = notifier
+        # Fresh engine: in-memory dedup set is empty, as it would be after a restart.
+        assert 11 not in engine._notified_stuck
+        with patch("strategy.decision.get_close_status", return_value="close_stuck"), \
+             patch("strategy.decision.mark_position_close_stuck"):
+            engine._mark_stuck_and_notify(self._pos(), "Stop-loss", "stop-loss", 3)
+        notifier.notify_close_stuck.assert_not_called()
+
+    def test_first_time_stuck_notifies_once(self):
+        notifier = MagicMock()
+        engine, _ = _make_engine()
+        engine._notifier = notifier
+        with patch("strategy.decision.get_close_status", return_value="open"), \
+             patch("strategy.decision.mark_position_close_stuck"):
+            engine._mark_stuck_and_notify(self._pos(), "Stop-loss", "stop-loss", 3)
+        notifier.notify_close_stuck.assert_called_once()
+
+
+class TestPrematureRollGuard:
+    """22f: a freshly-entered short-dated near leg is not roll-eligible on its
+    first tick, and _try_roll rejects a near candidate that doesn't precede the
+    position's own far leg."""
+
+    def _pos(self, near_days_entry=1, near_left=1, far_days=30):
+        return {
+            "trade_id": 206, "status": "Open", "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0,
+            "expiry_near": _future_label(near_left),
+            "expiry_far": _future_label(far_days),
+            "qty": 1.0, "net_debit": 0.02, "spot_open": 90_000.0,
+            "near_days": near_days_entry, "far_days": far_days,
+            "near_instrument": f"BTC-{_future_label(near_left)}-90000-C",
+            "far_instrument": f"BTC-{_future_label(far_days)}-90000-C",
+            "open_fees": 0.0, "close_fees": 0.0,
+        }
+
+    def test_freshly_entered_1d_near_not_roll_eligible(self):
+        """near_days_left == near_days (just entered) → no roll, no close."""
+        executor = MagicMock()
+        engine, _ = _make_engine(executor=executor)
+        pos = self._pos(near_days_entry=1, near_left=1, far_days=30)
+
+        with patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.0, "OK")), \
+             patch("strategy.decision.scan", return_value=[_make_candidate()]):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            action, _unr = engine._monitor_position(pos)
+
+        executor.roll_near_leg.assert_not_called()
+        executor.close_spread.assert_not_called()
+        assert action is None  # position held
+
+    def test_try_roll_rejects_same_expiry_as_far(self):
+        """A candidate whose near leg expires on/after the far leg is rejected."""
+        engine, _ = _make_engine()
+        far_label = _future_label(30)
+        pos = {
+            "trade_id": 207, "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0, "qty": 1.0, "net_debit": 0.02, "spot_open": 90_000.0,
+            "near_instrument": f"BTC-{_future_label(2)}-90000-C",
+            "far_instrument": f"BTC-{far_label}-90000-C",
+        }
+        # Candidate matches the position's far leg but its NEW near leg expires on
+        # the same day as that far leg — a zero-width spread.
+        degenerate = _make_candidate(near_days=30, far_days=30)
+        with patch("strategy.decision.scan", return_value=[degenerate]):
+            engine._cache.get_spot = MagicMock(return_value=90_000.0)
+            rolled = engine._try_roll(pos, 90_000.0)
+        assert rolled is False
+
+    def test_expiry_gap_days_helper(self):
+        assert _expiry_gap_days(
+            f"BTC-{_future_label(2)}-90000-C", f"BTC-{_future_label(30)}-90000-C"
+        ) == 28
+        # Same expiry → zero gap
+        assert _expiry_gap_days(
+            f"BTC-{_future_label(30)}-90000-C", f"BTC-{_future_label(30)}-90000-C"
+        ) == 0
+        # Unparseable → None
+        assert _expiry_gap_days("BTC-BAD-90000-C", "BTC-ALSO-90000-C") is None
