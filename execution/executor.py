@@ -174,8 +174,18 @@ class _DeribitRPCClient:
         return await self._rpc("public/ticker", {"instrument_name": instrument})
 
     async def get_instrument(self, instrument: str) -> dict:
-        """Fetch instrument metadata including tick_size for price rounding."""
-        return await self._rpc("public/get_instruments", {"instrument_name": instrument})
+        """
+        Fetch a single instrument's metadata (including ``tick_size`` and
+        ``tick_size_steps``) for price rounding.
+
+        Uses Deribit's ``public/get_instrument`` (singular) endpoint, which
+        accepts an ``instrument_name`` and returns the instrument object
+        directly.  (The plural ``public/get_instruments`` endpoint takes a
+        ``currency``/``kind`` and returns a list — it does not accept
+        ``instrument_name`` — so calling it here silently returned the wrong
+        shape and broke tick-size lookup.)
+        """
+        return await self._rpc("public/get_instrument", {"instrument_name": instrument})
 
     async def _fetch_tick_info(self, instrument: str) -> tuple[float | None, list | None]:
         """
@@ -191,12 +201,11 @@ class _DeribitRPCClient:
         attempts = config.TICK_SIZE_FETCH_RETRIES + 1
         for attempt in range(attempts):
             try:
-                instr_data = await self._rpc(
-                    "public/get_instruments", {"instrument_name": instrument}
+                meta = await self._rpc(
+                    "public/get_instrument", {"instrument_name": instrument}
                 )
-                instruments = instr_data.get("instruments", [])
-                if instruments and isinstance(instruments, list):
-                    meta = instruments[0]
+                # public/get_instrument returns the instrument object directly.
+                if meta and isinstance(meta, dict):
                     tick_size = meta.get("tick_size")
                     tick_steps = meta.get("tick_size_steps") or []
                     if tick_size:
@@ -1080,14 +1089,9 @@ class CalendarExecutor:
         async def _fetch():
             try:
                 async with _DeribitRPCClient(self.client_id, self.client_secret) as client:
-                    result = await client.get_instrument(instrument)
-                    # Result is a list of instruments; extract the first (or matching) one
-                    instruments = result.get("instruments", result.get("instrument", []))
-                    if isinstance(instruments, list) and len(instruments) > 0:
-                        instr = instruments[0]
-                    elif isinstance(instruments, dict):
-                        instr = instruments
-                    else:
+                    instr = await client.get_instrument(instrument)
+                    # public/get_instrument returns the instrument object directly.
+                    if not isinstance(instr, dict):
                         return None
                     tick_size = instr.get("tick_size")
                     if tick_size is not None:
