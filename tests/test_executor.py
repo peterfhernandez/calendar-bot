@@ -976,13 +976,17 @@ class TestTickSizeRounding:
             from execution.executor import _DeribitRPCClient
 
             client = _DeribitRPCClient("test_id", "test_secret")
-            # Mock the get_instrument call
+            # Mock the get_instrument call.  public/get_instrument (singular)
+            # returns the instrument object directly, not a {"instruments": [...]} list.
             with patch.object(client, "_rpc", new_callable=AsyncMock) as mock_rpc:
                 mock_rpc.return_value = {
-                    "instruments": [{"instrument_name": "BTC-3JAN26-60000-C", "tick_size": 0.0001}]
+                    "instrument_name": "BTC-3JAN26-60000-C", "tick_size": 0.0001
                 }
                 instr = await client.get_instrument("BTC-3JAN26-60000-C")
-                assert instr["instruments"][0]["tick_size"] == 0.0001
+                # Verify the singular endpoint was requested with the instrument name.
+                assert mock_rpc.call_args.args[0] == "public/get_instrument"
+                assert mock_rpc.call_args.args[1] == {"instrument_name": "BTC-3JAN26-60000-C"}
+                assert instr["tick_size"] == 0.0001
 
         asyncio.run(fetch_and_check())
 
@@ -1131,6 +1135,37 @@ class TestTickFetchFailureLoud:
         tick, steps = asyncio.run(run())
         assert tick is None and steps is None
         assert any("BTC-3JAN26-60000-C" in r.message for r in caplog.records)
+
+    def test_fetch_tick_info_parses_singular_endpoint_object(self):
+        """
+        Regression: public/get_instrument (singular) returns the instrument
+        object directly.  _fetch_tick_info must parse that shape and populate
+        the tick caches — not expect a {"instruments": [...]} list (which was
+        the wrong plural-endpoint shape that silently broke tick-size lookup).
+        """
+        from execution.executor import (
+            _DeribitRPCClient, _TICK_SIZE_CACHE, _TICK_STEPS_CACHE,
+        )
+
+        _TICK_SIZE_CACHE.pop("BTC-3JAN26-60000-C", None)
+        _TICK_STEPS_CACHE.pop("BTC-3JAN26-60000-C", None)
+
+        async def run():
+            client = _DeribitRPCClient("id", "secret")
+            with patch.object(client, "_rpc", new_callable=AsyncMock) as mock_rpc:
+                mock_rpc.return_value = {
+                    "instrument_name": "BTC-3JAN26-60000-C",
+                    "tick_size": 0.0005,
+                    "tick_size_steps": [{"above_price": 0.1, "tick_size": 0.001}],
+                }
+                tick, steps = await client._fetch_tick_info("BTC-3JAN26-60000-C")
+                assert mock_rpc.call_args.args[0] == "public/get_instrument"
+                return tick, steps
+
+        tick, steps = asyncio.run(run())
+        assert tick == 0.0005
+        assert steps == [{"above_price": 0.1, "tick_size": 0.001}]
+        assert _TICK_SIZE_CACHE["BTC-3JAN26-60000-C"] == 0.0005
 
 
 # ── Phase 18: Stuck-position retry loop fix ──────────────────────────────────
