@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from telegram.ext import CallbackContext
     from data.chain_cache import ChainCache
     from strategy.decision import DecisionEngine
+    from portfolio.tracker import PortfolioTracker
 
 logger = logging.getLogger(__name__)
 
@@ -689,3 +690,91 @@ async def handle_pnl(
     except Exception as exc:
         await update.message.reply_text(f"Error rendering chart: {exc}")
         logger.error("Failed to render /pnl chart: %s", exc)
+
+
+async def handle_deribit_positions(
+    update: Update,
+    context: CallbackContext,
+    portfolio: PortfolioTracker | None,
+    db_path: Path = DB_PATH,
+) -> None:
+    """
+    List the positions currently open on Deribit, cross-referenced against the bot DB.
+
+    Phase 24c: gives the operator the same view as the Deribit UI directly in
+    Telegram, so a "RECONCILE MISMATCH" warning can be investigated without
+    logging into the exchange.  Any live instrument not tracked in the bot DB is
+    flagged, and stuck DB trades still open on Deribit trigger a sync hint.
+
+    Not available in paper mode (there is no live Deribit account).
+    """
+    if config.TRADING_MODE == "paper":
+        await update.message.reply_text("Command not available in paper mode.")
+        return
+
+    if portfolio is None:
+        await update.message.reply_text("Portfolio tracker not available.")
+        return
+
+    try:
+        # Deduped, upper-cased asset/currency list.
+        currencies: list[str] = []
+        for a in config.ASSETS:
+            c = a.upper()
+            if c not in currencies:
+                currencies.append(c)
+
+        lines: list[str] = ["*Deribit open positions*"]
+        live_names: set[str] = set()
+        any_positions = False
+
+        for currency in currencies:
+            positions = portfolio.get_deribit_open_positions(currency)
+            if not positions:
+                continue
+            any_positions = True
+            lines.append(f"\n*{currency}*")
+            for p in positions:
+                name = p.get("instrument_name", "")
+                live_names.add(name)
+                lines.append(
+                    f"  {name}  size={p.get('size', 0.0)}  "
+                    f"index=${p.get('index_price', 0.0):,.2f}  "
+                    f"mark=${p.get('mark_value', 0.0):.4f}"
+                )
+
+        if not any_positions:
+            await update.message.reply_text("No positions currently open on Deribit.")
+            return
+
+        # Cross-reference against the bot DB (stuck-inclusive view, Phase 22b).
+        visible = get_visible_positions(db_path)
+        db_names: set[str] = set()
+        for t in visible:
+            if t.near_instrument:
+                db_names.add(t.near_instrument)
+            if t.far_instrument:
+                db_names.add(t.far_instrument)
+
+        untracked = sorted(n for n in live_names if n and n not in db_names)
+        if untracked:
+            lines.append("")
+            for n in untracked:
+                lines.append(f"⚠️ {n} — Not tracked in bot DB — open manually?")
+
+        # Stuck DB trades that are still open on Deribit.
+        stuck = get_stuck_positions(db_path)
+        stuck_live = [
+            t for t in stuck
+            if (t.near_instrument in live_names) or (t.far_instrument in live_names)
+        ]
+        if stuck_live:
+            lines.append(
+                f"\n{len(stuck_live)} position(s) also shown as ⚠️ STUCK in /positions "
+                f"— use /close or /close_manually to sync."
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"Error fetching Deribit positions: {exc}")
+        logger.error("handle_deribit_positions failed: %s", exc)

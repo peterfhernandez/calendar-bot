@@ -1315,6 +1315,13 @@ In **test/live mode**:
 
 ## Phase 24 — Reconcile Mismatch Remediation for close_stuck Positions
 
+**Status:** Complete — all four sub-phases (24a–24d) implemented and tested; 636 tests passing (18 new across `test_portfolio.py::TestReconcileEnhanced`, `test_telegram_cmd.py::TestHandleDeribitPositions`, and `test_state.py::TestMarkStuckPositionReconciled`). Offline demo: `python -m scratch.scratch_reconcile_mismatch` (read-only, no live orders; aborts in live mode). Full root-cause detail in BOT_PLAN.md Phase 24.
+
+**Implementation notes:**
+- **24a** — `portfolio/tracker.py::get_deribit_open_positions(currency)` calls `private/get_positions` (kind=option) and normalises each non-flat position to `{instrument_name, size, mark_price, index_price, mark_value}`, returning `[]` on any failure. `_reconcile()` now names the live instruments on a mismatch (`_describe_deribit_positions()`), replacing the non-actionable "possible manual trade or missed fill" suffix with `Deribit open: <instruments>`.
+- **24b** — `portfolio/tracker.py::sync_stuck_positions(db_path)` fetches the live position list once (aborting on any fetch error so an API failure never falsely reconciles), and marks a `close_stuck` DB trade `closed` (via new `db/state.py::mark_stuck_position_reconciled`) only when *both* legs are confirmed absent from Deribit. `refresh()` calls it at the top of the test/live path and recomputes SQLite margin/counts so the mismatch resolves in the same cycle. Existing pnl on terminal-but-stuck rows is preserved.
+- **24c** — `telegram_cmd/handlers.py::handle_deribit_positions` lists live Deribit positions grouped by currency, flags any instrument not tracked in the bot DB (`⚠️ Not tracked in bot DB`), and appends a sync hint when stuck DB trades are still open on Deribit. Gated to "Command not available in paper mode." Wired through `TelegramCommandListener(portfolio=…)` (passed from `bot.py`) and added to `COMMAND_REGISTRY`.
+
 **Root cause:** When the bot marks a position `close_stuck` after retry exhaustion (e.g. trades 6–9, `BTC-15JUL26-*` options from 2026-07-14, all with `close_error_reason = "Roll retry limit exceeded close failed after 4 attempts — position needs manual close on Deribit"`), the Deribit position remains open on the exchange. The bot's DB records those positions as closed (with `close_status='close_stuck'`) and excludes their legs from the used-margin calculation (`SQLite margin = $0`), but Deribit's maintenance margin is still tied up. The portfolio tracker detects this divergence on every scan cycle and fires:
 
 ```
@@ -1325,34 +1332,34 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 
 ### 24a — Enhanced reconcile logging (identify the culprit instruments)
 
-- [ ] Add `get_deribit_open_positions(currency) -> list[dict]` to `portfolio/tracker.py` — calls `private/get_positions` (filtered to `kind=option`) for a given currency; returns a list of dicts with `instrument_name`, `size`, `mark_value`, and `index_price`; returns `[]` on any API failure (non-blocking)
-- [ ] Update `_reconcile()` in `portfolio/tracker.py` — when divergence exceeds `RECONCILE_THRESHOLD_PCT`, call `get_deribit_open_positions` for each configured asset and append the result to the WARNING log line: e.g. `"Deribit open: BTC-15JUL26-64000-C qty=0.1, BTC-15JUL26-64000-P qty=0.1"` so the operator immediately knows what is live on the exchange
-- [ ] When the enhanced log line lists specific instruments, replace the trailing `"— possible manual trade or missed fill"` suffix with `"— see instruments above"` to reduce noise on successive warnings
+- [x] Add `get_deribit_open_positions(currency) -> list[dict]` to `portfolio/tracker.py` — calls `private/get_positions` (filtered to `kind=option`) for a given currency; returns a list of dicts with `instrument_name`, `size`, `mark_value`, and `index_price`; returns `[]` on any API failure (non-blocking)
+- [x] Update `_reconcile()` in `portfolio/tracker.py` — when divergence exceeds `RECONCILE_THRESHOLD_PCT`, call `get_deribit_open_positions` for each configured asset and append the result to the WARNING log line: e.g. `"Deribit open: BTC-15JUL26-64000-C qty=0.1, BTC-15JUL26-64000-P qty=0.1"` so the operator immediately knows what is live on the exchange
+- [x] When the enhanced log line lists specific instruments, replace the trailing `"— possible manual trade or missed fill"` suffix with `"— see instruments above"` to reduce noise on successive warnings
 
 ### 24b — Auto-reconcile close_stuck positions after manual Deribit close
 
-- [ ] Add `sync_stuck_positions(db_path) -> list[int]` to `portfolio/tracker.py` — fetches the live Deribit open position list for each `ASSETS` currency; for each `close_stuck` trade in the DB, checks whether both its `near_instrument` and `far_instrument` are absent from the Deribit list; if both absent (the operator has already closed them on Deribit), calls `db.state.close_calendar_trade()` with `close_status='closed'` and logs `INFO "trade_id=N auto-reconciled: both legs confirmed closed on Deribit"`; returns the list of `trade_id`s that were reconciled
-- [ ] Call `sync_stuck_positions()` at the start of each `refresh()` cycle in `portfolio/tracker.py` — runs every scan, so a manual Deribit close is picked up within `SCAN_INTERVAL_SEC` (5 minutes) without operator intervention
-- [ ] After reconciliation, re-run the margin comparison so the mismatch warning resolves in the same cycle it is detected, rather than one cycle later
+- [x] Add `sync_stuck_positions(db_path) -> list[int]` to `portfolio/tracker.py` — fetches the live Deribit open position list for each `ASSETS` currency; for each `close_stuck` trade in the DB, checks whether both its `near_instrument` and `far_instrument` are absent from the Deribit list; if both absent (the operator has already closed them on Deribit), calls `db.state.mark_stuck_position_reconciled()` (sets `close_status='closed'`, preserving any recorded pnl) and logs `INFO "trade_id=N auto-reconciled: both legs confirmed closed on Deribit"`; returns the list of `trade_id`s that were reconciled. Aborts (returns `[]`) on any position-fetch error so an API failure never falsely reconciles
+- [x] Call `sync_stuck_positions()` at the start of each `refresh()` cycle in `portfolio/tracker.py` — runs every scan, so a manual Deribit close is picked up within `SCAN_INTERVAL_SEC` (5 minutes) without operator intervention
+- [x] After reconciliation, re-run the margin comparison so the mismatch warning resolves in the same cycle it is detected, rather than one cycle later
 
 ### 24c — `/deribit_positions` Telegram command
 
-- [ ] Add `handle_deribit_positions(update, context)` to `telegram_cmd/handlers.py` — calls `get_deribit_open_positions()` for each `ASSETS` currency and formats a per-instrument reply: instrument name, size, index price, mark value; groups by currency
-- [ ] Cross-reference the Deribit list against `get_visible_positions()` (the stuck-inclusive DB query from Phase 22b) and append a note for any Deribit instrument not tracked in the bot DB: `"⚠️ Not tracked in bot DB — open manually?"`
-- [ ] Append a summary line: `"N position(s) also shown as ⚠️ STUCK in /positions — use /close or /close_manually to sync."` when stuck trades exist that are still open on Deribit
-- [ ] Reply `"No positions currently open on Deribit."` when the Deribit list is empty for all assets
-- [ ] Add `("deribit_positions", "List positions currently open on Deribit — cross-check vs bot DB")` to `COMMAND_REGISTRY` in `telegram_cmd/listener.py`
+- [x] Add `handle_deribit_positions(update, context)` to `telegram_cmd/handlers.py` — calls `get_deribit_open_positions()` for each `ASSETS` currency and formats a per-instrument reply: instrument name, size, index price, mark value; groups by currency
+- [x] Cross-reference the Deribit list against `get_visible_positions()` (the stuck-inclusive DB query from Phase 22b) and append a note for any Deribit instrument not tracked in the bot DB: `"⚠️ Not tracked in bot DB — open manually?"`
+- [x] Append a summary line: `"N position(s) also shown as ⚠️ STUCK in /positions — use /close or /close_manually to sync."` when stuck trades exist that are still open on Deribit
+- [x] Reply `"No positions currently open on Deribit."` when the Deribit list is empty for all assets
+- [x] Add `("deribit_positions", "List positions currently open on Deribit — cross-check vs bot DB")` to `COMMAND_REGISTRY` in `telegram_cmd/listener.py`
 
 ### 24d — Tests and scratch
 
-- [ ] Add `TestReconcileEnhanced` to `tests/test_portfolio.py`
-  - [ ] When mismatch is detected, `get_deribit_open_positions` is called and instrument names appear in the log
-  - [ ] `sync_stuck_positions` marks a `close_stuck` trade as `closed` when both legs are absent from the Deribit list
-  - [ ] `sync_stuck_positions` leaves a `close_stuck` trade unchanged when either leg is still open on Deribit
-  - [ ] Reconcile warning resolves in the same cycle after `sync_stuck_positions` auto-closes the trade
-- [ ] Add `TestHandleDeribitPositions` to `tests/test_telegram_cmd.py`
-  - [ ] Reply lists each Deribit instrument with size and mark value
-  - [ ] Instruments not tracked in the DB are flagged `"⚠️ Not tracked in bot DB"`
-  - [ ] Stuck DB trades still open on Deribit trigger the sync summary line
-  - [ ] `"No positions"` reply when Deribit list is empty
-- [ ] Add `scratch/scratch_reconcile_mismatch.py` — connects to the paper/test Deribit account, fetches the live position list, compares it against `close_stuck` trades in the DB, and prints a reconciliation report; aborts if `TRADING_MODE == "live"`
+- [x] Add `TestReconcileEnhanced` to `tests/test_portfolio.py`
+  - [x] When mismatch is detected, `get_deribit_open_positions` is called and instrument names appear in the log
+  - [x] `sync_stuck_positions` marks a `close_stuck` trade as `closed` when both legs are absent from the Deribit list
+  - [x] `sync_stuck_positions` leaves a `close_stuck` trade unchanged when either leg is still open on Deribit
+  - [x] Reconcile warning resolves in the same cycle after `sync_stuck_positions` auto-closes the trade
+- [x] Add `TestHandleDeribitPositions` to `tests/test_telegram_cmd.py`
+  - [x] Reply lists each Deribit instrument with size and mark value
+  - [x] Instruments not tracked in the DB are flagged `"⚠️ Not tracked in bot DB"`
+  - [x] Stuck DB trades still open on Deribit trigger the sync summary line
+  - [x] `"No positions"` reply when Deribit list is empty
+- [x] Add `scratch/scratch_reconcile_mismatch.py` — connects to the paper/test Deribit account, fetches the live position list, compares it against `close_stuck` trades in the DB, and prints a reconciliation report; aborts if `TRADING_MODE == "live"`

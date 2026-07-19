@@ -196,6 +196,7 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
             engine=loop.engine,
             cache=cache,
             db_path=loop.engine._db_path,
+            portfolio=portfolio,
         )
     else:
         logger.info("TELEGRAM_TOKEN not set — Telegram command listener disabled.")

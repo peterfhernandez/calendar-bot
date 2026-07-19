@@ -16,7 +16,9 @@ from db.state import (
     get_visible_positions,
     get_close_status,
     get_open_trades,
+    get_stuck_positions,
     mark_position_close_stuck,
+    mark_stuck_position_reconciled,
 )
 
 
@@ -521,3 +523,34 @@ class TestGetCloseStatus:
 
     def test_missing_trade_returns_none(self, db):
         assert get_close_status(9999, db_path=db) is None
+
+
+class TestMarkStuckPositionReconciled:
+    """Phase 24b — auto-reconcile a close_stuck trade the operator closed on Deribit."""
+
+    def test_reconciles_stuck_open_trade(self, db):
+        t = _open_trade(db)
+        mark_position_close_stuck(t.id, error_reason="timeout", db_path=db)
+        mark_stuck_position_reconciled(t.id, db_path=db)
+        assert get_close_status(t.id, db_path=db) == "closed"
+        # Leaves all open-position queries.
+        assert get_open_trades(db_path=db) == []
+        assert get_visible_positions(db_path=db) == []
+        assert get_stuck_positions(db_path=db) == []
+
+    def test_preserves_existing_pnl_for_terminal_stuck_trade(self, db):
+        t = _open_trade(db)
+        # Emulate the observed state: terminal result + recorded pnl, but stuck.
+        close_calendar_trade(
+            t.id, date_close=date(2026, 6, 7),
+            spot_close=101_000.0, pnl=-1.0, result="Loss (Stop)", db_path=db,
+        )
+        mark_position_close_stuck(t.id, error_reason="timeout", db_path=db)
+        reconciled = mark_stuck_position_reconciled(t.id, db_path=db)
+        assert reconciled.close_status == "closed"
+        assert reconciled.pnl == -1.0            # pnl not clobbered
+        assert reconciled.close_error_reason is None
+
+    def test_missing_trade_raises(self, db):
+        with pytest.raises(ValueError):
+            mark_stuck_position_reconciled(9999, db_path=db)

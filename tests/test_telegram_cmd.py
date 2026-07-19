@@ -800,6 +800,7 @@ class TestSetMyCommands:
             "start_with_assets", "drain_and_new", "help",
             "info", "close", "close_manually",  # stuck position recovery commands
             "pnl",  # equity curve chart
+            "deribit_positions",  # Phase 24c — live Deribit position cross-check
         }
         assert expected == command_names
 
@@ -1482,3 +1483,109 @@ class TestGlobalErrorHandler:
         ctx.error = ValueError("boom")
         await error_handler(update, ctx)
         update.message.reply_text.assert_awaited()
+
+
+# ── Phase 24c — /deribit_positions ───────────────────────────────────────────
+
+class _FakePortfolio:
+    """Minimal stand-in for PortfolioTracker.get_deribit_open_positions()."""
+    def __init__(self, positions_by_currency: dict[str, list[dict]]) -> None:
+        self._pos = positions_by_currency
+
+    def get_deribit_open_positions(self, currency: str) -> list[dict]:
+        return self._pos.get(currency, [])
+
+
+def _deribit_pos(instrument: str, size: float = 0.1) -> dict:
+    return {
+        "instrument_name": instrument,
+        "size":            size,
+        "mark_price":      0.0005,
+        "index_price":     64_000.0,
+        "mark_value":      0.0005 * abs(size),
+    }
+
+
+class TestHandleDeribitPositions:
+    @pytest.mark.asyncio
+    async def test_lists_instruments(self):
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        portfolio = _FakePortfolio({"BTC": [_deribit_pos("BTC-15JUL26-64000-C")]})
+
+        db_trade = _make_trade(near_instrument="BTC-15JUL26-64000-C",
+                               far_instrument="BTC-28AUG26-64000-C")
+        with patch("config.TRADING_MODE", "test"), \
+             patch("config.ASSETS", ["BTC"]), \
+             patch("telegram_cmd.handlers.get_visible_positions", return_value=[db_trade]), \
+             patch("telegram_cmd.handlers.get_stuck_positions", return_value=[]):
+            await handlers.handle_deribit_positions(update, context, portfolio, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "BTC-15JUL26-64000-C" in text
+        assert "size=" in text
+        assert "mark=" in text
+
+    @pytest.mark.asyncio
+    async def test_untracked_instrument_flagged(self):
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        # Deribit holds an instrument the DB doesn't track.
+        portfolio = _FakePortfolio({"BTC": [_deribit_pos("BTC-15JUL26-64000-C")]})
+
+        with patch("config.TRADING_MODE", "test"), \
+             patch("config.ASSETS", ["BTC"]), \
+             patch("telegram_cmd.handlers.get_visible_positions", return_value=[]), \
+             patch("telegram_cmd.handlers.get_stuck_positions", return_value=[]):
+            await handlers.handle_deribit_positions(update, context, portfolio, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "Not tracked in bot DB" in text
+
+    @pytest.mark.asyncio
+    async def test_stuck_trade_still_open_triggers_sync_line(self):
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        portfolio = _FakePortfolio({"BTC": [_deribit_pos("BTC-15JUL26-64000-C")]})
+
+        stuck_trade = _make_trade(near_instrument="BTC-15JUL26-64000-C",
+                                  far_instrument="BTC-28AUG26-64000-C")
+        with patch("config.TRADING_MODE", "test"), \
+             patch("config.ASSETS", ["BTC"]), \
+             patch("telegram_cmd.handlers.get_visible_positions", return_value=[stuck_trade]), \
+             patch("telegram_cmd.handlers.get_stuck_positions", return_value=[stuck_trade]):
+            await handlers.handle_deribit_positions(update, context, portfolio, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "STUCK" in text
+        assert "/close" in text
+
+    @pytest.mark.asyncio
+    async def test_no_positions_reply(self):
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        portfolio = _FakePortfolio({})  # nothing open on Deribit
+
+        with patch("config.TRADING_MODE", "test"), \
+             patch("config.ASSETS", ["BTC"]):
+            await handlers.handle_deribit_positions(update, context, portfolio, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "No positions currently open on Deribit" in text
+
+    @pytest.mark.asyncio
+    async def test_paper_mode_not_available(self):
+        update  = _make_update()
+        context = _make_context()
+        db_path = Path(tempfile.mktemp(suffix=".db"))
+        portfolio = _FakePortfolio({"BTC": [_deribit_pos("BTC-15JUL26-64000-C")]})
+
+        with patch("config.TRADING_MODE", "paper"):
+            await handlers.handle_deribit_positions(update, context, portfolio, db_path)
+
+        text = update.message.reply_text.call_args[0][0]
+        assert "not available in paper mode" in text.lower()

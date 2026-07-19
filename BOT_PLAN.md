@@ -1608,6 +1608,8 @@ Default `120` (4× `CHAIN_CACHE_TTL_SEC`). The extra headroom above the 30s TTL 
 
 ## Phase 24 — Reconcile Mismatch Remediation for close_stuck Positions
 
+**Status:** Complete — all three improvements (24a–24c) implemented and tested; 636 tests passing (18 new). Offline demo: `python -m scratch.scratch_reconcile_mismatch` (read-only, no live orders). `portfolio/tracker.py` gains `get_deribit_open_positions()`, `_describe_deribit_positions()`, and `sync_stuck_positions()` (called at the top of every test/live `refresh()`); `_reconcile()` names the live Deribit instruments on a mismatch. `db/state.py` gains `mark_stuck_position_reconciled()`. `telegram_cmd/handlers.py` gains `handle_deribit_positions()`, wired via `TelegramCommandListener(portfolio=…)` from `bot.py` and registered in `COMMAND_REGISTRY`. `sync_stuck_positions()` requires **both** legs absent from the live Deribit list before marking a stuck trade closed and aborts on any position-fetch error, so a transient API failure can never falsely reconcile every stuck trade.
+
 ### Root cause
 
 When `_mark_stuck_and_notify()` fires (after `POSITION_FAILURE_RETRY_CAP` failed close/roll attempts), it updates the DB `close_status` to `'close_stuck'` and fires a "MANUAL ACTION REQUIRED" Telegram alert, but it does not successfully close the Deribit position — that is the entire reason the position is stuck. The Deribit account therefore keeps the margin tied up from those legs.
