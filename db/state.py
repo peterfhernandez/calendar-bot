@@ -642,6 +642,53 @@ def mark_position_manually_closed(
     return _row_to_trade(row)
 
 
+def mark_stuck_position_reconciled(trade_id: int, db_path: Path = DB_PATH) -> CalendarTrade:
+    """
+    Mark a ``close_stuck`` trade as fully closed after both legs are confirmed
+    gone from Deribit (Phase 24b auto-reconcile).
+
+    The operator has manually closed the position on the exchange, so the DB
+    record — which is still flagged ``close_stuck`` — should be reconciled to
+    ``close_status='closed'``.  Any P&L the bot previously recorded on the row
+    is preserved; if the trade's ``result`` is still an open status (no
+    terminal close was ever recorded), a terminal ``result`` and ``date_close``
+    are stamped so the row leaves every open-position query.
+    """
+    init_db(db_path)
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Calendar trade ID {trade_id} not found")
+
+        if row["result"] in _OPEN_STATUSES:
+            conn.execute(
+                """
+                UPDATE calendar_trades
+                SET close_status = 'closed',
+                    result = 'Closed',
+                    date_close = COALESCE(date_close, ?),
+                    close_error_reason = NULL
+                WHERE id = ?
+                """,
+                (date.today().isoformat(), trade_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE calendar_trades
+                SET close_status = 'closed', close_error_reason = NULL
+                WHERE id = ?
+                """,
+                (trade_id,),
+            )
+        row = conn.execute(
+            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+        ).fetchone()
+    return _row_to_trade(row)
+
+
 def get_stuck_positions(db_path: Path = DB_PATH) -> list[CalendarTrade]:
     """
     Fetch all positions marked as close_stuck (failed close, awaiting manual intervention).

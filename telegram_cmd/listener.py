@@ -50,6 +50,7 @@ COMMAND_REGISTRY: list[tuple[str, str]] = [
     ("close",             "Retry closing a stuck position: /close trade_id=N"),
     ("close_manually",    "Manually close position with known spread: /close_manually trade_id=N spread=VALUE"),
     ("pnl",               "Equity curve: realized P&L (black) + unrealized PnL (dotted green)"),
+    ("deribit_positions", "List positions currently open on Deribit — cross-check vs bot DB"),
     ("help",              "List all available commands with descriptions"),
 ]
 
@@ -88,6 +89,9 @@ class TelegramCommandListener:
         The live ChainCache (for IV/OI lookups in /positions and /portfolio).
     db_path
         Path to the SQLite database used to load open/closed trade records.
+    portfolio
+        Optional PortfolioTracker, used by /deribit_positions to query the live
+        Deribit position list.  May be None (e.g. paper mode or no credentials).
     """
 
     def __init__(
@@ -95,12 +99,14 @@ class TelegramCommandListener:
         engine: DecisionEngine,
         cache: ChainCache,
         db_path: Path = DB_PATH,
+        portfolio=None,
     ) -> None:
-        self._engine   = engine
-        self._cache    = cache
-        self._db_path  = db_path
+        self._engine    = engine
+        self._cache     = cache
+        self._db_path   = db_path
+        self._portfolio = portfolio
         self._app: Application | None = None
-        self._stopped  = asyncio.Event()
+        self._stopped   = asyncio.Event()
 
     def _build_app(self) -> Application:
         from telegram.ext import Application, CommandHandler
@@ -115,9 +121,10 @@ class TelegramCommandListener:
             .build()
         )
 
-        engine  = self._engine
-        cache   = self._cache
-        db_path = self._db_path
+        engine    = self._engine
+        cache     = self._cache
+        db_path   = self._db_path
+        portfolio = self._portfolio
 
         # Wrap each handler to inject dependencies and enforce chat security.
         @_require_authorized_chat
@@ -177,6 +184,10 @@ class TelegramCommandListener:
             await handlers.handle_pnl(update, context, cache, db_path)
 
         @_require_authorized_chat
+        async def cmd_deribit_positions(update, context):
+            await handlers.handle_deribit_positions(update, context, portfolio, db_path)
+
+        @_require_authorized_chat
         async def cmd_help(update, context):
             await handlers.handle_help(update, context)
 
@@ -194,6 +205,7 @@ class TelegramCommandListener:
         app.add_handler(CommandHandler("close",             cmd_close))
         app.add_handler(CommandHandler("close_manually",    cmd_close_manually))
         app.add_handler(CommandHandler("pnl",               cmd_pnl))
+        app.add_handler(CommandHandler("deribit_positions", cmd_deribit_positions))
         app.add_handler(CommandHandler("help",              cmd_help))
 
         # Global error handler (Phase 22c): python-telegram-bot's default for an

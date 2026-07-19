@@ -31,7 +31,12 @@ from typing import Optional, NamedTuple
 
 import config
 from data.chain_cache import ChainCache
-from db.state import DB_PATH, get_connection
+from db.state import (
+    DB_PATH,
+    get_connection,
+    get_stuck_positions,
+    mark_stuck_position_reconciled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +238,16 @@ class PortfolioTracker:
             )
 
         # ── Test/live mode: Deribit REST API ──────────────────────────────────
+        # Phase 24b: auto-reconcile any close_stuck trades the operator has
+        # already closed on Deribit, before the margin comparison runs, so the
+        # reconcile-mismatch warning resolves in the same cycle it is detected.
+        reconciled_ids = self.sync_stuck_positions(self._db_path)
+        if reconciled_ids:
+            # DB changed — recompute the SQLite-derived margin/count so the
+            # reconciliation below compares against fresh numbers.
+            self._used_margin         = self._calc_used_margin()
+            self._open_position_count = self._count_open_positions()
+
         has_credentials = bool(self._client_id and self._client_secret)
 
         if has_credentials:
@@ -392,6 +407,122 @@ class PortfolioTracker:
         url    = f"{self._rest_url}/api/v2/private/get_positions?{params}"
         data   = _rest_get(url, bearer_token=token)
         return data.get("result", [])
+
+    def get_deribit_open_positions(self, currency: str) -> list[dict]:
+        """Return the account's live option positions for one currency (Phase 24a).
+
+        Calls ``private/get_positions`` (kind=option) and normalises each
+        non-flat position to a small dict the reconcile logger and the
+        ``/deribit_positions`` Telegram command can format directly:
+
+            {instrument_name, size, mark_price, index_price, mark_value}
+
+        Returns ``[]`` on any failure (network, auth, paper mode, no
+        credentials) so callers never block on it.  Because a failure is
+        indistinguishable from "genuinely no positions" here, the
+        safety-critical auto-reconcile path (``sync_stuck_positions``) fetches
+        positions itself and aborts on error rather than relying on this
+        method's empty-list-on-failure contract.
+        """
+        if config.TRADING_MODE == "paper":
+            return []
+        if not self._client_id or not self._client_secret:
+            return []
+        try:
+            token = self._authenticate()
+            positions = self._get_positions(token, currency)
+        except Exception as exc:
+            logger.debug("get_deribit_open_positions(%s) failed: %s", currency, exc)
+            return []
+
+        result: list[dict] = []
+        for p in positions:
+            size = p.get("size", 0.0)
+            if not size:
+                continue
+            mark_price = p.get("mark_price", 0.0)
+            result.append({
+                "instrument_name": p.get("instrument_name", ""),
+                "size":            size,
+                "mark_price":      mark_price,
+                "index_price":     p.get("index_price", 0.0),
+                "mark_value":      mark_price * abs(size),
+            })
+        return result
+
+    def _describe_deribit_positions(self) -> str:
+        """Return a one-line 'INSTR qty=N, …' description of live Deribit legs.
+
+        Used to make the reconcile-mismatch warning actionable (Phase 24a) by
+        naming exactly which instruments Deribit still holds.  Returns an empty
+        string if nothing is open or the position fetch fails.
+        """
+        descs: list[str] = []
+        for currency in _assets_to_currencies(config.ASSETS):
+            for p in self.get_deribit_open_positions(currency):
+                descs.append(f"{p['instrument_name']} qty={p['size']}")
+        return ", ".join(descs)
+
+    def sync_stuck_positions(self, db_path: Path | None = None) -> list[int]:
+        """Auto-close ``close_stuck`` DB trades the operator has closed on Deribit (Phase 24b).
+
+        For every trade flagged ``close_stuck`` in the DB, checks whether *both*
+        its legs are absent from Deribit's live position list.  If both are gone
+        the operator has already closed the position on the exchange, so the DB
+        row is reconciled to ``close_status='closed'``.  A partially-closed
+        position (one leg still live) is left untouched.
+
+        The live position list is fetched here directly (not via
+        ``get_deribit_open_positions``' empty-on-failure contract) and the whole
+        sync aborts on any fetch error, so an API failure can never be mistaken
+        for "no positions open" and falsely reconcile every stuck trade.
+
+        Returns the list of reconciled ``trade_id``s.
+        """
+        if config.TRADING_MODE == "paper":
+            return []
+        if not self._client_id or not self._client_secret:
+            return []
+
+        path = db_path or self._db_path
+        stuck = get_stuck_positions(path)
+        if not stuck:
+            return []
+
+        try:
+            token = self._authenticate()
+            live: set[str] = set()
+            for currency in _assets_to_currencies(config.ASSETS):
+                for p in self._get_positions(token, currency):
+                    name = p.get("instrument_name")
+                    if name and p.get("size", 0.0):
+                        live.add(name)
+        except Exception as exc:
+            logger.debug(
+                "sync_stuck_positions: could not fetch Deribit positions "
+                "(%s) — skipping auto-reconcile this cycle",
+                exc,
+            )
+            return []
+
+        reconciled: list[int] = []
+        for t in stuck:
+            near, far = t.near_instrument, t.far_instrument
+            near_gone = (not near) or (near not in live)
+            far_gone  = (not far)  or (far  not in live)
+            if near_gone and far_gone:
+                try:
+                    mark_stuck_position_reconciled(t.id, db_path=path)
+                    logger.info(
+                        "trade_id=%d auto-reconciled: both legs confirmed closed on Deribit",
+                        t.id,
+                    )
+                    reconciled.append(t.id)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to auto-reconcile stuck trade_id=%d: %s", t.id, exc
+                    )
+        return reconciled
 
     def simulate_margin(
         self,
@@ -657,11 +788,22 @@ class PortfolioTracker:
         divergence = abs(api_margin - db_margin) / max_val
 
         if divergence > _RECONCILE_THRESHOLD:
-            logger.warning(
-                "RECONCILE MISMATCH: Deribit margin $%.2f vs SQLite margin $%.2f "
-                "(divergence %.0f%%) — possible manual trade or missed fill",
-                api_margin, db_margin, divergence * 100,
-            )
+            # Name the live Deribit instruments so the warning is actionable
+            # (Phase 24a): the operator can see exactly what is open on the
+            # exchange without logging into the Deribit UI separately.
+            open_desc = self._describe_deribit_positions()
+            if open_desc:
+                logger.warning(
+                    "RECONCILE MISMATCH: Deribit margin $%.2f vs SQLite margin $%.2f "
+                    "(divergence %.0f%%) — Deribit open: %s",
+                    api_margin, db_margin, divergence * 100, open_desc,
+                )
+            else:
+                logger.warning(
+                    "RECONCILE MISMATCH: Deribit margin $%.2f vs SQLite margin $%.2f "
+                    "(divergence %.0f%%) — possible manual trade or missed fill",
+                    api_margin, db_margin, divergence * 100,
+                )
         else:
             logger.debug(
                 "RECONCILE OK: Deribit $%.2f vs SQLite $%.2f (divergence %.1f%%)",

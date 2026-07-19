@@ -507,6 +507,189 @@ class TestReconciliation:
         assert not any("RECONCILE MISMATCH" in w for w in warnings)
 
 
+# ── Tests: Phase 24 — reconcile mismatch remediation ─────────────────────────
+
+def _mark_stuck(db: Path, trade_id: int) -> None:
+    """Flag a trade close_stuck directly in the DB."""
+    from db.state import mark_position_close_stuck
+    mark_position_close_stuck(
+        trade_id=trade_id,
+        error_reason="Roll retry limit exceeded — manual close needed",
+        db_path=db,
+    )
+
+
+def _seed_stuck_trade(
+    db: Path,
+    near_instrument: str,
+    far_instrument: str,
+    result_terminal: bool = True,
+) -> int:
+    """Seed a close_stuck trade with named legs; return its id."""
+    trade = create_calendar_trade(
+        asset="BTC",
+        date_open=date.today(),
+        option_type="Call",
+        strike=64_000.0,
+        expiry_near="15JUL26",
+        expiry_far="28AUG26",
+        near_days=3,
+        far_days=45,
+        qty=0.1,
+        spot_open=64_000.0,
+        near_prem=5.0,
+        far_prem=15.0,
+        net_debit=10.0,
+        near_instrument=near_instrument,
+        far_instrument=far_instrument,
+        db_path=db,
+    )
+    if result_terminal:
+        # Emulate the observed state: the bot recorded a closure that never
+        # executed on Deribit, so result is terminal but close_status='close_stuck'.
+        with get_connection(db) as conn:
+            conn.execute(
+                "UPDATE calendar_trades SET result='Loss (Stop)', date_close=?, pnl=-1.0 WHERE id=?",
+                (date.today().isoformat(), trade.id),
+            )
+    _mark_stuck(db, trade.id)
+    return trade.id
+
+
+def _fake_position(instrument: str, size: float = 0.1) -> dict:
+    return {
+        "instrument_name": instrument,
+        "size":            size,
+        "mark_price":      0.0005,
+        "index_price":     64_000.0,
+    }
+
+
+class TestReconcileEnhanced:
+
+    def _make_fake_rest_get(self, margin_btc: float, positions: list[dict]):
+        def fake(url, bearer_token=None, timeout=10):
+            if "public/auth" in url:
+                return _fake_auth_response()
+            if "get_account_summary" in url:
+                return {"result": {
+                    "equity":             1.0,
+                    "available_funds":    0.9,
+                    "initial_margin":     margin_btc,
+                    "maintenance_margin": margin_btc,
+                }}
+            if "get_positions" in url:
+                return {"result": positions}
+            return {"result": []}
+        return fake
+
+    def _run_refresh(self, db: Path, margin_btc: float, positions: list[dict]) -> list[str]:
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        import logging
+        warnings: list[str] = []
+
+        class CapturingHandler(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    warnings.append(record.getMessage())
+
+        log = logging.getLogger("portfolio.tracker")
+        handler = CapturingHandler()
+        log.addHandler(handler)
+        old_level = log.level
+        log.setLevel(logging.WARNING)
+        try:
+            with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post):
+                with patch("portfolio.tracker._rest_get",
+                           side_effect=self._make_fake_rest_get(margin_btc, positions)):
+                    with patch("config.ASSETS", ["BTC"]):
+                        tracker.refresh(spot_prices={"BTC": 100_000.0})
+        finally:
+            log.removeHandler(handler)
+            log.setLevel(old_level)
+        return warnings
+
+    def test_mismatch_warning_names_instruments(self):
+        db = _make_db()
+        # SQLite margin $0 (no open non-stuck trades), Deribit margin large →
+        # divergence 100%. get_positions returns a live BTC instrument.
+        positions = [_fake_position("BTC-15JUL26-64000-C")]
+        warnings = self._run_refresh(db, margin_btc=0.05, positions=positions)
+        mismatch = [w for w in warnings if "RECONCILE MISMATCH" in w]
+        assert mismatch, "expected a reconcile mismatch warning"
+        assert any("BTC-15JUL26-64000-C" in w for w in mismatch)
+        assert any("Deribit open:" in w for w in mismatch)
+
+    def test_sync_closes_when_both_legs_absent(self):
+        db = _make_db()
+        tid = _seed_stuck_trade(db, "BTC-15JUL26-64000-C", "BTC-28AUG26-64000-C")
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        with patch("portfolio.tracker._rest_get",
+                   side_effect=self._make_fake_rest_get(0.0, positions=[])):
+            with patch("config.ASSETS", ["BTC"]):
+                reconciled = tracker.sync_stuck_positions(db)
+        assert reconciled == [tid]
+        from db.state import get_close_status
+        assert get_close_status(tid, db_path=db) == "closed"
+
+    def test_sync_leaves_when_leg_still_open(self):
+        db = _make_db()
+        tid = _seed_stuck_trade(db, "BTC-15JUL26-64000-C", "BTC-28AUG26-64000-C")
+        # Near leg is still open on Deribit → must not reconcile.
+        positions = [_fake_position("BTC-15JUL26-64000-C")]
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        with patch("portfolio.tracker._rest_get",
+                   side_effect=self._make_fake_rest_get(0.05, positions=positions)):
+            with patch("config.ASSETS", ["BTC"]):
+                reconciled = tracker.sync_stuck_positions(db)
+        assert reconciled == []
+        from db.state import get_close_status
+        assert get_close_status(tid, db_path=db) == "close_stuck"
+
+    def test_sync_aborts_on_fetch_failure(self):
+        """An API failure must never falsely reconcile every stuck trade."""
+        db = _make_db()
+        tid = _seed_stuck_trade(db, "BTC-15JUL26-64000-C", "BTC-28AUG26-64000-C")
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        with patch("portfolio.tracker._rest_get", side_effect=OSError("unreachable")):
+            with patch("config.ASSETS", ["BTC"]):
+                reconciled = tracker.sync_stuck_positions(db)
+        assert reconciled == []
+        from db.state import get_close_status
+        assert get_close_status(tid, db_path=db) == "close_stuck"
+
+    def test_reconcile_resolves_same_cycle_after_sync(self):
+        db = _make_db()
+        tid = _seed_stuck_trade(db, "BTC-15JUL26-64000-C", "BTC-28AUG26-64000-C")
+        # Operator closed on Deribit: no positions, margin 0. refresh() should
+        # auto-reconcile the stuck trade and emit no mismatch warning.
+        warnings = self._run_refresh(db, margin_btc=0.0, positions=[])
+        assert not any("RECONCILE MISMATCH" in w for w in warnings)
+        from db.state import get_close_status
+        assert get_close_status(tid, db_path=db) == "closed"
+
+    def test_get_deribit_open_positions_paper_mode_returns_empty(self):
+        db = _make_db()
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        with patch("config.TRADING_MODE", "paper"):
+            assert tracker.get_deribit_open_positions("BTC") == []
+
+
 # ── Tests: portfolio_view formatting ─────────────────────────────────────────
 
 class TestPortfolioView:
