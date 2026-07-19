@@ -1288,26 +1288,28 @@ In **test/live mode**:
 
 ## Phase 23 — Feed Freshness Watchdog
 
+**Status:** Complete — watchdog implemented and tested; 622 tests passing (5 new in `tests/test_feed.py::TestFeedFreshnessWatchdog`). Offline demo: `python -m scratch.scratch_feed_watchdog` (no live orders, no network). Full root-cause detail in BOT_PLAN.md Phase 23.
+
 **Root cause:** `DeribitFeed` detects WS drops via TCP/ping failures but cannot detect Deribit silently stopping ticker data pushes while the connection remains technically open. Observed 2026-07-19: the feed last subscribed to 298 BTC + 234 ETH instruments at 07:55 AEST; no reconnect event appeared for the remaining 7+ hours of the session. Every scan from ~08:00 onward logged the same warning — "298 stale instrument(s) excluded from BTC chain / 234 stale instrument(s) excluded from ETH chain" — because all 532 cached snapshots had aged past the 30s TTL within seconds of Deribit stopping its push stream. The scanner received 0 fresh instruments and returned 0 candidates on every tick; the bot stayed in IDLE indefinitely with no log indication the feed was dead. The only recovery was a manual restart. See [BOT_PLAN.md Phase 23](BOT_PLAN.md#phase-23--feed-freshness-watchdog) for full root-cause detail.
 
 ### 23a — Watchdog in `DeribitFeed`
 
-- [ ] Add `FEED_WATCHDOG_TIMEOUT_SEC` to `config.py` (default `120`; set `0` to disable) — seconds without a ticker update before a reconnect is forced; 4× `CHAIN_CACHE_TTL_SEC` by default gives a buffer above the 30s staleness threshold while still recovering within minutes
-- [ ] Add `_last_ticker_at: float` to `DeribitFeed.__init__` (initialised to `time.time()` at connection, so a very quiet but live market does not trigger an immediate false positive)
-- [ ] Update `_handle_message()` — set `_last_ticker_at = time.time()` on every successfully parsed ticker notification
-- [ ] Add `async def _watchdog(self, ws)` — sleeps `FEED_WATCHDOG_TIMEOUT_SEC / 2` between checks; if `time.time() - _last_ticker_at > FEED_WATCHDOG_TIMEOUT_SEC`, logs `WARNING "Feed watchdog: no ticker in {elapsed:.0f}s — forcing reconnect"` then calls `await ws.close()`; the existing reconnect loop in `start()` handles the reconnect and re-subscription
-- [ ] Launch `_watchdog` as an `asyncio.create_task` alongside the pump task in `_connect_and_stream()`, after `_subscribe_all()` completes (to avoid a race between subscription latency and the first ticker arriving); cancel it in the same `except` block that cancels the pump task
-- [ ] Skip watchdog task creation when `FEED_WATCHDOG_TIMEOUT_SEC == 0` (feature flag for environments where Deribit is known to have quiet periods)
+- [x] Add `FEED_WATCHDOG_TIMEOUT_SEC` to `config.py` (default `120`; set `0` to disable) — seconds without a ticker update before a reconnect is forced; 4× `CHAIN_CACHE_TTL_SEC` by default gives a buffer above the 30s staleness threshold while still recovering within minutes
+- [x] Add `_last_ticker_at: float` to `DeribitFeed.__init__` (set to `time.time()` in `_connect_and_stream()` after subscriptions complete, so a very quiet but live market does not trigger an immediate false positive)
+- [x] Update `_handle_message()` — set `_last_ticker_at = time.time()` on every successfully parsed ticker notification
+- [x] Add `async def _watchdog(self, ws)` — sleeps `FEED_WATCHDOG_TIMEOUT_SEC / 2` (floored at 1s) between checks; if `time.time() - _last_ticker_at > FEED_WATCHDOG_TIMEOUT_SEC`, logs `WARNING "Feed watchdog: no ticker in {elapsed:.0f}s (> {timeout}s) — forcing reconnect"` then calls `await ws.close()`; the existing reconnect loop in `start()` handles the reconnect and re-subscription
+- [x] Launch `_watchdog` as an `asyncio.create_task` alongside the pump task in `_connect_and_stream()`, after `_subscribe_all()` completes (to avoid a race between subscription latency and the first ticker arriving); cancel it in the `finally` block that also cancels the pump task
+- [x] Skip watchdog task creation when `FEED_WATCHDOG_TIMEOUT_SEC == 0` (feature flag for environments where Deribit is known to have quiet periods)
 
 ### 23b — Tests and scratch
 
-- [ ] Add `TestFeedFreshnessWatchdog` to `tests/test_feed.py`
-  - [ ] No ticker received within `FEED_WATCHDOG_TIMEOUT_SEC` → watchdog closes the WS (verify `ws.close()` called)
-  - [ ] Ticker received before timeout → watchdog does not close the WS (verify `_last_ticker_at` is reset)
-  - [ ] Watchdog task is cancelled cleanly when the WS closes for any other reason (pump task finishes first)
-  - [ ] `FEED_WATCHDOG_TIMEOUT_SEC = 0` → no watchdog task is created (verify task count unchanged)
-- [ ] Add `scratch/scratch_feed_watchdog.py` — connects to the paper feed, waits for initial subscriptions, then simulates a ticker blackout by not processing updates and verifies the watchdog fires and the feed reconnects within `FEED_WATCHDOG_TIMEOUT_SEC + 30` seconds; aborts if `TRADING_MODE == "live"`
-- [ ] Add `FEED_WATCHDOG_TIMEOUT_SEC` to `config_test.py` with value matching `config.py` default (parity requirement from Phase 21f)
+- [x] Add `TestFeedFreshnessWatchdog` to `tests/test_feed.py`
+  - [x] No ticker received within `FEED_WATCHDOG_TIMEOUT_SEC` → watchdog closes the WS (verify `ws.close()` called)
+  - [x] Ticker received before timeout → watchdog does not close the WS; `_handle_message` updates `_last_ticker_at`
+  - [x] Watchdog task is cancelled cleanly when the WS closes for any other reason (pump task finishes first)
+  - [x] `FEED_WATCHDOG_TIMEOUT_SEC = 0` → no watchdog task is created (verify `_watchdog` not called)
+- [x] Add `scratch/scratch_feed_watchdog.py` — drives the real `DeribitFeed._watchdog` and `start()` reconnect loop against a controllable in-memory transport that delivers a ticker burst then goes silent; verifies the watchdog closes each silent socket and the feed reconnects automatically; aborts if `TRADING_MODE == "live"` (offline, read-only, no live orders)
+- [x] Add `FEED_WATCHDOG_TIMEOUT_SEC` to `config_test.py` with value matching `config.py` default (parity requirement from Phase 21f)
 
 ---
 

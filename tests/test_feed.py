@@ -10,11 +10,13 @@ mocked so the suite can run offline and in CI.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import config
 from data.deribit_feed import DeribitFeed, TickerSnapshot
 from data.chain_cache import ChainCache
 
@@ -405,6 +407,115 @@ class TestFeedOpenPositionCoverage(unittest.IsolatedAsyncioTestCase):
         feed = self._feed(lambda: [self._FAR_LEG])
         await self._run_subscribe_all(feed)
         self.assertIn(self._FAR_LEG, feed._instruments["BTC"])
+
+
+# ── Feed freshness watchdog (Phase 23) ─────────────────────────────────────────
+
+class _FakeWS:
+    """Minimal async-context-manager / async-iterator stand-in for a WebSocket.
+
+    Yields any queued messages then ends the pump loop; records close() calls.
+    """
+
+    def __init__(self, messages=None):
+        self._messages = list(messages or [])
+        self.closed = False
+        self.sent: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._messages:
+            return self._messages.pop(0)
+        raise StopAsyncIteration
+
+    async def send(self, payload):
+        self.sent.append(payload)
+
+    async def close(self):
+        self.closed = True
+
+
+async def _dummy_watchdog(ws):
+    await asyncio.sleep(3600)
+
+
+class TestFeedFreshnessWatchdog(unittest.IsolatedAsyncioTestCase):
+    """Phase 23 — the watchdog closes a silently-dead WS so start() reconnects."""
+
+    def _ticker_msg(self) -> str:
+        return json.dumps({
+            "method": "subscription",
+            "params": {
+                "channel": "ticker.BTC-27JUN25-100000-C.raw",
+                "data": {
+                    "index_price":    100_000.0,
+                    "mark_iv":        80.0,
+                    "mark_price":     0.020,
+                    "best_bid_price": 0.019,
+                    "best_ask_price": 0.021,
+                    "open_interest":  200.0,
+                },
+            },
+        })
+
+    async def test_watchdog_closes_ws_when_no_ticker(self):
+        feed = DeribitFeed(assets=["BTC"])
+        feed._running = True
+        feed._last_ticker_at = time.time() - 1000  # long past the timeout
+        ws = AsyncMock()
+        with patch.object(config, "FEED_WATCHDOG_TIMEOUT_SEC", 2):
+            await asyncio.wait_for(feed._watchdog(ws), timeout=5)
+        ws.close.assert_awaited_once()
+
+    async def test_watchdog_does_not_close_when_ticker_fresh(self):
+        feed = DeribitFeed(assets=["BTC"])
+        feed._running = True
+        feed._last_ticker_at = time.time()
+        ws = AsyncMock()
+        with patch.object(config, "FEED_WATCHDOG_TIMEOUT_SEC", 2):
+            task = asyncio.create_task(feed._watchdog(ws))
+            await asyncio.sleep(1.3)  # > one interval (1.0s), < timeout (2s)
+            feed._running = False
+            ws.close.assert_not_called()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def test_handle_message_updates_last_ticker_at(self):
+        feed = DeribitFeed(assets=["BTC"])
+        feed._last_ticker_at = 0.0
+        before = time.time()
+        await feed._handle_message(self._ticker_msg())
+        self.assertGreaterEqual(feed._last_ticker_at, before)
+
+    async def test_watchdog_created_and_cancelled_cleanly(self):
+        feed = DeribitFeed(assets=["BTC"])
+        feed._subscribe_all = AsyncMock()
+        feed._watchdog = MagicMock(side_effect=_dummy_watchdog)
+        fake = _FakeWS()  # no messages → pump ends immediately
+        with patch.object(config, "FEED_WATCHDOG_TIMEOUT_SEC", 60), \
+             patch("data.deribit_feed.websockets.connect", return_value=fake):
+            await feed._connect_and_stream()
+        feed._watchdog.assert_called_once()   # watchdog task was created
+        self.assertFalse(fake.closed)         # pump finished first; no forced close
+
+    async def test_no_watchdog_task_when_disabled(self):
+        feed = DeribitFeed(assets=["BTC"])
+        feed._subscribe_all = AsyncMock()
+        feed._watchdog = MagicMock(side_effect=_dummy_watchdog)
+        fake = _FakeWS()
+        with patch.object(config, "FEED_WATCHDOG_TIMEOUT_SEC", 0), \
+             patch("data.deribit_feed.websockets.connect", return_value=fake):
+            await feed._connect_and_stream()
+        feed._watchdog.assert_not_called()    # disabled → no watchdog task created
 
 
 if __name__ == "__main__":

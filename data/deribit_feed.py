@@ -113,6 +113,7 @@ class DeribitFeed:
         self._instruments: dict[str, list[str]] = {}  # asset → instrument names
         self._offline  = False   # True while disconnected; suppresses repeated warnings
         self._retry_count = 0    # retries since last successful connection
+        self._last_ticker_at = 0.0  # time.time() of the most recent ticker update (watchdog)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -222,6 +223,7 @@ class DeribitFeed:
             # Without this, _rpc() awaits a future that only gets resolved inside
             # the pump loop — causing a deadlock where setup never completes.
             pump_task = asyncio.create_task(self._pump(ws))
+            watchdog_task: asyncio.Task | None = None
 
             try:
                 if self.client_id and self.client_secret:
@@ -229,10 +231,18 @@ class DeribitFeed:
 
                 await self._subscribe_all()
 
+                # Start the freshness watchdog only after subscriptions are in
+                # place, so the first ticker has a chance to arrive before the
+                # timeout is evaluated. Skipped when the timeout is 0 (disabled).
+                self._last_ticker_at = time.time()
+                if config.FEED_WATCHDOG_TIMEOUT_SEC > 0:
+                    watchdog_task = asyncio.create_task(self._watchdog(ws))
+
                 await pump_task
-            except Exception:
+            finally:
                 pump_task.cancel()
-                raise
+                if watchdog_task is not None:
+                    watchdog_task.cancel()
 
     async def _subscribe_all(self) -> None:
         """Subscribe to the day-window instrument lists plus open-position legs.
@@ -290,6 +300,31 @@ class DeribitFeed:
                 break
             await self._handle_message(raw_msg)
 
+    async def _watchdog(self, ws) -> None:
+        """Force a reconnect if Deribit stops pushing ticker data on a live socket.
+
+        The WS ping/pong heartbeat keeps the connection technically open even
+        when no ticker notifications arrive (observed 2026-07-19: every cached
+        snapshot went stale, the scanner found 0 candidates for 7+ hours, and no
+        reconnect ever fired). This task closes the WS explicitly once the
+        last-ticker age exceeds ``config.FEED_WATCHDOG_TIMEOUT_SEC``. Closing the
+        socket unblocks ``_pump()``'s ``async for`` and hands control to
+        ``start()``'s reconnect loop, which resubscribes as normal — no separate
+        reconnect path is needed.
+        """
+        timeout = config.FEED_WATCHDOG_TIMEOUT_SEC
+        interval = max(1.0, timeout / 2)
+        while self._running:
+            await asyncio.sleep(interval)
+            elapsed = time.time() - self._last_ticker_at
+            if elapsed > timeout:
+                logger.warning(
+                    "Feed watchdog: no ticker in %.0fs (> %ds) — forcing reconnect",
+                    elapsed, timeout,
+                )
+                await ws.close()
+                return
+
     async def _authenticate(self) -> None:
         logger.debug("Authenticating with Deribit WebSocket API")
         await self._rpc(
@@ -338,10 +373,14 @@ class DeribitFeed:
             if channel.startswith("ticker.") and (channel.endswith(".raw") or channel.endswith(".100ms")):
                 instrument = channel.split(".")[1]
                 snapshot = self._parse_ticker(instrument, data)
-                if snapshot and self.on_ticker:
-                    result = self.on_ticker(snapshot)
-                    if asyncio.iscoroutine(result):
-                        await result
+                if snapshot:
+                    # Record liveness for the freshness watchdog: a successfully
+                    # parsed ticker means Deribit is still pushing real data.
+                    self._last_ticker_at = time.time()
+                    if self.on_ticker:
+                        result = self.on_ticker(snapshot)
+                        if asyncio.iscoroutine(result):
+                            await result
 
     def _parse_ticker(self, instrument: str, data: dict) -> TickerSnapshot | None:
         try:
