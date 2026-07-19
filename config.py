@@ -255,6 +255,15 @@ DERIBIT_WS_OPEN_TIMEOUT  = 15                 # seconds to wait for the WS hands
 DERIBIT_WS_MAX_SIZE      = 10 * 1024 * 1024   # 10 MB — large option-chain snapshots
 RPC_TIMEOUT_SEC          = 15                 # seconds to wait for a JSON-RPC response
 
+# Feed freshness watchdog (Phase 23) — the WS ping/pong heartbeat detects TCP
+# drops, but not Deribit silently ceasing ticker pushes while the socket stays
+# open (observed 2026-07-19: all cached snapshots went stale, scanner found 0
+# candidates for 7+ hours). If no ticker update arrives within this many seconds,
+# the feed closes the WS so the existing reconnect loop resubscribes. Default is
+# 4x CHAIN_CACHE_TTL_SEC for headroom above the 30s staleness threshold while
+# still recovering within minutes. Set to 0 to disable the watchdog entirely.
+FEED_WATCHDOG_TIMEOUT_SEC = 120
+
 # Order execution (execution/executor.py)
 SLIPPAGE_LIMIT_PCT = 0.02        # reject fills deviating more than 2% from intended price
 ORDER_TIMEOUT_SEC  = 30          # seconds to wait for an order to fill before giving up

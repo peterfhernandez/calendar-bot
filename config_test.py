@@ -224,6 +224,9 @@ DERIBIT_WS_OPEN_TIMEOUT  = 15
 DERIBIT_WS_MAX_SIZE      = 10 * 1024 * 1024
 RPC_TIMEOUT_SEC          = 15
 
+# Feed freshness watchdog (Phase 23) — matches config.py default; 0 disables.
+FEED_WATCHDOG_TIMEOUT_SEC = 120
+
 SLIPPAGE_LIMIT_PCT = 0.02
 ORDER_TIMEOUT_SEC  = 30
 MAX_ORDER_RETRIES  = 3
