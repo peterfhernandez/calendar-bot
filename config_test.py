@@ -215,6 +215,7 @@ NOISY_LOGGERS = {
 LOG_LEVEL_OVERRIDES = {
     "strategy.decision": "DEBUG",
     "strategy.sizer":    "DEBUG",
+    "apscheduler.executors.default": "DEBUG",
 }
 
 # ── Network / timeout / retry constants (Phase 20b + 20c) ─────────────────────
