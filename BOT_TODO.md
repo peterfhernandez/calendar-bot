@@ -1283,3 +1283,74 @@ In **test/live mode**:
 - [x] Run the full test suite; confirm no regressions in existing Phase 18/20/21 tests around `close_status`, `get_open_trades()`, and roll behaviour
 - [x] Update README.md's Known Issues section once implemented
 - [x] Update this file's checkboxes as each sub-phase lands
+
+---
+
+## Phase 23 — Feed Freshness Watchdog
+
+**Root cause:** `DeribitFeed` detects WS drops via TCP/ping failures but cannot detect Deribit silently stopping ticker data pushes while the connection remains technically open. Observed 2026-07-19: the feed last subscribed to 298 BTC + 234 ETH instruments at 07:55 AEST; no reconnect event appeared for the remaining 7+ hours of the session. Every scan from ~08:00 onward logged the same warning — "298 stale instrument(s) excluded from BTC chain / 234 stale instrument(s) excluded from ETH chain" — because all 532 cached snapshots had aged past the 30s TTL within seconds of Deribit stopping its push stream. The scanner received 0 fresh instruments and returned 0 candidates on every tick; the bot stayed in IDLE indefinitely with no log indication the feed was dead. The only recovery was a manual restart. See [BOT_PLAN.md Phase 23](BOT_PLAN.md#phase-23--feed-freshness-watchdog) for full root-cause detail.
+
+### 23a — Watchdog in `DeribitFeed`
+
+- [ ] Add `FEED_WATCHDOG_TIMEOUT_SEC` to `config.py` (default `120`; set `0` to disable) — seconds without a ticker update before a reconnect is forced; 4× `CHAIN_CACHE_TTL_SEC` by default gives a buffer above the 30s staleness threshold while still recovering within minutes
+- [ ] Add `_last_ticker_at: float` to `DeribitFeed.__init__` (initialised to `time.time()` at connection, so a very quiet but live market does not trigger an immediate false positive)
+- [ ] Update `_handle_message()` — set `_last_ticker_at = time.time()` on every successfully parsed ticker notification
+- [ ] Add `async def _watchdog(self, ws)` — sleeps `FEED_WATCHDOG_TIMEOUT_SEC / 2` between checks; if `time.time() - _last_ticker_at > FEED_WATCHDOG_TIMEOUT_SEC`, logs `WARNING "Feed watchdog: no ticker in {elapsed:.0f}s — forcing reconnect"` then calls `await ws.close()`; the existing reconnect loop in `start()` handles the reconnect and re-subscription
+- [ ] Launch `_watchdog` as an `asyncio.create_task` alongside the pump task in `_connect_and_stream()`, after `_subscribe_all()` completes (to avoid a race between subscription latency and the first ticker arriving); cancel it in the same `except` block that cancels the pump task
+- [ ] Skip watchdog task creation when `FEED_WATCHDOG_TIMEOUT_SEC == 0` (feature flag for environments where Deribit is known to have quiet periods)
+
+### 23b — Tests and scratch
+
+- [ ] Add `TestFeedFreshnessWatchdog` to `tests/test_feed.py`
+  - [ ] No ticker received within `FEED_WATCHDOG_TIMEOUT_SEC` → watchdog closes the WS (verify `ws.close()` called)
+  - [ ] Ticker received before timeout → watchdog does not close the WS (verify `_last_ticker_at` is reset)
+  - [ ] Watchdog task is cancelled cleanly when the WS closes for any other reason (pump task finishes first)
+  - [ ] `FEED_WATCHDOG_TIMEOUT_SEC = 0` → no watchdog task is created (verify task count unchanged)
+- [ ] Add `scratch/scratch_feed_watchdog.py` — connects to the paper feed, waits for initial subscriptions, then simulates a ticker blackout by not processing updates and verifies the watchdog fires and the feed reconnects within `FEED_WATCHDOG_TIMEOUT_SEC + 30` seconds; aborts if `TRADING_MODE == "live"`
+- [ ] Add `FEED_WATCHDOG_TIMEOUT_SEC` to `config_test.py` with value matching `config.py` default (parity requirement from Phase 21f)
+
+---
+
+## Phase 24 — Reconcile Mismatch Remediation for close_stuck Positions
+
+**Root cause:** When the bot marks a position `close_stuck` after retry exhaustion (e.g. trades 6–9, `BTC-15JUL26-*` options from 2026-07-14, all with `close_error_reason = "Roll retry limit exceeded close failed after 4 attempts — position needs manual close on Deribit"`), the Deribit position remains open on the exchange. The bot's DB records those positions as closed (with `close_status='close_stuck'`) and excludes their legs from the used-margin calculation (`SQLite margin = $0`), but Deribit's maintenance margin is still tied up. The portfolio tracker detects this divergence on every scan cycle and fires:
+
+```
+RECONCILE MISMATCH: Deribit margin $1534.28 vs SQLite margin $0.00 (divergence 100%) — possible manual trade or missed fill
+```
+
+The warning is correct but not actionable: it does not identify *which* Deribit instruments are open, and there is no automated path for the bot to detect when the operator manually closes those positions on the exchange and reconcile the DB accordingly. Log fills with one warning per scan (every 5 minutes) indefinitely, with no path to resolution. See [BOT_PLAN.md Phase 24](BOT_PLAN.md#phase-24--reconcile-mismatch-remediation-for-close_stuck-positions) for full root-cause detail.
+
+### 24a — Enhanced reconcile logging (identify the culprit instruments)
+
+- [ ] Add `get_deribit_open_positions(currency) -> list[dict]` to `portfolio/tracker.py` — calls `private/get_positions` (filtered to `kind=option`) for a given currency; returns a list of dicts with `instrument_name`, `size`, `mark_value`, and `index_price`; returns `[]` on any API failure (non-blocking)
+- [ ] Update `_reconcile()` in `portfolio/tracker.py` — when divergence exceeds `RECONCILE_THRESHOLD_PCT`, call `get_deribit_open_positions` for each configured asset and append the result to the WARNING log line: e.g. `"Deribit open: BTC-15JUL26-64000-C qty=0.1, BTC-15JUL26-64000-P qty=0.1"` so the operator immediately knows what is live on the exchange
+- [ ] When the enhanced log line lists specific instruments, replace the trailing `"— possible manual trade or missed fill"` suffix with `"— see instruments above"` to reduce noise on successive warnings
+
+### 24b — Auto-reconcile close_stuck positions after manual Deribit close
+
+- [ ] Add `sync_stuck_positions(db_path) -> list[int]` to `portfolio/tracker.py` — fetches the live Deribit open position list for each `ASSETS` currency; for each `close_stuck` trade in the DB, checks whether both its `near_instrument` and `far_instrument` are absent from the Deribit list; if both absent (the operator has already closed them on Deribit), calls `db.state.close_calendar_trade()` with `close_status='closed'` and logs `INFO "trade_id=N auto-reconciled: both legs confirmed closed on Deribit"`; returns the list of `trade_id`s that were reconciled
+- [ ] Call `sync_stuck_positions()` at the start of each `refresh()` cycle in `portfolio/tracker.py` — runs every scan, so a manual Deribit close is picked up within `SCAN_INTERVAL_SEC` (5 minutes) without operator intervention
+- [ ] After reconciliation, re-run the margin comparison so the mismatch warning resolves in the same cycle it is detected, rather than one cycle later
+
+### 24c — `/deribit_positions` Telegram command
+
+- [ ] Add `handle_deribit_positions(update, context)` to `telegram_cmd/handlers.py` — calls `get_deribit_open_positions()` for each `ASSETS` currency and formats a per-instrument reply: instrument name, size, index price, mark value; groups by currency
+- [ ] Cross-reference the Deribit list against `get_visible_positions()` (the stuck-inclusive DB query from Phase 22b) and append a note for any Deribit instrument not tracked in the bot DB: `"⚠️ Not tracked in bot DB — open manually?"`
+- [ ] Append a summary line: `"N position(s) also shown as ⚠️ STUCK in /positions — use /close or /close_manually to sync."` when stuck trades exist that are still open on Deribit
+- [ ] Reply `"No positions currently open on Deribit."` when the Deribit list is empty for all assets
+- [ ] Add `("deribit_positions", "List positions currently open on Deribit — cross-check vs bot DB")` to `COMMAND_REGISTRY` in `telegram_cmd/listener.py`
+
+### 24d — Tests and scratch
+
+- [ ] Add `TestReconcileEnhanced` to `tests/test_portfolio.py`
+  - [ ] When mismatch is detected, `get_deribit_open_positions` is called and instrument names appear in the log
+  - [ ] `sync_stuck_positions` marks a `close_stuck` trade as `closed` when both legs are absent from the Deribit list
+  - [ ] `sync_stuck_positions` leaves a `close_stuck` trade unchanged when either leg is still open on Deribit
+  - [ ] Reconcile warning resolves in the same cycle after `sync_stuck_positions` auto-closes the trade
+- [ ] Add `TestHandleDeribitPositions` to `tests/test_telegram_cmd.py`
+  - [ ] Reply lists each Deribit instrument with size and mark value
+  - [ ] Instruments not tracked in the DB are flagged `"⚠️ Not tracked in bot DB"`
+  - [ ] Stuck DB trades still open on Deribit trigger the sync summary line
+  - [ ] `"No positions"` reply when Deribit list is empty
+- [ ] Add `scratch/scratch_reconcile_mismatch.py` — connects to the paper/test Deribit account, fetches the live position list, compares it against `close_stuck` trades in the DB, and prints a reconciliation report; aborts if `TRADING_MODE == "live"`
