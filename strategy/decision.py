@@ -513,24 +513,58 @@ class DecisionEngine:
         max_leg_spread_pct = config.asset_config(candidate.asset, "MAX_LEG_SPREAD_PCT")
         max_entry_premium  = config.asset_config(candidate.asset, "MAX_ENTRY_PREMIUM")
 
+        # ── Absolute spread floor (Phase 25d) ─────────────────────────────────
+        # A leg passes the spread check if it is within the percentage limit OR
+        # its raw bid/ask width is within an enabled absolute floor.  This keeps
+        # one-tick-wide testnet books (whose tiny mids make a single-tick spread
+        # read as "40–100%") from being rejected.  Both floors default to 0
+        # (disabled) so live behaviour is unchanged.
+        abs_usd   = config.MAX_LEG_SPREAD_ABS_USD
+        abs_ticks = config.MAX_LEG_SPREAD_ABS_TICKS
+        # Estimated per-leg tick in USD — Deribit's option base tick is ≈ 0.0001
+        # of the index for inverse BTC/ETH; used only for the absolute tick floor.
+        est_tick_usd = (
+            0.0001 * candidate.spot if candidate.asset.upper() in ("BTC", "ETH") else 0.01
+        )
+
+        def _within_abs_floor(bid: float, ask: float) -> bool:
+            width = ask - bid
+            if abs_usd > 0 and width <= abs_usd:
+                return True
+            if abs_ticks > 0 and est_tick_usd > 0 and width <= abs_ticks * est_tick_usd:
+                return True
+            return False
+
         near_mid = (candidate.near_bid + candidate.near_ask) / 2 if (candidate.near_bid > 0 and candidate.near_ask > 0) else 0.0
         far_mid  = (candidate.far_bid  + candidate.far_ask)  / 2 if (candidate.far_bid  > 0 and candidate.far_ask  > 0) else 0.0
 
         if near_mid > 0:
             near_spread_pct = (candidate.near_ask - candidate.near_bid) / near_mid
             if near_spread_pct > max_leg_spread_pct:
-                return (
-                    f"near-leg spread {near_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
-                    f"{max_leg_spread_pct:.1%}"
-                )
+                if _within_abs_floor(candidate.near_bid, candidate.near_ask):
+                    logger.debug(
+                        "LIQUIDITY GATE: near-leg spread %.1f%% > pct limit but within "
+                        "absolute floor — passing", near_spread_pct * 100,
+                    )
+                else:
+                    return (
+                        f"near-leg spread {near_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
+                        f"{max_leg_spread_pct:.1%}"
+                    )
 
         if far_mid > 0:
             far_spread_pct = (candidate.far_ask - candidate.far_bid) / far_mid
             if far_spread_pct > max_leg_spread_pct:
-                return (
-                    f"far-leg spread {far_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
-                    f"{max_leg_spread_pct:.1%}"
-                )
+                if _within_abs_floor(candidate.far_bid, candidate.far_ask):
+                    logger.debug(
+                        "LIQUIDITY GATE: far-leg spread %.1f%% > pct limit but within "
+                        "absolute floor — passing", far_spread_pct * 100,
+                    )
+                else:
+                    return (
+                        f"far-leg spread {far_spread_pct:.1%} > MAX_LEG_SPREAD_PCT "
+                        f"{max_leg_spread_pct:.1%}"
+                    )
 
         spread_mid = far_mid - near_mid
         if spread_mid > 0:
@@ -1016,12 +1050,26 @@ class DecisionEngine:
         else:
             gross_pnl = close_credit - net_debit * qty
 
-        # Compute exit fees for fee-inclusive net P&L logging.
-        try:
+        # Compute exit fees for fee-inclusive net P&L logging.  Prefer the actual
+        # close fill prices returned by the executor (Phase 25c); fall back to the
+        # DB-loaded entry premiums only when fills are unavailable (dry-run/paper
+        # or a partial-fill path that didn't record them).
+        fills = getattr(self._executor, "last_close_fills", None)
+        if fills:
+            near_price = fills.get("near_close_usd", 0.0) or 0.0
+            far_price  = fills.get("far_close_usd",  0.0) or 0.0
+        else:
             near_price = pos.get("near_prem", 0.0) or 0.0
             far_price  = pos.get("far_prem",  0.0) or 0.0
+        try:
             close_fees_usd = exit_fees(asset, spot, qty, near_price, far_price)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Exit-fee calculation failed for trade_id=%d "
+                "(asset=%s spot=%.2f qty=%.4f near=%.4f far=%.4f): %s — "
+                "recording close_fees=0.00 (net P&L understates fees)",
+                trade_id, asset, spot, qty, near_price, far_price, exc,
+            )
             close_fees_usd = 0.0
         self._fees_paid_today += close_fees_usd
 

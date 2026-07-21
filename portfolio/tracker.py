@@ -401,21 +401,46 @@ class PortfolioTracker:
         data   = _rest_get(url, bearer_token=token)
         return data["result"]
 
-    def _get_positions(self, token: str, currency: str) -> list[dict]:
-        """Fetch open option positions for one currency."""
-        params = urllib.parse.urlencode({"currency": currency, "kind": "option"})
+    def _get_positions(self, token: str, currency: str, kind: str | None = "option") -> list[dict]:
+        """Fetch open positions for one currency.
+
+        ``kind`` selects the instrument class (``option``, ``future``, …).  Pass
+        ``None`` (or ``"any"``) to omit the filter so Deribit returns positions of
+        every kind — used by the Phase 25e residual-margin reconciliation, since
+        margin can be tied up by a future/perpetual that the option-only filter
+        never sees.
+        """
+        query = {"currency": currency}
+        if kind and kind != "any":
+            query["kind"] = kind
+        params = urllib.parse.urlencode(query)
         url    = f"{self._rest_url}/api/v2/private/get_positions?{params}"
         data   = _rest_get(url, bearer_token=token)
         return data.get("result", [])
 
-    def get_deribit_open_positions(self, currency: str) -> list[dict]:
-        """Return the account's live option positions for one currency (Phase 24a).
+    def _get_open_orders(self, token: str, currency: str) -> list[dict]:
+        """Fetch resting open orders for one currency (Phase 25e).
 
-        Calls ``private/get_positions`` (kind=option) and normalises each
-        non-flat position to a small dict the reconcile logger and the
-        ``/deribit_positions`` Telegram command can format directly:
+        Resting orders can reserve margin that no position explains; surfacing
+        them makes an otherwise-invisible reconcile mismatch actionable.
+        """
+        params = urllib.parse.urlencode({"currency": currency})
+        url    = f"{self._rest_url}/api/v2/private/get_open_orders_by_currency?{params}"
+        data   = _rest_get(url, bearer_token=token)
+        return data.get("result", [])
 
-            {instrument_name, size, mark_price, index_price, mark_value}
+    def get_deribit_open_positions(self, currency: str, kind: str | None = "option") -> list[dict]:
+        """Return the account's live positions for one currency (Phase 24a / 25e).
+
+        Calls ``private/get_positions`` and normalises each non-flat position to a
+        small dict the reconcile logger and the ``/deribit_positions`` Telegram
+        command can format directly:
+
+            {instrument_name, kind, size, mark_price, index_price, mark_value}
+
+        ``kind`` defaults to ``"option"`` (Phase 24 behaviour); pass ``"any"`` to
+        also include futures/perpetuals (Phase 25e), so margin held by a
+        non-option position is no longer invisible to reconcile.
 
         Returns ``[]`` on any failure (network, auth, paper mode, no
         credentials) so callers never block on it.  Because a failure is
@@ -430,9 +455,9 @@ class PortfolioTracker:
             return []
         try:
             token = self._authenticate()
-            positions = self._get_positions(token, currency)
+            positions = self._get_positions(token, currency, kind=kind)
         except Exception as exc:
-            logger.debug("get_deribit_open_positions(%s) failed: %s", currency, exc)
+            logger.debug("get_deribit_open_positions(%s, kind=%s) failed: %s", currency, kind, exc)
             return []
 
         result: list[dict] = []
@@ -443,6 +468,7 @@ class PortfolioTracker:
             mark_price = p.get("mark_price", 0.0)
             result.append({
                 "instrument_name": p.get("instrument_name", ""),
+                "kind":            p.get("kind", "option"),
                 "size":            size,
                 "mark_price":      mark_price,
                 "index_price":     p.get("index_price", 0.0),
@@ -450,17 +476,60 @@ class PortfolioTracker:
             })
         return result
 
-    def _describe_deribit_positions(self) -> str:
-        """Return a one-line 'INSTR qty=N, …' description of live Deribit legs.
+    def get_deribit_open_orders(self, currency: str) -> list[dict]:
+        """Return the account's resting open orders for one currency (Phase 25e).
 
-        Used to make the reconcile-mismatch warning actionable (Phase 24a) by
-        naming exactly which instruments Deribit still holds.  Returns an empty
-        string if nothing is open or the position fetch fails.
+        Normalises each order to ``{instrument_name, direction, amount, price}``.
+        Returns ``[]`` on any failure (network, auth, paper mode, no credentials).
+        """
+        if config.TRADING_MODE == "paper":
+            return []
+        if not self._client_id or not self._client_secret:
+            return []
+        try:
+            token = self._authenticate()
+            orders = self._get_open_orders(token, currency)
+        except Exception as exc:
+            logger.debug("get_deribit_open_orders(%s) failed: %s", currency, exc)
+            return []
+        return [
+            {
+                "instrument_name": o.get("instrument_name", ""),
+                "direction":       o.get("direction", ""),
+                "amount":          o.get("amount", 0.0),
+                "price":           o.get("price", 0.0),
+            }
+            for o in orders
+        ]
+
+    def _reconcile_currencies(self) -> list[str]:
+        """Currency set scanned when locating margin sources (Phase 25e).
+
+        Widened from ``ASSETS`` to the ``COLLECTOR_ASSETS`` superset so margin
+        held in a currency the bot doesn't actively trade (but does know about)
+        is still visible to reconcile.  The read-only ``scratch_account_margin_
+        audit.py`` covers the full account for currencies outside even this set.
+        """
+        assets = list(dict.fromkeys([*config.ASSETS, *config.COLLECTOR_ASSETS]))
+        return _assets_to_currencies(assets)
+
+    def _describe_deribit_positions(self) -> str:
+        """Return a one-line description of every live Deribit margin source.
+
+        Used to make the reconcile-mismatch warning actionable (Phase 24a / 25e)
+        by naming exactly what Deribit still holds — options *and* futures across
+        the widened currency set — plus a count of resting open orders (which can
+        reserve margin no position explains).  Returns an empty string if nothing
+        is open or the fetches fail.
         """
         descs: list[str] = []
-        for currency in _assets_to_currencies(config.ASSETS):
-            for p in self.get_deribit_open_positions(currency):
-                descs.append(f"{p['instrument_name']} qty={p['size']}")
+        open_order_count = 0
+        for currency in self._reconcile_currencies():
+            for p in self.get_deribit_open_positions(currency, kind="any"):
+                descs.append(f"{p['instrument_name']} ({p['kind']}) qty={p['size']}")
+            open_order_count += len(self.get_deribit_open_orders(currency))
+        if open_order_count:
+            descs.append(f"{open_order_count} resting open order(s)")
         return ", ".join(descs)
 
     def sync_stuck_positions(self, db_path: Path | None = None) -> list[int]:

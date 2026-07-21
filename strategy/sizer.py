@@ -18,6 +18,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_FLOOR
 
 import config
 from core.fees import round_trip_fees
@@ -192,20 +193,34 @@ def size_candidate(
     effective_cost_per_unit = candidate.net_debit + fee_per_unit
     raw_qty = max_loss_usd / effective_cost_per_unit if effective_cost_per_unit > 0 else 0.0
 
-    # Round down to one decimal place (Deribit minimum increment is 0.1 for options)
-    qty = max(0.0, math.floor(raw_qty * 10) / 10)
+    # Round down to the instrument's amount step so the approved qty is already
+    # submittable to Deribit (Phase 25a/25b).  BTC options step in 0.1 from a 0.1
+    # minimum; ETH options require an integer minimum of 1.  Rounding in Decimal
+    # step-count space avoids float drift off the exchange grid.
+    min_amount, step = config.DEFAULT_MIN_TRADE_AMOUNTS.get(
+        candidate.asset.upper(), config.DEFAULT_MIN_TRADE_AMOUNT
+    )
+    # The config sanity floor still applies as an absolute lower bound.
+    min_amount = max(min_amount, _MIN_QTY)
+
+    def _floor_to_step(value: float) -> float:
+        if step <= 0:
+            return value
+        steps = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_FLOOR)
+        return max(0.0, float(steps * Decimal(str(step))))
+
+    qty = _floor_to_step(raw_qty)
 
     # Hard cap to prevent runaway sizes from low-debit candidates that slip past the floor
-    max_qty = config.MAX_QTY
-    if qty > max_qty:
-        qty = math.floor(max_qty * 10) / 10
+    if qty > config.MAX_QTY:
+        qty = _floor_to_step(config.MAX_QTY)
 
-    if qty < _MIN_QTY:
+    if qty < min_amount:
         return SizeResult(
             qty=0.0,
             reason=(
-                f"Computed qty {qty:.2f} below minimum {_MIN_QTY} "
-                f"(net_debit={candidate.net_debit:.2f}, "
+                f"Computed qty {qty:.2f} below exchange minimum {min_amount:.2f} "
+                f"for {candidate.asset} (net_debit={candidate.net_debit:.2f}, "
                 f"max_loss_usd={max_loss_usd:.2f})"
             ),
         )

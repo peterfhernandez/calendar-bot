@@ -84,6 +84,14 @@ MAX_LEG_SPREAD_PCT     = 0.1    # reject if (ask-bid)/mid > 10% on either leg
 MAX_ENTRY_PREMIUM      = 0.10   # reject if net_debit > spread_mid * (1 + 10%)
 COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individual-leg fallback
 
+# ── Phase 25d — absolute spread floor (test-mode override) ────────────────────
+# test.deribit.com option books are frequently one or two ticks wide, so the
+# percentage-only gate above rejects them as "40–100% spread" and starves test
+# mode of every entry.  Enable the tick floor here so a spread within ~2 ticks
+# passes regardless of percentage; config.py keeps both at 0 (disabled) for live.
+MAX_LEG_SPREAD_ABS_TICKS = 2      # global default: 0 (disabled)
+MAX_LEG_SPREAD_ABS_USD   = 0.0    # global default: 0.0 (disabled)
+
 # Position sizing
 MAX_LOSS_PCT       = 0.02   # max 2% of portfolio per trade
 MAX_POSITIONS      = 5      # max concurrent open calendar spreads
@@ -278,6 +286,14 @@ MIN_ROLL_NEAR_FAR_GAP_DAYS   = 1      # new near expiry must precede far by this
 
 MIN_CONTRACT_SIZE      = 0.1
 STRIKE_CORRELATION_PCT = 0.05
+
+# ── Phase 25a/25b — per-instrument order-amount minimums ──────────────────────
+DEFAULT_MIN_TRADE_AMOUNTS = {   # asset → (min_trade_amount, amount_step)
+    "BTC": (0.1, 0.1),
+    "ETH": (1.0, 1.0),
+    "SOL": (1.0, 1.0),
+}
+DEFAULT_MIN_TRADE_AMOUNT = (1.0, 1.0)
 
 RECONCILE_THRESHOLD_PCT = 0.10
 INITIAL_CAPITAL         = 10_000.0

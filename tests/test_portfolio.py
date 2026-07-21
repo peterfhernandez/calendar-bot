@@ -1108,3 +1108,52 @@ class TestPaperModePortfolioIsolation:
             assert mock_get.called, "Test mode should call Deribit REST API"
             # Equity should come from API (100.0 BTC * 100,000 spot = $10M)
             assert state.equity_usd > 0
+
+
+# ── Phase 25e — kind=any reconcile visibility ─────────────────────────────────
+
+class TestKindAnyReconcile:
+    def _tracker(self, db):
+        return PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+
+    def _rest_get_with(self, positions, orders):
+        def fake(url, bearer_token=None, timeout=10):
+            if "public/auth" in url:
+                return _fake_auth_response()
+            if "get_open_orders_by_currency" in url:
+                return {"result": orders}
+            if "get_positions" in url:
+                return {"result": positions}
+            return {"result": []}
+        return fake
+
+    def test_kind_any_includes_futures(self):
+        db = _make_db()
+        positions = [{
+            "instrument_name": "BTC-PERPETUAL", "kind": "future",
+            "size": 10.0, "mark_price": 1.0, "index_price": 100_000.0,
+        }]
+        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post), \
+             patch("portfolio.tracker._rest_get", side_effect=self._rest_get_with(positions, [])), \
+             patch("config.TRADING_MODE", "test"):
+            out = self._tracker(db).get_deribit_open_positions("BTC", kind="any")
+        assert any(p["kind"] == "future" and p["instrument_name"] == "BTC-PERPETUAL" for p in out)
+
+    def test_get_open_orders(self):
+        db = _make_db()
+        orders = [{"instrument_name": "BTC-15JUL26-64000-C", "direction": "buy",
+                   "amount": 0.1, "price": 0.01}]
+        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post), \
+             patch("portfolio.tracker._rest_get", side_effect=self._rest_get_with([], orders)), \
+             patch("config.TRADING_MODE", "test"):
+            out = self._tracker(db).get_deribit_open_orders("BTC")
+        assert len(out) == 1
+        assert out[0]["direction"] == "buy"
+
+    def test_get_open_orders_paper_mode_empty(self):
+        db = _make_db()
+        with patch("config.TRADING_MODE", "paper"):
+            assert self._tracker(db).get_deribit_open_orders("BTC") == []

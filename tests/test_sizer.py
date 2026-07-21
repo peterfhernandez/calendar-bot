@@ -85,3 +85,46 @@ class TestReentryCooldown:
             recent_auto_closes=recent, reentry_cooldown_sec=0,
         )
         assert result.qty > 0.0
+
+
+def _eth_candidate(net_debit: float) -> CalendarCandidate:
+    """An ETH candidate whose amount step is integer (min 1, step 1)."""
+    return CalendarCandidate(
+        asset="ETH", strike=3_000.0, option_type="Call",
+        near_instrument="ETH-07JUN25-3000-C",
+        far_instrument="ETH-27JUN25-3000-C",
+        near_days=7, far_days=30,
+        spot=3_000.0,
+        near_iv=0.90, far_iv=0.75, iv_contango=0.15,
+        near_ask=20.0, near_bid=18.0, far_ask=60.0, far_bid=55.0,
+        net_debit=net_debit,
+        near_oi=600.0, far_oi=600.0,
+        pop=0.50, be_lo=2_800.0, be_hi=3_200.0,
+        ev_score=0.36,
+    )
+
+
+class TestAmountStepRounding:
+    """Phase 25a/25b — the sizer rounds qty to the instrument's amount step so
+    the approved qty is already submittable (ETH requires integer steps)."""
+
+    def test_eth_qty_rounds_to_integer_step(self):
+        # max_loss_usd = 10_000 * 0.02 = 200; net_debit=30 → raw ≈ 6.6 → floors to 6.0
+        c = _eth_candidate(net_debit=30.0)
+        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[])
+        assert result.qty > 0.0
+        assert result.qty == float(int(result.qty))  # integer for ETH
+
+    def test_eth_below_minimum_rejected(self):
+        # net_debit large → raw qty < 1 → floors to 0 → below ETH minimum of 1
+        c = _eth_candidate(net_debit=400.0)
+        result = size_candidate(c, portfolio_value=10_000.0, open_positions=[])
+        assert result.qty == 0.0
+        assert "minimum" in result.reason.lower()
+
+    def test_btc_still_uses_tenth_step(self):
+        c = _candidate(asset="BTC", strike=100_000.0, net_debit=140.0)
+        result = size_candidate(c, portfolio_value=100_000.0, open_positions=[])
+        assert result.qty > 0.0
+        # BTC step is 0.1 — qty is a multiple of 0.1
+        assert abs(result.qty * 10 - round(result.qty * 10)) < 1e-9

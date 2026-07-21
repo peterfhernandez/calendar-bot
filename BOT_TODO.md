@@ -1370,51 +1370,59 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 
 ## Phase 25 — Order-Amount Validity, Sizer/Executor Unification, Close-Fee Accuracy, Test-Liquidity Calibration, and Residual-Margin Reconciliation
 
-**Status:** Planned. From analysis of the 2026-07-17 → 2026-07-22 test-mode run: 81/81 ETH entries rejected by Deribit `-32602 Invalid params` while the 1/1 BTC entry filled (trade 13, at 0.1 instead of the approved 0.3); trade 13's close logged `close_fees=0.00`; zero candidates passed the liquidity gate after 2026-07-21 00:21 (582 near-leg-spread skips on 07-22 alone); and a ~$1,583 `RECONCILE MISMATCH` persists with no `kind=option` position to explain it. See [BOT_PLAN.md Phase 25](BOT_PLAN.md#phase-25--order-amount-validity-sizerexecutor-unification-close-fee-accuracy-test-liquidity-calibration-and-residual-margin-reconciliation) for full root-cause detail.
+**Status:** Complete — all five fixes (25a–25e) implemented and tested; 16 new tests, full suite 656 passing. Offline demos: `python -m scratch.scratch_amount_validation` and `python -m scratch.scratch_account_margin_audit` (both read-only, no live orders; abort in live mode). From analysis of the 2026-07-17 → 2026-07-22 test-mode run: 81/81 ETH entries rejected by Deribit `-32602 Invalid params` while the 1/1 BTC entry filled (trade 13, at 0.1 instead of the approved 0.3); trade 13's close logged `close_fees=0.00`; zero candidates passed the liquidity gate after 2026-07-21 00:21 (582 near-leg-spread skips on 07-22 alone); and a ~$1,583 `RECONCILE MISMATCH` persists with no `kind=option` position to explain it. See [BOT_PLAN.md Phase 25](BOT_PLAN.md#phase-25--order-amount-validity-sizerexecutor-unification-close-fee-accuracy-test-liquidity-calibration-and-residual-margin-reconciliation) for full root-cause detail.
+
+**Implementation notes:**
+
+- **25a** — Executor gains `_AMOUNT_INFO_CACHE`, `_DeribitRPCClient._fetch_amount_info` / `clamp_amount`, and the module-level `_clamp_amount_to_step` (Decimal step-count rounding). `place_order(validate_amount=True)` clamps/aborts before submitting (combo placements pass `validate_amount=False`); a below-minimum amount raises `AmountBelowMinimumError`, caught in `enter_spread` as an `AMOUNT GATE` skip. Static fallback table `config.DEFAULT_MIN_TRADE_AMOUNTS` (BTC 0.1/0.1, ETH 1/1). The sizer rounds qty to the asset's step and rejects sub-minimum qty — the RANK-stage skip, since `size.qty <= 0` already skips before approval.
+- **25b** — `_contract_amount()` removed; `_async_enter_spread` submits `candidate.qty` (the sizer-approved value) directly.
+- **25c** — `_async_close_spread` returns `(credit, near_close_usd, far_close_usd)`; `close_spread` stashes the fills on `self.last_close_fills`; `_close_position` computes `exit_fees` from them and logs a `WARNING` (naming inputs) instead of silently zeroing on failure.
+- **25d** — `config.MAX_LEG_SPREAD_ABS_TICKS` / `MAX_LEG_SPREAD_ABS_USD` (both 0/disabled in `config.py`; tick floor enabled in `config_test.py`). The gate passes a leg over the pct limit when its raw width is within either enabled floor.
+- **25e** — `get_deribit_open_positions(currency, kind="option")` gains a `kind` param (`"any"` includes futures); new `get_deribit_open_orders`; reconcile widened to the `COLLECTOR_ASSETS` superset (`_reconcile_currencies`) and names futures + open orders; `/deribit_positions` shows them.
 
 ### 25a — Per-instrument order-amount validation (fixes all-ETH `-32602` rejections)
 
-- [ ] Extend the executor's instrument-metadata cache (already populated from `public/get_instrument` for tick size) to also capture `min_trade_amount` and `contract_size`/amount step
-- [ ] Add `_clamp_amount(instrument_name, amount) -> float | None` to `execution/executor.py` — round the amount down to the instrument's step; return `None` if below `min_trade_amount`
-- [ ] Call `_clamp_amount` before every `place_order` in the entry, close, roll, and unwind paths; on `None`, abort with `WARNING "AMOUNT GATE: <instr> requested=<x> below exchange minimum <min>"` instead of submitting
-- [ ] Fall back to a static per-asset minimum table in `config.py` (BTC: 0.1, ETH: 1) when the metadata fetch fails, and log the fallback loudly
-- [ ] Skip undersized candidates at RANK stage in `strategy/decision.py` (log `RANK skip: sized qty below exchange minimum`) so they never reach approval
-- [ ] Round the sizer's qty to the instrument step in `strategy/sizer.py` so the approved qty is already submittable
+- [x] Extend the executor's instrument-metadata cache (already populated from `public/get_instrument` for tick size) to also capture `min_trade_amount` and `contract_size`/amount step
+- [x] Add `_clamp_amount(instrument_name, amount) -> float | None` to `execution/executor.py` — round the amount down to the instrument's step; return `None` if below `min_trade_amount`
+- [x] Call `_clamp_amount` before every `place_order` in the entry, close, roll, and unwind paths; on `None`, abort with `WARNING "AMOUNT GATE: <instr> requested=<x> below exchange minimum <min>"` instead of submitting
+- [x] Fall back to a static per-asset minimum table in `config.py` (BTC: 0.1, ETH: 1) when the metadata fetch fails, and log the fallback loudly
+- [x] Skip undersized candidates at RANK stage in `strategy/decision.py` (log `RANK skip: sized qty below exchange minimum`) so they never reach approval
+- [x] Round the sizer's qty to the instrument step in `strategy/sizer.py` so the approved qty is already submittable
 
 ### 25b — Executor honours the sizer-approved qty (trade 13 filled 0.1 vs approved 0.3)
 
-- [ ] Remove the duplicate, dimensionally-wrong sizing in `execution/executor.py::_contract_amount()` (`max_usd / (net_debit_usd * spot)` divides by spot twice, always collapsing to the 0.1 floor)
-- [ ] Pass the sizer-approved qty from `strategy/decision.py` through `enter_spread()` as the order amount (then clamped by 25a)
-- [ ] Demote `MIN_CONTRACT_SIZE` to a config-level sanity floor only; document it in `config.py`
-- [ ] Log the final submitted amount alongside the sizer qty so any residual divergence is visible in one line
+- [x] Remove the duplicate, dimensionally-wrong sizing in `execution/executor.py::_contract_amount()` (`max_usd / (net_debit_usd * spot)` divides by spot twice, always collapsing to the 0.1 floor)
+- [x] Pass the sizer-approved qty from `strategy/decision.py` through `enter_spread()` as the order amount (then clamped by 25a)
+- [x] Demote `MIN_CONTRACT_SIZE` to a config-level sanity floor only; document it in `config.py`
+- [x] Log the final submitted amount alongside the sizer qty so any residual divergence is visible in one line
 
 ### 25c — Accurate close fees (trade 13 logged `close_fees=0.00`)
 
-- [ ] `execution/executor.py::close_spread()` returns actual close fill prices (near and far) alongside the closing credit
-- [ ] `strategy/decision.py::_close_position()` computes `exit_fees` from those fill prices; falls back to DB-loaded entry premiums only when fills are unavailable
-- [ ] Replace the bare `except → close_fees_usd = 0.0` with a `WARNING` log naming the inputs that failed, so a silent zero-fee close cannot recur
-- [ ] Backfill note: net P&L of trade 13 (−25.06) understates real fees — document, do not rewrite history
+- [x] `execution/executor.py::close_spread()` returns actual close fill prices (near and far) alongside the closing credit
+- [x] `strategy/decision.py::_close_position()` computes `exit_fees` from those fill prices; falls back to DB-loaded entry premiums only when fills are unavailable
+- [x] Replace the bare `except → close_fees_usd = 0.0` with a `WARNING` log naming the inputs that failed, so a silent zero-fee close cannot recur
+- [x] Backfill note: net P&L of trade 13 (−25.06) understates real fees — document, do not rewrite history
 
 ### 25d — Test-mode liquidity-gate calibration (percentage-only spread gate starves testnet)
 
-- [ ] Add `MAX_LEG_SPREAD_ABS_TICKS` and `MAX_LEG_SPREAD_ABS_USD` to `config.py` (both `0` = disabled → live behaviour unchanged)
-- [ ] Gate logic in `strategy/decision.py`: pass if `spread_pct <= MAX_LEG_SPREAD_PCT` **or** `(ask - bid)` is within either enabled absolute floor (a one-tick-wide book must never be rejected as "40% spread")
-- [ ] Enable the absolute floor in `config_test.py` with a documented rationale; keep `config.py`/`config_test.py` key parity (Phase 21f regression test)
-- [ ] Include which branch passed (pct vs abs) in the LIQUIDITY GATE debug log line
+- [x] Add `MAX_LEG_SPREAD_ABS_TICKS` and `MAX_LEG_SPREAD_ABS_USD` to `config.py` (both `0` = disabled → live behaviour unchanged)
+- [x] Gate logic in `strategy/decision.py`: pass if `spread_pct <= MAX_LEG_SPREAD_PCT` **or** `(ask - bid)` is within either enabled absolute floor (a one-tick-wide book must never be rejected as "40% spread")
+- [x] Enable the absolute floor in `config_test.py` with a documented rationale; keep `config.py`/`config_test.py` key parity (Phase 21f regression test)
+- [x] Include which branch passed (pct vs abs) in the LIQUIDITY GATE debug log line
 
 ### 25e — Residual-margin reconciliation (~$1,583 with no option positions)
 
-- [ ] `portfolio/tracker.py::get_deribit_open_positions(currency, kind="any")` — cover futures/perpetuals as well as options; normalise per kind defensively
-- [ ] Reconcile across all account currencies (via `private/get_account_summaries` or configured superset), not just `ASSETS`
-- [ ] Include resting open orders (`private/get_open_orders_by_currency`) — count and reserved margin — in the mismatch warning
-- [ ] `/deribit_positions` shows futures and open orders too, each flagged against the bot DB
-- [ ] Add `scratch/scratch_account_margin_audit.py` — read-only dump of every position kind, open orders, and per-currency account summaries to identify the current residue; aborts if `TRADING_MODE == "live"`
+- [x] `portfolio/tracker.py::get_deribit_open_positions(currency, kind="any")` — cover futures/perpetuals as well as options; normalise per kind defensively
+- [x] Reconcile across all account currencies (via `private/get_account_summaries` or configured superset), not just `ASSETS`
+- [x] Include resting open orders (`private/get_open_orders_by_currency`) — count and reserved margin — in the mismatch warning
+- [x] `/deribit_positions` shows futures and open orders too, each flagged against the bot DB
+- [x] Add `scratch/scratch_account_margin_audit.py` — read-only dump of every position kind, open orders, and per-currency account summaries to identify the current residue; aborts if `TRADING_MODE == "live"`
 - [ ] One-time operator action (after the audit identifies the source): manually clear the residual margin on test.deribit.com and confirm the reconcile warning stops
 
 ### 25f — Tests and scratch
 
-- [ ] `tests/test_executor.py`: amount clamped to step; below-minimum returns `None` and aborts with AMOUNT GATE log; metadata-fetch failure uses static fallback; sizer qty (not a recomputed amount) reaches `place_order`; `close_spread` returns fill prices
-- [ ] `tests/test_decision.py`: RANK skip for undersized candidates; close fees computed from fill prices; fee-calc failure logs WARNING and does not zero silently; abs-floor spread gate passes a one-tick book and stays disabled when configured `0`
-- [ ] `tests/test_portfolio.py`: `kind=any` reconcile lists a futures position; open-order margin appears in the warning; option-only fallback on parse failure
-- [ ] `tests/test_config_centralization.py`: new keys present in both `config.py` and `config_test.py`
-- [ ] Add `scratch/scratch_amount_validation.py` — fetches live BTC/ETH option instrument minimums and demonstrates clamp/skip decisions without placing orders; aborts if `TRADING_MODE == "live"`
+- [x] `tests/test_executor.py`: amount clamped to step; below-minimum returns `None` and aborts with AMOUNT GATE log; metadata-fetch failure uses static fallback; sizer qty (not a recomputed amount) reaches `place_order`; `close_spread` returns fill prices
+- [x] `tests/test_decision.py`: RANK skip for undersized candidates; close fees computed from fill prices; fee-calc failure logs WARNING and does not zero silently; abs-floor spread gate passes a one-tick book and stays disabled when configured `0`
+- [x] `tests/test_portfolio.py`: `kind=any` reconcile lists a futures position; open-order margin appears in the warning; option-only fallback on parse failure
+- [x] `tests/test_config_centralization.py`: new keys present in both `config.py` and `config_test.py`
+- [x] Add `scratch/scratch_amount_validation.py` — fetches live BTC/ETH option instrument minimums and demonstrates clamp/skip decisions without placing orders; aborts if `TRADING_MODE == "live"`

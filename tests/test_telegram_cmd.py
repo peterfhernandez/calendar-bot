@@ -1489,16 +1489,25 @@ class TestGlobalErrorHandler:
 
 class _FakePortfolio:
     """Minimal stand-in for PortfolioTracker.get_deribit_open_positions()."""
-    def __init__(self, positions_by_currency: dict[str, list[dict]]) -> None:
+    def __init__(
+        self,
+        positions_by_currency: dict[str, list[dict]],
+        orders_by_currency: dict[str, list[dict]] | None = None,
+    ) -> None:
         self._pos = positions_by_currency
+        self._orders = orders_by_currency or {}
 
-    def get_deribit_open_positions(self, currency: str) -> list[dict]:
+    def get_deribit_open_positions(self, currency: str, kind: str | None = "option") -> list[dict]:
         return self._pos.get(currency, [])
+
+    def get_deribit_open_orders(self, currency: str) -> list[dict]:
+        return self._orders.get(currency, [])
 
 
 def _deribit_pos(instrument: str, size: float = 0.1) -> dict:
     return {
         "instrument_name": instrument,
+        "kind":            "option",
         "size":            size,
         "mark_price":      0.0005,
         "index_price":     64_000.0,

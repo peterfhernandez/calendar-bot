@@ -36,8 +36,10 @@ from execution.executor import (
     LegRiskError,
     OrderTimeoutError,
     CalendarExecutor,
+    AmountBelowMinimumError,
     _check_slippage,
-    _contract_amount,
+    _clamp_amount_to_step,
+    _asset_from_instrument,
     _index_price,
     _usd_price,
     _async_enter_spread,
@@ -156,7 +158,7 @@ class _MockRPCClient:
     async def __aexit__(self, *_):
         pass
 
-    async def place_order(self, instrument, direction, amount, price, label=""):
+    async def place_order(self, instrument, direction, amount, price, label="", validate_amount=True):
         self.placed_orders.append(
             {"instrument": instrument, "direction": direction, "amount": amount, "price": price}
         )
@@ -206,11 +208,22 @@ class TestHelpers:
     def test_usd_price_linear(self):
         assert _usd_price(5.0, 150.0, "SOL") == pytest.approx(5.0, rel=1e-6)
 
-    def test_contract_amount_btc(self):
-        # portfolio=$10k, max_loss_pct=2%, net_debit=$400 → $200 budget
-        # $200 / ($400 * (0.002 * 100000/100000)) ... actually let's just check >=0.1
-        amt = _contract_amount(100_000.0, "BTC", 10_000.0, 0.02, 0.004 * 100_000.0)
-        assert amt >= 0.1  # Deribit minimum
+    def test_asset_from_instrument(self):
+        assert _asset_from_instrument("BTC-07JUN25-100000-C") == "BTC"
+        assert _asset_from_instrument("ETH-07JUN25-3000-P") == "ETH"
+        assert _asset_from_instrument("") == ""
+
+    def test_clamp_amount_btc_valid(self):
+        # 0.3 with min 0.1, step 0.1 → 0.3 unchanged
+        assert _clamp_amount_to_step(0.3, 0.1, 0.1) == pytest.approx(0.3)
+
+    def test_clamp_amount_eth_rounds_to_integer_step(self):
+        # 9.5 with min 1, step 1 → floored to 9.0
+        assert _clamp_amount_to_step(9.5, 1.0, 1.0) == pytest.approx(9.0)
+
+    def test_clamp_amount_below_minimum_returns_none(self):
+        # 0.1 with ETH min 1, step 1 → floors to 0 → below minimum → None
+        assert _clamp_amount_to_step(0.1, 1.0, 1.0) is None
 
     def test_check_slippage_within_bounds(self):
         _check_slippage(102.0, 100.0, 0.05)  # 2% deviation, 5% limit — should not raise
@@ -447,16 +460,18 @@ class TestAsyncCloseSpread:
 
         with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
             mgr = OrderManager()
-            credit = self._run(
+            result = self._run(
                 _async_close_spread(
                     position, client_id="", client_secret="",
                     order_manager=mgr,
                 )
             )
 
-        assert credit is not None
-        # far_close - near_close > 0 means we collected more than we paid
+        assert result is not None
+        # Phase 25c: returns (credit, near_close_usd, far_close_usd)
+        credit, near_close_usd, far_close_usd = result
         assert isinstance(credit, float)
+        assert credit == pytest.approx(far_close_usd - near_close_usd)
 
     def test_close_failure_returns_none(self):
         position = _make_position()
@@ -710,7 +725,7 @@ class TestComboOrder:
             async def create_combo(self, legs):
                 return {"combo_id": "COMBO-BTC-NEAR-FAR", "instrument_name": "COMBO-BTC-NEAR-FAR"}
 
-            async def place_order(self, instrument, direction, amount, price, label=""):
+            async def place_order(self, instrument, direction, amount, price, label="", validate_amount=True):
                 self.placed_orders.append({"instrument": instrument, "direction": direction})
                 return {"order": {"order_id": combo_order_id, "order_state": "open", "price": price}}
 
@@ -745,7 +760,7 @@ class TestComboOrder:
             async def create_combo(self, legs):
                 return {"combo_id": "COMBO-BTC"}
 
-            async def place_order(self, instrument, direction, amount, price, label=""):
+            async def place_order(self, instrument, direction, amount, price, label="", validate_amount=True):
                 return {"order": {"order_id": "combo-1", "order_state": "open"}}
 
             async def get_order_state(self, order_id):
@@ -1264,3 +1279,103 @@ class TestForceClosePnLFix:
             # fake PnL=0.0 row is ever written.
             assert "FAILED" in result
             mock_stuck.assert_not_called()
+
+
+# ── Tests: amount validation (Phase 25a/25b) ──────────────────────────────────
+
+class TestAmountValidation:
+    """Per-instrument order-amount clamping and the AMOUNT GATE abort."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _client_with_meta(self, meta: dict | Exception):
+        from execution.executor import _DeribitRPCClient, _AMOUNT_INFO_CACHE
+        _AMOUNT_INFO_CACHE.clear()
+        client = _DeribitRPCClient()
+
+        async def fake_rpc(method, params):
+            if method == "public/get_instrument":
+                if isinstance(meta, Exception):
+                    raise meta
+                return meta
+            # order placement echo
+            return {"order": {"order_id": "x-1", "order_state": "open"}}
+
+        client._rpc = fake_rpc  # type: ignore[assignment]
+        return client
+
+    def test_clamp_amount_uses_live_min(self):
+        client = self._client_with_meta({"min_trade_amount": 1.0, "contract_size": 1.0})
+        out = self._run(client.clamp_amount("ETH-07JUN25-3000-C", 9.5))
+        assert out == pytest.approx(9.0)  # ETH integer step
+
+    def test_clamp_amount_below_min_returns_none(self):
+        client = self._client_with_meta({"min_trade_amount": 1.0, "contract_size": 1.0})
+        out = self._run(client.clamp_amount("ETH-07JUN25-3000-C", 0.1))
+        assert out is None  # floors to 0 → below ETH minimum
+
+    def test_clamp_amount_static_fallback_on_fetch_failure(self):
+        # Fetch raises → fall back to config.DEFAULT_MIN_TRADE_AMOUNTS["ETH"] = (1, 1)
+        client = self._client_with_meta(RuntimeError("network"))
+        out = self._run(client.clamp_amount("ETH-07JUN25-3000-C", 5.7))
+        assert out == pytest.approx(5.0)
+
+    def test_place_order_raises_amount_gate_below_min(self):
+        client = self._client_with_meta({"min_trade_amount": 1.0, "contract_size": 1.0})
+        with pytest.raises(AmountBelowMinimumError):
+            self._run(client.place_order("ETH-07JUN25-3000-C", "buy", 0.1, 0.01))
+
+    def test_place_order_skips_validation_for_combo(self):
+        client = self._client_with_meta({"min_trade_amount": 1.0, "contract_size": 1.0})
+        # validate_amount=False must not raise even though 0.1 < ETH min
+        result = self._run(
+            client.place_order("COMBO-X", "buy", 0.1, 0.01, validate_amount=False)
+        )
+        assert result["order"]["order_id"] == "x-1"
+
+
+# ── Tests: close_spread stashes fill prices (Phase 25c) ───────────────────────
+
+class TestCloseFillTracking:
+    def test_close_spread_stores_last_close_fills(self):
+        position = _make_position()
+        mock_client = _MockRPCClient(
+            place_order_results=[
+                _submitted_order_result("close-near-1", 0.0015),
+                _submitted_order_result("close-far-1",  0.0055),
+            ],
+            order_states={
+                "close-near-1": [_filled_order_state("close-near-1", 0.0015)],
+                "close-far-1":  [_filled_order_state("close-far-1",  0.0055)],
+            },
+            ticker_results={
+                "BTC-07JUN25-100000-C": {"best_bid_price": 0.0014, "best_ask_price": 0.0016},
+                "BTC-07JUL25-100000-C": {"best_bid_price": 0.0054, "best_ask_price": 0.0056},
+            },
+        )
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            ex = CalendarExecutor(client_id="", client_secret="")
+            credit = ex.close_spread(position)
+        assert credit is not None
+        assert ex.last_close_fills is not None
+        assert "near_close_usd" in ex.last_close_fills
+        assert "far_close_usd" in ex.last_close_fills
+
+    def test_close_spread_clears_fills_on_failure(self):
+        position = _make_position()
+        mock_client = _MockRPCClient(
+            place_order_results=[
+                _submitted_order_result("close-near-1", 0.0015),
+                _submitted_order_result("close-far-1",  0.0055),
+            ],
+            order_states={
+                "close-near-1": [{"order_id": "close-near-1", "order_state": "open"}],
+                "close-far-1":  [{"order_id": "close-far-1",  "order_state": "open"}],
+            },
+        )
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client):
+            ex = CalendarExecutor(client_id="", client_secret="", order_timeout=0)
+            credit = ex.close_spread(position)
+        assert credit is None
+        assert ex.last_close_fills is None
