@@ -728,22 +728,32 @@ async def handle_deribit_positions(
         live_names: set[str] = set()
         any_positions = False
 
+        open_orders_total = 0
         for currency in currencies:
-            positions = portfolio.get_deribit_open_positions(currency)
-            if not positions:
+            # kind="any" so futures/perpetuals (a residual-margin source) show
+            # alongside options (Phase 25e).
+            positions = portfolio.get_deribit_open_positions(currency, kind="any")
+            orders = portfolio.get_deribit_open_orders(currency)
+            if not positions and not orders:
                 continue
-            any_positions = True
+            any_positions = any_positions or bool(positions)
             lines.append(f"\n*{currency}*")
             for p in positions:
                 name = p.get("instrument_name", "")
                 live_names.add(name)
                 lines.append(
-                    f"  {name}  size={p.get('size', 0.0)}  "
+                    f"  {name} [{p.get('kind', 'option')}]  size={p.get('size', 0.0)}  "
                     f"index=${p.get('index_price', 0.0):,.2f}  "
                     f"mark=${p.get('mark_value', 0.0):.4f}"
                 )
+            for o in orders:
+                open_orders_total += 1
+                lines.append(
+                    f"  order: {o.get('instrument_name', '')} {o.get('direction', '')} "
+                    f"amount={o.get('amount', 0.0)} @ {o.get('price', 0.0)}"
+                )
 
-        if not any_positions:
+        if not any_positions and open_orders_total == 0:
             await update.message.reply_text("No positions currently open on Deribit.")
             return
 

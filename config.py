@@ -113,6 +113,18 @@ MAX_LEG_SPREAD_PCT     = 0.05   # reject if (ask-bid)/mid > 5% on either leg
 MAX_ENTRY_PREMIUM      = 0.10   # reject if net_debit > spread_mid * (1 + 10%)
 COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individual-leg fallback
 
+# ── Phase 25d — absolute spread floor ─────────────────────────────────────────
+# The percentage-only spread gate (MAX_LEG_SPREAD_PCT) rejects one-tick-wide
+# testnet books as "40–100% spread" because their mids are only a tick or two
+# wide, starving test mode of every entry.  These absolute floors let a leg pass
+# the spread gate whenever its raw bid/ask width is within either enabled floor,
+# regardless of what percentage of a tiny mid that happens to be.  Both default
+# to 0 (disabled) so live behaviour is unchanged; config_test.py enables the
+# tick floor so minimum-width books pass.  A leg passes the spread gate if
+# (ask-bid)/mid <= MAX_LEG_SPREAD_PCT OR (ask-bid) is within an enabled floor.
+MAX_LEG_SPREAD_ABS_TICKS = 0     # spread <= N ticks always passes (0 = disabled)
+MAX_LEG_SPREAD_ABS_USD   = 0.0   # spread <= $X always passes (0 = disabled)
+
 # Position sizing
 MAX_LOSS_PCT       = 0.02  # max 2% of portfolio per trade
 MAX_POSITIONS      = 5     # max concurrent open calendar spreads
@@ -343,8 +355,24 @@ TICK_SIZE_FETCH_RETRIES = 1
 MIN_ROLL_NEAR_FAR_GAP_DAYS = 1
 
 # Position sizing (strategy/sizer.py, execution/executor.py)
-MIN_CONTRACT_SIZE      = 0.1    # Deribit minimum option contract increment (BTC/ETH)
+MIN_CONTRACT_SIZE      = 0.1    # config-level sanity floor on contract size (BTC/ETH)
 STRIKE_CORRELATION_PCT = 0.05   # positions within ±5% of an open strike are correlated
+
+# ── Phase 25a/25b — per-instrument order-amount validation ────────────────────
+# Deribit enforces a per-instrument minimum trade amount and amount step (from
+# public/get_instrument: min_trade_amount / contract_size).  BTC options accept
+# 0.1 in 0.1 steps; ETH options require a minimum of 1 in integer steps; an
+# amount below the minimum is rejected at the exchange with "-32602 Invalid
+# params" — which is exactly what collapsed every ETH entry in the 2026-07 test
+# run.  The executor fetches the live values per instrument and clamps the
+# sizer-approved qty to them.  These static fallbacks are used only when the
+# live metadata fetch fails, and the fallback is logged loudly.
+DEFAULT_MIN_TRADE_AMOUNTS = {   # asset → (min_trade_amount, amount_step)
+    "BTC": (0.1, 0.1),
+    "ETH": (1.0, 1.0),
+    "SOL": (1.0, 1.0),
+}
+DEFAULT_MIN_TRADE_AMOUNT = (1.0, 1.0)   # unknown assets: conservative integer step
 
 # Portfolio tracker (portfolio/tracker.py)
 RECONCILE_THRESHOLD_PCT = 0.10      # warn when Deribit vs DB margin diverge by more than 10%

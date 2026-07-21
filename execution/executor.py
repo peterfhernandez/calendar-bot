@@ -35,7 +35,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
 from typing import Optional
 
 import websockets
@@ -57,11 +57,23 @@ _RETRY_DELAYS = config.ORDER_RETRY_DELAYS   # seconds between retry attempts
 _TICK_SIZE_CACHE: dict[str, float] = {}          # instrument_name → base tick_size
 _TICK_STEPS_CACHE: dict[str, list] = {}          # instrument_name → tick_size_steps (per-price-band overrides)
 
+# ── Amount-validity cache (Phase 25a) ─────────────────────────────────────────
+# instrument_name → (min_trade_amount, amount_step).  Deribit rejects an order
+# whose amount is below the instrument minimum or not on the amount step with
+# "-32602 Invalid params" (the cause of every ETH entry failing in the 2026-07
+# test run, since the executor floored everything to 0.1 while ETH options
+# require a minimum of 1 in integer steps).
+_AMOUNT_INFO_CACHE: dict[str, tuple[float, float]] = {}
+
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 class SlippageError(Exception):
     """Fill price deviates too far from mid; trade rejected."""
+
+
+class AmountBelowMinimumError(Exception):
+    """Order amount is below the instrument's exchange minimum after clamping to step."""
 
 
 class LegRiskError(Exception):
@@ -224,6 +236,50 @@ class _DeribitRPCClient:
         )
         return None, None
 
+    async def _fetch_amount_info(self, instrument: str) -> tuple[float, float] | None:
+        """
+        Fetch and cache an instrument's ``min_trade_amount`` and amount step
+        (``contract_size``) from ``public/get_instrument`` (Phase 25a).
+
+        Returns ``(min_trade_amount, amount_step)`` or ``None`` on failure so the
+        caller falls back to the static per-asset table in config.
+        """
+        try:
+            meta = await self._rpc("public/get_instrument", {"instrument_name": instrument})
+        except Exception as exc:
+            logger.warning("Amount-info fetch failed for %s: %s", instrument, exc)
+            return None
+        if not isinstance(meta, dict):
+            return None
+        min_amt = meta.get("min_trade_amount")
+        step    = meta.get("contract_size") or min_amt
+        if min_amt and step:
+            info = (float(min_amt), float(step))
+            _AMOUNT_INFO_CACHE[instrument] = info
+            return info
+        return None
+
+    async def clamp_amount(self, instrument: str, amount: float) -> float | None:
+        """
+        Round ``amount`` down to the instrument's amount step and return it, or
+        ``None`` if the result is below the exchange minimum (Phase 25a).
+
+        Uses live ``public/get_instrument`` metadata (cached); on fetch failure
+        falls back to ``config.DEFAULT_MIN_TRADE_AMOUNTS`` keyed by the asset and
+        logs the fallback loudly — never silently submits an unvalidated amount.
+        """
+        info = _AMOUNT_INFO_CACHE.get(instrument)
+        if info is None:
+            info = await self._fetch_amount_info(instrument)
+        if info is None:
+            asset = _asset_from_instrument(instrument)
+            info = config.DEFAULT_MIN_TRADE_AMOUNTS.get(asset, config.DEFAULT_MIN_TRADE_AMOUNT)
+            logger.warning(
+                "AMOUNT GATE: could not fetch live minimum for %s — using static "
+                "fallback (min=%s, step=%s)", instrument, info[0], info[1],
+            )
+        return _clamp_amount_to_step(amount, info[0], info[1])
+
     async def place_order(
         self,
         instrument: str,
@@ -231,7 +287,20 @@ class _DeribitRPCClient:
         amount:     float,
         price:      float,  # limit price in Deribit index fraction
         label:      str = "",
+        validate_amount: bool = True,
     ) -> dict:
+        # Validate/clamp the order amount to the instrument's exchange minimum
+        # and step (Phase 25a) — an off-minimum amount is rejected with "-32602
+        # Invalid params".  Combo placements pass validate_amount=False (the
+        # combo instrument has its own minimum handled by the exchange).
+        if validate_amount:
+            clamped = await self.clamp_amount(instrument, amount)
+            if clamped is None:
+                raise AmountBelowMinimumError(
+                    f"amount {amount} below exchange minimum for {instrument}"
+                )
+            amount = clamped
+
         # Round price to instrument's valid tick size to prevent "-32602 Invalid
         # params" errors.  Tick size varies with option price level
         # (tick_size_steps); try cache first, then fetch (loud on failure).
@@ -295,26 +364,31 @@ def _usd_price(index_price: float, spot: float, asset: str) -> float:
     return index_price
 
 
-def _contract_amount(spot: float, asset: str, portfolio_value: float, max_loss_pct: float, net_debit_usd: float) -> float:
-    """
-    Calculate order amount in Deribit contract units.
+def _asset_from_instrument(instrument: str) -> str:
+    """Return the upper-cased asset prefix of a Deribit instrument name.
 
-    For inverse assets (BTC, ETH): amount in coin units.
-    For linear (SOL_USDC etc.): amount in integer contracts.
-
-    The amount is sized so that max_loss_pct of portfolio_value covers the
-    net_debit per unit times the amount.
+    (Phase 25b removed the old ``_contract_amount`` sizing helper — the executor
+    now submits the sizer-approved qty directly instead of recomputing it.)
     """
-    max_usd = portfolio_value * max_loss_pct
-    if net_debit_usd <= 0:
-        return 0.0
-    qty_usd = max_usd / net_debit_usd
-    if asset.upper() in ("BTC", "ETH"):
-        # Each contract = 1 coin unit; net_debit_usd is already per-coin
-        amount_coins = max_usd / (net_debit_usd * spot)
-        return round(max(config.MIN_CONTRACT_SIZE, amount_coins), 4)  # Deribit minimum
-    # Linear: amount in integer contracts
-    return float(max(1, int(qty_usd)))
+    return instrument.split("-", 1)[0].upper() if instrument else ""
+
+
+def _clamp_amount_to_step(amount: float, min_amount: float, step: float) -> float | None:
+    """
+    Round *amount* down to a multiple of *step* and return it, or ``None`` if the
+    result is below *min_amount* (Phase 25a).
+
+    Rounding is done in ``Decimal`` step-count space to avoid float drift so the
+    submitted amount lands exactly on the exchange grid.
+    """
+    if step <= 0:
+        step = min_amount if min_amount > 0 else 1.0
+    step_dec = Decimal(str(step))
+    steps = (Decimal(str(amount)) / step_dec).to_integral_value(rounding=ROUND_FLOOR)
+    clamped = float(steps * step_dec)
+    if clamped < min_amount or clamped <= 0:
+        return None
+    return clamped
 
 
 def _effective_tick_size(price: float, base_tick: float, tick_size_steps: list | None) -> float:
@@ -481,6 +555,7 @@ async def _async_enter_spread_combo(
             order_result = await client.place_order(
                 combo_id, "buy", amount, net_debit_limit_index,
                 label=f"CAL-COMBO-{asset}",
+                validate_amount=False,  # combo instrument has its own exchange minimum
             )
         except Exception as exc:
             logger.debug("Combo order placement failed (%s) — will use individual legs", exc)
@@ -566,12 +641,16 @@ async def _async_enter_spread(
     """
     asset = candidate.asset
     spot  = candidate.spot
-    amount = _contract_amount(
-        spot, asset, portfolio_value,
-        config.MAX_LOSS_PCT, candidate.net_debit * spot if asset.upper() in ("BTC", "ETH") else candidate.net_debit
-    )
+    # Phase 25b: submit the sizer-approved quantity directly instead of the old
+    # dimensionally-wrong _contract_amount() recompute (which divided by spot a
+    # second time and always collapsed to the 0.1 floor — valid for BTC but
+    # rejected for ETH).  The sizer rounds qty to the instrument step, and
+    # place_order re-validates it against the live per-instrument minimum.
+    amount = candidate.qty
     if amount <= 0:
-        logger.warning("Calculated amount is 0 for %s %s — skipping", asset, candidate.near_instrument)
+        logger.warning(
+            "Sizer-approved qty is %s for %s %s — skipping", amount, asset, candidate.near_instrument
+        )
         return None
 
     near_instr = candidate.near_instrument
@@ -758,11 +837,13 @@ async def _async_close_spread(
     client_secret: str,
     order_manager: OrderManager,
     order_timeout: int = ORDER_TIMEOUT_SEC,
-) -> float | None:
+) -> tuple[float, float, float] | None:
     """
     Close both legs of a calendar spread.
 
-    Returns the net closing credit in USD (positive = profit vs. debit paid),
+    Returns ``(closing_credit_usd, near_close_usd, far_close_usd)`` — the net
+    closing credit (positive = profit vs. debit paid) plus the two per-leg close
+    fill prices in USD so the caller can compute accurate exit fees (Phase 25c) —
     or None if an error occurred.
     """
     asset      = position["asset"]
@@ -929,7 +1010,7 @@ async def _async_close_spread(
             "Spread closed: near_close=%.4f  far_close=%.4f  credit=%.4f",
             near_close_usd, far_close_usd, closing_credit,
         )
-        return closing_credit
+        return closing_credit, near_close_usd, far_close_usd
 
 
 async def _async_roll_near_leg(
@@ -1058,6 +1139,9 @@ class CalendarExecutor:
         self.order_manager   = order_manager or OrderManager()
         self.slippage_pct    = slippage_pct
         self.order_timeout   = order_timeout
+        # Populated by close_spread() with the last close's per-leg fill prices
+        # so the decision engine can compute exit fees from real fills (Phase 25c).
+        self.last_close_fills: dict[str, float] | None = None
 
     def _run(self, coro):
         """Run an async coroutine, handling both standalone and in-loop contexts."""
@@ -1129,6 +1213,9 @@ class CalendarExecutor:
             )
         except LegRiskError:
             raise
+        except AmountBelowMinimumError as exc:
+            logger.warning("AMOUNT GATE: entry aborted — %s", exc)
+            return None
         except SlippageError as exc:
             logger.warning("Slippage exceeded: %s", exc)
             return None
@@ -1137,9 +1224,17 @@ class CalendarExecutor:
             return None
 
     def close_spread(self, position: dict) -> float | None:
-        """Close both legs.  Returns closing credit in USD or None on failure."""
+        """
+        Close both legs.  Returns closing credit in USD or None on failure.
+
+        On success the per-leg close fill prices are stashed on
+        ``self.last_close_fills`` (``{"near_close_usd", "far_close_usd"}``) so the
+        decision engine can compute accurate exit fees from the actual fills
+        (Phase 25c) rather than falling back to stale entry-time premiums.
+        """
+        self.last_close_fills = None
         try:
-            return self._run(
+            result = self._run(
                 _async_close_spread(
                     position,
                     client_id=self.client_id,
@@ -1151,6 +1246,14 @@ class CalendarExecutor:
         except Exception:
             logger.exception("Unexpected error in close_spread")
             return None
+        if result is None:
+            return None
+        credit, near_close_usd, far_close_usd = result
+        self.last_close_fills = {
+            "near_close_usd": near_close_usd,
+            "far_close_usd":  far_close_usd,
+        }
+        return credit
 
     def roll_near_leg(self, position: dict, new_candidate: CalendarCandidate) -> bool:
         """Roll the near leg to new_candidate.  Returns True on success."""

@@ -1126,6 +1126,45 @@ class TestLiquidityGate:
         reason = engine._check_liquidity_gate(self._good_candidate())
         assert reason is None
 
+    # ── Phase 25d: absolute spread floor ──────────────────────────────────────
+
+    def _wide_but_narrow_usd_candidate(self) -> CalendarCandidate:
+        """Near leg is ~15% wide by percentage but only $15 wide in absolute terms.
+
+        (spot=90k → estimated tick ≈ $9, so $15 is within a 2-tick floor.)
+        """
+        c = _make_candidate()
+        c.near_bid = 90.0
+        c.near_ask = 105.0   # width $15, ~15% of mid=97.5
+        c.far_bid  = 300.0
+        c.far_ask  = 302.0   # far_mid=301, 0.7% — fine
+        # spread_mid = 301 - 97.5 = 203.5; net_debit keeps premium comfortably < 10%
+        c.net_debit = 210.0  # premium = (210-203.5)/203.5 ≈ 3.2%
+        return c
+
+    def test_abs_floor_disabled_rejects_wide_pct(self):
+        engine, _ = _make_engine()
+        with patch.object(config, "MAX_LEG_SPREAD_ABS_TICKS", 0), \
+             patch.object(config, "MAX_LEG_SPREAD_ABS_USD", 0.0):
+            reason = engine._check_liquidity_gate(self._wide_but_narrow_usd_candidate())
+        assert reason is not None
+        assert "near-leg" in reason
+
+    def test_abs_usd_floor_passes_narrow_usd_spread(self):
+        engine, _ = _make_engine()
+        with patch.object(config, "MAX_LEG_SPREAD_ABS_USD", 25.0), \
+             patch.object(config, "MAX_LEG_SPREAD_ABS_TICKS", 0):
+            reason = engine._check_liquidity_gate(self._wide_but_narrow_usd_candidate())
+        assert reason is None
+
+    def test_abs_tick_floor_passes_narrow_spread(self):
+        # BTC spot=100k → est tick ≈ 0.0001*100000 = $10; 2 ticks = $20 allowance.
+        engine, _ = _make_engine()
+        with patch.object(config, "MAX_LEG_SPREAD_ABS_TICKS", 2), \
+             patch.object(config, "MAX_LEG_SPREAD_ABS_USD", 0.0):
+            reason = engine._check_liquidity_gate(self._wide_but_narrow_usd_candidate())
+        assert reason is None
+
     # ── Integration: scan_tick respects the gate ──────────────────────────────
 
     def test_scan_tick_blocks_wide_spread_candidate(self):

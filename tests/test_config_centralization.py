@@ -430,3 +430,18 @@ class TestConfigTestParity:
         ):
             assert hasattr(config, key), f"config.py missing {key}"
             assert hasattr(config_test, key), f"config_test.py missing {key}"
+
+    def test_phase25_keys_present_in_both(self):
+        import config_test
+
+        for key in (
+            "MAX_LEG_SPREAD_ABS_TICKS", "MAX_LEG_SPREAD_ABS_USD",
+            "DEFAULT_MIN_TRADE_AMOUNTS", "DEFAULT_MIN_TRADE_AMOUNT",
+        ):
+            assert hasattr(config, key), f"config.py missing {key}"
+            assert hasattr(config_test, key), f"config_test.py missing {key}"
+
+        # config.py disables the absolute floor by default (live unchanged);
+        # config_test.py enables the tick floor for thin testnet books.
+        assert config.MAX_LEG_SPREAD_ABS_TICKS == 0
+        assert config_test.MAX_LEG_SPREAD_ABS_TICKS > 0
