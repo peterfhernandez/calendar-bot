@@ -49,7 +49,7 @@ MIN_IV_CONTANGO = 0.02   # front IV must exceed back IV by at least 2%
 MIN_POP         = 0.45   # minimum probability of profit
 MIN_OI_NEAR     = 100    # minimum open interest on near-leg strike
 MIN_OI_FAR      = 50     # minimum open interest on far-leg strike
-MIN_EV          = 0      # minimum expected value as a fraction of net_debit.
+MIN_EV          = -0.1   # minimum expected value as a fraction of net_debit.
                          # 0.0 = reject non-positive EV; 0.10 = EV must be ≥ 10% of debit paid.
                          # e.g. a candidate with net_debit=0.02 BTC and ev_score=0.25
                          # has an expected profit of 25% of the debit (0.005 BTC per contract).
@@ -200,7 +200,7 @@ CLOSE_CONFIRM_TICKS         = 2      # consecutive stop/TP ticks required before
 REENTRY_COOLDOWN_SEC        = 1800   # block re-entry of a just-auto-closed instrument
 
 # ── Logging (Phase 20a) ───────────────────────────────────────────────────────
-LOG_LEVEL          = "INFO"
+LOG_LEVEL          = "WARNING"
 LOG_FORMAT         = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
 LOG_DATE_FORMAT    = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
