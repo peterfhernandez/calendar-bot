@@ -1228,6 +1228,7 @@ In **test/live mode**:
 **Status:** Complete — all seven sub-phases (22a–22g) implemented and tested; 616 tests passing (24 new across `test_state.py`, `test_telegram_cmd.py`, `test_executor.py`, and `test_decision.py`). Offline demos: `python -m scratch.scratch_stuck_position_visibility`, `python -m scratch.scratch_close_price_rounding`, `python -m scratch.scratch_premature_roll` (no live orders). Full root-cause detail in BOT_PLAN.md Phase 22. Found via a test-mode Telegram session (trades #11/#12): `/positions` and `/info trade_id=N` both went silent/empty right after "MANUAL ACTION REQUIRED" alerts, and the same alert fired twice across a service restart. Root causes: (1) `get_open_trades()` (used by Telegram) excludes `close_status='close_stuck'` rows, hiding exactly the positions the operator needs to see; (2) `handle_info` has no `try/except` and `telegram_cmd/listener.py` registers no PTB error handler, so any exception (e.g. a `cost_basis==0` divide-by-zero) is completely silent; (3) the monitor loop's actual read path (`_load_all_open_positions` → `load_calendar_state`) was never updated to exclude `close_stuck` positions — only the Telegram-facing `get_open_trades()` was — so the engine keeps retrying (and eventually re-notifying about) a stuck position forever, and a restart just resets the in-memory notification-dedup set that was papering over it; (4) the underlying close/roll order rejection (`-32602 Invalid params`) was still live: `execution/executor.py` derived close/roll prices from a synthetic `mid * 1.02`/`mid * 0.98` instead of a real quote, and silently swallowed tick-size fetch failures. A fifth item was found mid-phase from a paper-mode report: trades #206/#207 (`near_days=1`) were entered and rolled/closed roughly a minute later — `ROLL_TRIGGER_DAYS=2` made any freshly-opened 1-day-near position immediately roll-eligible with zero regard for actual elapsed time, and `_try_roll()` matched a same-expiry-as-far-leg candidate for trade #207 (no check that the new near leg's expiry precedes the position's own far leg), collapsing its spread value to `$0.00` and tripping a large stop-loss — the same failure family as Phase 21's churn, through the roll path instead of the entry-ranking path.
 
 **Implementation notes:**
+
 - **22a** — `load_calendar_state()`'s `open_positions` list now excludes `close_status == 'close_stuck'`, so the monitor's read path (`_load_all_open_positions`) genuinely leaves stuck positions alone instead of merely hiding them from Telegram.
 - **22b** — new `get_visible_positions()` (stuck-inclusive) backs `/positions` and `/portfolio`; stuck rows are prefixed `⚠️ STUCK —` with the `close_error_reason` appended. `get_open_trades()` is unchanged (still excludes stuck) for 22a.
 - **22c** — `handle_info` wrapped in `try/except` with an explicit `cost_basis == 0` guard; `listener._build_app()` registers a global `add_error_handler` that replies "Something went wrong processing that command." instead of staying silent.
@@ -1318,13 +1319,14 @@ In **test/live mode**:
 **Status:** Complete — all four sub-phases (24a–24d) implemented and tested; 636 tests passing (18 new across `test_portfolio.py::TestReconcileEnhanced`, `test_telegram_cmd.py::TestHandleDeribitPositions`, and `test_state.py::TestMarkStuckPositionReconciled`). Offline demo: `python -m scratch.scratch_reconcile_mismatch` (read-only, no live orders; aborts in live mode). Full root-cause detail in BOT_PLAN.md Phase 24.
 
 **Implementation notes:**
+
 - **24a** — `portfolio/tracker.py::get_deribit_open_positions(currency)` calls `private/get_positions` (kind=option) and normalises each non-flat position to `{instrument_name, size, mark_price, index_price, mark_value}`, returning `[]` on any failure. `_reconcile()` now names the live instruments on a mismatch (`_describe_deribit_positions()`), replacing the non-actionable "possible manual trade or missed fill" suffix with `Deribit open: <instruments>`.
 - **24b** — `portfolio/tracker.py::sync_stuck_positions(db_path)` fetches the live position list once (aborting on any fetch error so an API failure never falsely reconciles), and marks a `close_stuck` DB trade `closed` (via new `db/state.py::mark_stuck_position_reconciled`) only when *both* legs are confirmed absent from Deribit. `refresh()` calls it at the top of the test/live path and recomputes SQLite margin/counts so the mismatch resolves in the same cycle. Existing pnl on terminal-but-stuck rows is preserved.
 - **24c** — `telegram_cmd/handlers.py::handle_deribit_positions` lists live Deribit positions grouped by currency, flags any instrument not tracked in the bot DB (`⚠️ Not tracked in bot DB`), and appends a sync hint when stuck DB trades are still open on Deribit. Gated to "Command not available in paper mode." Wired through `TelegramCommandListener(portfolio=…)` (passed from `bot.py`) and added to `COMMAND_REGISTRY`.
 
 **Root cause:** When the bot marks a position `close_stuck` after retry exhaustion (e.g. trades 6–9, `BTC-15JUL26-*` options from 2026-07-14, all with `close_error_reason = "Roll retry limit exceeded close failed after 4 attempts — position needs manual close on Deribit"`), the Deribit position remains open on the exchange. The bot's DB records those positions as closed (with `close_status='close_stuck'`) and excludes their legs from the used-margin calculation (`SQLite margin = $0`), but Deribit's maintenance margin is still tied up. The portfolio tracker detects this divergence on every scan cycle and fires:
 
-```
+```text
 RECONCILE MISMATCH: Deribit margin $1534.28 vs SQLite margin $0.00 (divergence 100%) — possible manual trade or missed fill
 ```
 
@@ -1363,3 +1365,56 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
   - [x] Stuck DB trades still open on Deribit trigger the sync summary line
   - [x] `"No positions"` reply when Deribit list is empty
 - [x] Add `scratch/scratch_reconcile_mismatch.py` — connects to the paper/test Deribit account, fetches the live position list, compares it against `close_stuck` trades in the DB, and prints a reconciliation report; aborts if `TRADING_MODE == "live"`
+
+---
+
+## Phase 25 — Order-Amount Validity, Sizer/Executor Unification, Close-Fee Accuracy, Test-Liquidity Calibration, and Residual-Margin Reconciliation
+
+**Status:** Planned. From analysis of the 2026-07-17 → 2026-07-22 test-mode run: 81/81 ETH entries rejected by Deribit `-32602 Invalid params` while the 1/1 BTC entry filled (trade 13, at 0.1 instead of the approved 0.3); trade 13's close logged `close_fees=0.00`; zero candidates passed the liquidity gate after 2026-07-21 00:21 (582 near-leg-spread skips on 07-22 alone); and a ~$1,583 `RECONCILE MISMATCH` persists with no `kind=option` position to explain it. See [BOT_PLAN.md Phase 25](BOT_PLAN.md#phase-25--order-amount-validity-sizerexecutor-unification-close-fee-accuracy-test-liquidity-calibration-and-residual-margin-reconciliation) for full root-cause detail.
+
+### 25a — Per-instrument order-amount validation (fixes all-ETH `-32602` rejections)
+
+- [ ] Extend the executor's instrument-metadata cache (already populated from `public/get_instrument` for tick size) to also capture `min_trade_amount` and `contract_size`/amount step
+- [ ] Add `_clamp_amount(instrument_name, amount) -> float | None` to `execution/executor.py` — round the amount down to the instrument's step; return `None` if below `min_trade_amount`
+- [ ] Call `_clamp_amount` before every `place_order` in the entry, close, roll, and unwind paths; on `None`, abort with `WARNING "AMOUNT GATE: <instr> requested=<x> below exchange minimum <min>"` instead of submitting
+- [ ] Fall back to a static per-asset minimum table in `config.py` (BTC: 0.1, ETH: 1) when the metadata fetch fails, and log the fallback loudly
+- [ ] Skip undersized candidates at RANK stage in `strategy/decision.py` (log `RANK skip: sized qty below exchange minimum`) so they never reach approval
+- [ ] Round the sizer's qty to the instrument step in `strategy/sizer.py` so the approved qty is already submittable
+
+### 25b — Executor honours the sizer-approved qty (trade 13 filled 0.1 vs approved 0.3)
+
+- [ ] Remove the duplicate, dimensionally-wrong sizing in `execution/executor.py::_contract_amount()` (`max_usd / (net_debit_usd * spot)` divides by spot twice, always collapsing to the 0.1 floor)
+- [ ] Pass the sizer-approved qty from `strategy/decision.py` through `enter_spread()` as the order amount (then clamped by 25a)
+- [ ] Demote `MIN_CONTRACT_SIZE` to a config-level sanity floor only; document it in `config.py`
+- [ ] Log the final submitted amount alongside the sizer qty so any residual divergence is visible in one line
+
+### 25c — Accurate close fees (trade 13 logged `close_fees=0.00`)
+
+- [ ] `execution/executor.py::close_spread()` returns actual close fill prices (near and far) alongside the closing credit
+- [ ] `strategy/decision.py::_close_position()` computes `exit_fees` from those fill prices; falls back to DB-loaded entry premiums only when fills are unavailable
+- [ ] Replace the bare `except → close_fees_usd = 0.0` with a `WARNING` log naming the inputs that failed, so a silent zero-fee close cannot recur
+- [ ] Backfill note: net P&L of trade 13 (−25.06) understates real fees — document, do not rewrite history
+
+### 25d — Test-mode liquidity-gate calibration (percentage-only spread gate starves testnet)
+
+- [ ] Add `MAX_LEG_SPREAD_ABS_TICKS` and `MAX_LEG_SPREAD_ABS_USD` to `config.py` (both `0` = disabled → live behaviour unchanged)
+- [ ] Gate logic in `strategy/decision.py`: pass if `spread_pct <= MAX_LEG_SPREAD_PCT` **or** `(ask - bid)` is within either enabled absolute floor (a one-tick-wide book must never be rejected as "40% spread")
+- [ ] Enable the absolute floor in `config_test.py` with a documented rationale; keep `config.py`/`config_test.py` key parity (Phase 21f regression test)
+- [ ] Include which branch passed (pct vs abs) in the LIQUIDITY GATE debug log line
+
+### 25e — Residual-margin reconciliation (~$1,583 with no option positions)
+
+- [ ] `portfolio/tracker.py::get_deribit_open_positions(currency, kind="any")` — cover futures/perpetuals as well as options; normalise per kind defensively
+- [ ] Reconcile across all account currencies (via `private/get_account_summaries` or configured superset), not just `ASSETS`
+- [ ] Include resting open orders (`private/get_open_orders_by_currency`) — count and reserved margin — in the mismatch warning
+- [ ] `/deribit_positions` shows futures and open orders too, each flagged against the bot DB
+- [ ] Add `scratch/scratch_account_margin_audit.py` — read-only dump of every position kind, open orders, and per-currency account summaries to identify the current residue; aborts if `TRADING_MODE == "live"`
+- [ ] One-time operator action (after the audit identifies the source): manually clear the residual margin on test.deribit.com and confirm the reconcile warning stops
+
+### 25f — Tests and scratch
+
+- [ ] `tests/test_executor.py`: amount clamped to step; below-minimum returns `None` and aborts with AMOUNT GATE log; metadata-fetch failure uses static fallback; sizer qty (not a recomputed amount) reaches `place_order`; `close_spread` returns fill prices
+- [ ] `tests/test_decision.py`: RANK skip for undersized candidates; close fees computed from fill prices; fee-calc failure logs WARNING and does not zero silently; abs-floor spread gate passes a one-tick book and stays disabled when configured `0`
+- [ ] `tests/test_portfolio.py`: `kind=any` reconcile lists a futures position; open-order margin appears in the warning; option-only fallback on parse failure
+- [ ] `tests/test_config_centralization.py`: new keys present in both `config.py` and `config_test.py`
+- [ ] Add `scratch/scratch_amount_validation.py` — fetches live BTC/ETH option instrument minimums and demonstrates clamp/skip decisions without placing orders; aborts if `TRADING_MODE == "live"`

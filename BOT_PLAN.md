@@ -1659,3 +1659,59 @@ Three independent improvements, each usable in isolation:
 | `private/get_positions` fails (network, auth) during reconcile | `get_deribit_open_positions` returns `[]` on any exception (non-blocking); enhanced log line is skipped; existing warning still fires |
 | Auto-reconcile marks a trade closed while a partial Deribit position still exists | `sync_stuck_positions` requires **both** `near_instrument` and `far_instrument` absent from the Deribit list before marking closed; a partially-closed leg keeps the trade in `close_stuck` |
 | `/deribit_positions` called in paper mode (no Deribit account) | Handler is gated to return `"Command not available in paper mode."` when `TRADING_MODE == "paper"` |
+
+---
+
+## Phase 25 — Order-Amount Validity, Sizer/Executor Unification, Close-Fee Accuracy, Test-Liquidity Calibration, and Residual-Margin Reconciliation
+
+**Status:** Planned — five independent fixes surfaced by analysis of the 2026-07-17 → 2026-07-22 test-mode run (`logs/bot_test.log`). In that window the bot produced 82 RANK approvals (81 ETH, 1 BTC); **all 81 ETH entries were rejected by Deribit with `-32602 Invalid params`**, the single BTC entry filled (trade 13) at a third of its approved size, its close logged `close_fees=0.00`, and since 2026-07-21 00:21 zero candidates have passed the liquidity gate at all (582 near-leg-spread skips on 2026-07-22 alone). A persistent `RECONCILE MISMATCH` (~$1,583 Deribit margin vs $0 SQLite) survives Phase 24's remediation because the margin is not attributable to any `kind=option` position.
+
+### Root causes
+
+**25a/25b — `execution/executor.py::_contract_amount()` is dimensionally wrong and duplicates the sizer.** The sizer (`strategy/sizer.py`) computes a correct contract quantity (`max_usd / net_debit_usd`, e.g. `qty=9.5` ETH contracts, `qty=0.3` BTC). The executor then ignores that quantity and recomputes its own order amount as `max_usd / (net_debit_usd * spot)` — dividing by spot a second time even though `net_debit_usd` is already per-contract USD. The result is a near-zero value that is always floored to `MIN_CONTRACT_SIZE = 0.1` and submitted as `amount=0.1`:
+
+- For **BTC** options (Deribit minimum trade amount 0.1 BTC, step 0.1) `amount=0.1` happens to be valid — so trade 13 filled, but at qty 0.1 instead of the sizer-approved 0.3 (a silent 3× under-size).
+- For **ETH** options (Deribit minimum trade amount 1 ETH, integer steps) `amount=0.1` is invalid — so **every** ETH order dies with `-32602 Invalid params` before reaching the book. The asset split in the log is a perfect signature: 81/81 ETH rejected, 1/1 BTC filled.
+
+The executor never validates the amount against the instrument's own `min_trade_amount` / amount step (both available from `public/get_instrument`, which the tick-size path already calls), so the invalid amount is discovered only as an opaque exchange rejection.
+
+**25c — Exit fees fall back to 0 silently.** `strategy/decision.py::_close_position()` computes `close_fees_usd = exit_fees(asset, spot, qty, near_price, far_price)` from `pos.get("near_prem")`/`pos.get("far_prem")` inside a bare `try/except` that swallows any error into `close_fees_usd = 0.0`. Trade 13's close logged `close_fees=0.00` on a real two-leg exchange close — net P&L (−25.06) understates true fees. Two defects: the premiums come from the position dict (entry-time values, may be absent) rather than the actual close fill prices returned by `close_spread()`, and the except hides the failure.
+
+**25d — Percentage-only spread gate starves test mode.** The liquidity gate rejects when `(ask-bid)/mid > MAX_LEG_SPREAD_PCT` (10% in `config_test.py`). On test.deribit.com books, near-leg option mids are frequently one or two ticks (e.g. bid 0.002 / ask 0.003 → "40% spread" — one tick wide), so the percentage test rejects instruments whose spread is literally the minimum possible. Result: since 2026-07-21 00:21, every scan's candidates are eliminated at this gate and the test instance can no longer exercise the order path at all. The gate needs an absolute floor: a spread of ≤ N ticks (or ≤ $X) is acceptable regardless of what percentage of a tiny mid it happens to be.
+
+**25e — Residual margin invisible to reconcile.** Deribit reports ~$1,550–1,585 maintenance margin continuously since at least 2026-07-17 with **zero** tracked DB positions and — decisively — while trade 13 was open, Phase 24a's enhanced warning listed *only* trade 13's two legs (`Deribit margin $1625 vs SQLite $41.70`). So ~$1,583 of margin belongs to something `get_deribit_open_positions()` cannot see: that helper filters `private/get_positions` to `kind=option` on `ASSETS` currencies only. Candidates: futures/perpetual positions (e.g. from settlement of expired ITM options into futures on the test account), positions in a non-configured currency, or margin reserved by resting open orders. Because nothing is listed, Phase 24b's auto-reconcile can never fire and the warning repeats every 5 minutes indefinitely.
+
+### Solution
+
+**25a — Per-instrument amount validation.** Extend the executor's instrument-metadata cache (already fetched for tick size via `public/get_instrument`) to capture `min_trade_amount` and `contract_size`/amount step. New helper `_clamp_amount(instrument_name, amount)` rounds the requested amount down to the instrument's step and returns `None` if the result is below `min_trade_amount`. `enter_spread` / close / roll paths call it before every `place_order`; a `None` result aborts the attempt with an explicit `AMOUNT GATE` log line naming the instrument, requested amount, and exchange minimum — turning a cryptic `-32602` into an actionable skip. The decision layer applies the same check at RANK time so undersized candidates are skipped before approval.
+
+**25b — Executor honours the sizer's qty.** Delete the duplicate sizing in `_contract_amount()`; `enter_spread` takes the sizer-approved qty as the order amount (then clamped by 25a). One sizing authority, one number in the logs. `MIN_CONTRACT_SIZE` remains only as a config-level sanity floor.
+
+**25c — Accurate close fees.** `close_spread()` returns the actual close fill prices alongside the credit; `_close_position()` computes `exit_fees` from those fills (falling back to DB-loaded entry premiums only if fills are unavailable), and the bare `except` is replaced by a `WARNING` log naming the failed inputs so a zero-fee close can never pass silently again.
+
+**25d — Absolute spread floor in the liquidity gate.** New config keys `MAX_LEG_SPREAD_ABS_TICKS` (spread ≤ N ticks always passes; default tuned for test) and/or `MAX_LEG_SPREAD_ABS_USD`. Gate logic becomes: pass if `spread_pct <= MAX_LEG_SPREAD_PCT` **or** `(ask-bid) <= abs-floor`. Defaults in `config.py` keep live behaviour unchanged (`MAX_LEG_SPREAD_ABS_TICKS = 0` disables the floor); `config_test.py` enables it so tick-wide testnet books pass. Config-parity test updated (Phase 21f requirement).
+
+**25e — Widen reconcile visibility to all margin sources.** `get_deribit_open_positions()` gains a `kind` parameter and the reconcile/`/deribit_positions` paths fetch `kind=any` (options **and** futures) across all account currencies (from `private/get_account_summaries` or a configured superset), plus a count/value of resting open orders (`private/get_open_orders_by_currency`). The mismatch warning then names whatever actually holds the margin. A new scratch script dumps the full account state (positions of every kind, open orders, per-currency account summaries) for one-shot diagnosis of the current ~$1,583 residue; the operator then clears it manually on test.deribit.com, and `sync_stuck_positions` gains nothing new — the point is that nothing can hold margin invisibly again.
+
+### New/changed files
+
+| File | Change |
+| --- | --- |
+| `execution/executor.py` | `_contract_amount()` removed (25b); `enter_spread`/close/roll take sizer qty; + `_clamp_amount()` with cached `min_trade_amount`/step from `public/get_instrument` (25a); `close_spread()` returns close fill prices (25c) |
+| `strategy/decision.py` | RANK-stage minimum-amount skip (25a); `_close_position()` uses close fills for `exit_fees`, WARNING on fee-calc failure (25c); liquidity gate abs-floor logic (25d) |
+| `strategy/sizer.py` | Rounds qty to instrument step at sizing time so the approved qty is already submittable (25a/25b) |
+| `config.py` / `config_test.py` | + `MAX_LEG_SPREAD_ABS_TICKS`, `MAX_LEG_SPREAD_ABS_USD` (25d); `MIN_CONTRACT_SIZE` demoted to sanity floor (25b); parity maintained |
+| `portfolio/tracker.py` | `get_deribit_open_positions(currency, kind="any")`; reconcile covers futures + all currencies + open-order margin (25e) |
+| `telegram_cmd/handlers.py` | `/deribit_positions` shows futures and open orders too (25e) |
+| `tests/` | New tests per sub-phase (see BOT_TODO.md Phase 25) |
+| `scratch/scratch_amount_validation.py` | New — fetches real instrument minimums for BTC/ETH options, demonstrates clamp/reject decisions (no orders) |
+| `scratch/scratch_account_margin_audit.py` | New — dumps positions of every kind, open orders, and account summaries per currency to locate residual margin (read-only) |
+
+### Biggest risks mitigated
+
+| Risk | Mitigation |
+| --- | --- |
+| Instrument-metadata fetch fails at order time | `_clamp_amount` falls back to a conservative per-asset static minimum table in `config.py` and logs the fallback loudly (never silently submits an unvalidated amount) |
+| Honouring sizer qty suddenly submits much larger test orders than the accidental 0.1s did | qty is still bounded by `MAX_LOSS_PCT` sizing, `MAX_QTY`, and the margin gate; test-mode `MAX_LOSS_PCT` is already halved |
+| Absolute spread floor lets genuinely illiquid instruments through in live mode | Floor defaults to disabled in `config.py`; enabled only in `config_test.py`; two-sided-quote and OI gates still apply |
+| `kind=any` position fetch returns unexpected shapes (futures fields differ from options) | Normalisation keyed per kind with defensive defaults; reconcile falls back to the option-only list on parse failure |
