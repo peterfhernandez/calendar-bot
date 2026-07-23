@@ -182,22 +182,46 @@ def _eval_candidate(
     min_oi_far:      float,
     min_iv_contango: float,
     min_pop:         float,
+    is_roll:    bool = False,
 ) -> CalendarCandidate | None:
     """
     Evaluate a single near/far pair. Returns None if any filter fails.
+
+    When *is_roll* is True the candidate is being evaluated to keep an existing
+    position alive (a roll), not to open new risk.  The entry-grade filters that
+    gate *new* risk — moneyness and the minimum entry-tenor floor — are skipped
+    (a drifted position must still be rollable to its exit), while the liquidity,
+    OI, and two-sided-quote checks are always applied.  Contango/POP relaxation
+    for rolls is handled by the caller passing loosened thresholds.
     """
     # ── Moneyness filter (Phase 21b) ──────────────────────────────────────────
     # Reject strikes too far from spot: deep ITM/OTM calendar spreads have
     # converged near/far pricing (near-zero net_debit), so the theta differential
     # the strategy harvests doesn't meaningfully exist and the near-zero debit
     # destabilises both EV ranking and percentage-of-debit stop/TP thresholds.
-    if spot > 0:
+    # Skipped for rolls (Phase 26c): a position whose strike has drifted past the
+    # moneyness cap must still be rollable to its stop/TP exit, not force-closed.
+    if not is_roll and spot > 0:
         max_moneyness = config.asset_config(asset, "MAX_MONEYNESS_PCT")
         moneyness = abs(strike - spot) / spot
         if moneyness > max_moneyness:
             logger.debug(
                 "%s %s strike=%.0f rejected: moneyness %.3f > %.3f (spot=%.0f)",
                 asset, opt_type, strike, moneyness, max_moneyness, spot,
+            )
+            return None
+
+    # ── Entry-tenor alignment (Phase 26d) ─────────────────────────────────────
+    # Reject an entry whose *matched* near DTE is already inside the roll window,
+    # so a freshly-opened near leg is never roll-eligible almost immediately (a
+    # 2-DTE leg matched to near target 1 via NEAR_DAY_TOLERANCE guaranteed an
+    # instant roll attempt — and its failure modes — hours after entry).  Skipped
+    # for rolls, whose new near legs are intentionally short-dated.
+    if not is_roll:
+        if near_dte < config.MIN_NEAR_DTE_AT_ENTRY:
+            logger.debug(
+                "%s %s strike=%.0f rejected: matched near DTE %d < MIN_NEAR_DTE_AT_ENTRY %d",
+                asset, opt_type, strike, near_dte, config.MIN_NEAR_DTE_AT_ENTRY,
             )
             return None
 
@@ -322,6 +346,7 @@ def scan(
     min_pop:            float | None = None,
     near_day_tolerance: int | None = None,
     far_day_tolerance:  int | None = None,
+    roll_for:           dict | None = None,
 ) -> list[CalendarCandidate]:
     """
     Scan the cache and return a ranked list of calendar spread candidates.
@@ -345,12 +370,23 @@ def scan(
     near_day_tolerance / far_day_tolerance
         Acceptable DTE range around each target (±days).
         Defaults: config.NEAR_DAY_TOLERANCE / config.FAR_DAY_TOLERANCE.
+    roll_for
+        Roll mode (Phase 26c).  When provided, the scan is constrained to finding
+        a *replacement near leg* for an existing position: a dict with keys
+        ``asset``, ``strike``, ``option_type`` and ``far_instrument``.  Only that
+        asset/strike/type is scanned, results are constrained to the position's
+        own far leg, and the entry-grade moneyness / minimum-entry-tenor / contango
+        / POP filters are relaxed (a drifted position must still be rollable to its
+        exit).  Liquidity, OI, and two-sided-quote gates still apply.
 
     Returns
     -------
     list[CalendarCandidate]
         Candidates sorted by ev_score descending (best first).
     """
+    is_roll = roll_for is not None
+    if is_roll:
+        assets = [str(roll_for["asset"])]
     assets            = [a.upper() for a in (assets            or config.ASSETS)]
     near_days_options = near_days_options or config.NEAR_DAYS_OPTIONS
     far_days_options  = far_days_options  or config.FAR_DAYS_OPTIONS
@@ -371,6 +407,14 @@ def scan(
         eff_min_iv_contango = _explicit_min_iv_contango if _explicit_min_iv_contango is not None else config.asset_config(asset, "MIN_IV_CONTANGO")
         eff_min_pop         = _explicit_min_pop         if _explicit_min_pop         is not None else config.asset_config(asset, "MIN_POP")
 
+        # Roll mode (Phase 26c): relax the entry-grade contango and POP thresholds
+        # — they gate opening *new* risk, not the continuation of existing risk.
+        # (Moneyness and the entry-tenor floor are relaxed inside _eval_candidate
+        # via is_roll.)  OI and liquidity gates are deliberately left intact.
+        if is_roll:
+            eff_min_iv_contango = -1e9
+            eff_min_pop         = 0.0
+
         spot = cache.get_spot(asset)
         if spot is None or spot <= 0:
             logger.debug("No spot price for %s — skipping", asset)
@@ -385,6 +429,11 @@ def scan(
         )
 
         for (strike, opt_type), entries in groups.items():
+            # Roll mode: only the position's own strike/type is a valid roll target.
+            if is_roll and (
+                strike != roll_for["strike"] or opt_type != roll_for["option_type"]
+            ):
+                continue
             for near_target in near_days_options:
                 near_matches = [
                     (dte, snap) for dte, snap in entries
@@ -417,9 +466,17 @@ def scan(
                         spot,
                         eff_min_oi_near, eff_min_oi_far,
                         eff_min_iv_contango, eff_min_pop,
+                        is_roll=is_roll,
                     )
                     if result is not None:
                         candidates.append(result)
+
+    # Roll mode: constrain to candidates that keep the position's own far leg
+    # (Phase 26c) — a candidate carrying a different far leg is a different spread,
+    # not a roll of this position.
+    if is_roll:
+        far_instr = roll_for.get("far_instrument")
+        candidates = [c for c in candidates if c.far_instrument == far_instr]
 
     # Rank by EV score, but treat an ev_score above EV_SCORE_RANKING_CAP as the
     # tell-tale of a near-zero-debit degeneracy (its ev_net/net_debit ratio blows

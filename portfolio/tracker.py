@@ -112,12 +112,21 @@ class PortfolioTracker:
         client_secret: str  | None = None,
         rest_url:      str  | None = None,
         cache:         ChainCache | None = None,
+        notifier=None,
     ) -> None:
         self._db_path       = db_path or DB_PATH
         self._client_id     = client_id     if client_id     is not None else config.DERIBIT_CLIENT_ID
         self._client_secret = client_secret if client_secret is not None else config.DERIBIT_CLIENT_SECRET
         self._rest_url      = rest_url or config.DERIBIT_REST_URL
         self._cache         = cache
+        # Optional notifier for the persistent-mismatch escalation alert (Phase 26f).
+        self._notifier      = notifier
+        # Reconcile-escalation state (Phase 26f): a mismatch fingerprint that
+        # recurs unchanged for RECONCILE_ESCALATE_AFTER_CYCLES cycles is escalated
+        # from a warn-only log to a one-shot operator alert.
+        self._reconcile_fingerprint: tuple | None = None
+        self._reconcile_repeat_count: int = 0
+        self._reconcile_escalated: bool = False
 
         # Cached state — updated by refresh()
         self._equity_usd:             float = 0.0
@@ -873,7 +882,44 @@ class PortfolioTracker:
                     "(divergence %.0f%%) — possible manual trade or missed fill",
                     api_margin, db_margin, divergence * 100,
                 )
+
+            # ── Persistent-mismatch escalation (Phase 26f) ────────────────────
+            # A mismatch that recurs unchanged cycle after cycle is an alarm, not
+            # noise — warn-only forever means the operator may never notice.  Once
+            # the same fingerprint (rounded Deribit/SQLite margins) has persisted
+            # RECONCILE_ESCALATE_AFTER_CYCLES cycles, fire a single Telegram alert.
+            fingerprint = (round(api_margin), round(db_margin))
+            if fingerprint == self._reconcile_fingerprint:
+                self._reconcile_repeat_count += 1
+            else:
+                self._reconcile_fingerprint = fingerprint
+                self._reconcile_repeat_count = 1
+                self._reconcile_escalated = False
+            if (
+                self._reconcile_repeat_count >= config.RECONCILE_ESCALATE_AFTER_CYCLES
+                and not self._reconcile_escalated
+                and self._notifier is not None
+            ):
+                try:
+                    self._notifier.notify_warning(
+                        f"RECONCILE MISMATCH persisting {self._reconcile_repeat_count} "
+                        f"cycles: Deribit margin ${api_margin:.2f} vs SQLite "
+                        f"${db_margin:.2f}. Deribit open: {open_desc or 'unknown'}. "
+                        f"Manual reconciliation required on Deribit."
+                    )
+                    self._reconcile_escalated = True
+                    logger.warning(
+                        "RECONCILE MISMATCH escalated to operator alert after %d cycles",
+                        self._reconcile_repeat_count,
+                    )
+                except Exception as exc:
+                    logger.warning("Reconcile escalation alert failed: %s", exc)
         else:
+            # Resolved — reset the escalation tracking so a future mismatch starts
+            # its own fresh cycle count.
+            self._reconcile_fingerprint = None
+            self._reconcile_repeat_count = 0
+            self._reconcile_escalated = False
             logger.debug(
                 "RECONCILE OK: Deribit $%.2f vs SQLite $%.2f (divergence %.1f%%)",
                 api_margin, db_margin, divergence * 100,

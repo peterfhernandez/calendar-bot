@@ -441,6 +441,21 @@ class TestConfigTestParity:
             assert hasattr(config, key), f"config.py missing {key}"
             assert hasattr(config_test, key), f"config_test.py missing {key}"
 
+    def test_phase26_keys_present_in_both(self):
+        import config_test
+
+        for key in (
+            "MIN_NEAR_DTE_AT_ENTRY", "SPREAD_VALUE_BASIS",
+            "CLOSE_PROCEEDS_WARN_PCT", "RECONCILE_ESCALATE_AFTER_CYCLES",
+        ):
+            assert hasattr(config, key), f"config.py missing {key}"
+            assert hasattr(config_test, key), f"config_test.py missing {key}"
+
+        # config.py defaults to the mark basis (unchanged live behaviour);
+        # config_test.py uses the executable basis for thin testnet books.
+        assert config.SPREAD_VALUE_BASIS == "mark"
+        assert config_test.SPREAD_VALUE_BASIS == "exec"
+
         # config.py disables the absolute floor by default (live unchanged);
         # config_test.py enables the tick floor for thin testnet books.
         assert config.MAX_LEG_SPREAD_ABS_TICKS == 0

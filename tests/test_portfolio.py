@@ -690,6 +690,52 @@ class TestReconcileEnhanced:
             assert tracker.get_deribit_open_positions("BTC") == []
 
 
+class TestReconcileEscalation:
+    """Phase 26f: a persistent identical mismatch escalates to a one-shot alert."""
+
+    def _make_tracker(self, notifier):
+        tracker = PortfolioTracker(
+            db_path=_make_db(), client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com", notifier=notifier,
+        )
+        # Avoid live position-fetch calls from the actionable warning path.
+        tracker._describe_deribit_positions = MagicMock(
+            return_value="BTC-15JUL26-64000-C (option) qty=0.1"
+        )
+        tracker._used_margin = 0.0          # SQLite margin
+        tracker._deribit_margin_usd = 1500.0  # Deribit margin → 100% divergence
+        return tracker
+
+    def test_escalates_once_after_threshold(self):
+        import config as cfg
+        notifier = MagicMock()
+        tracker = self._make_tracker(notifier)
+        n = cfg.RECONCILE_ESCALATE_AFTER_CYCLES
+        for _ in range(n - 1):
+            tracker._reconcile()
+        notifier.notify_warning.assert_not_called()
+        tracker._reconcile()  # nth identical cycle → escalate
+        notifier.notify_warning.assert_called_once()
+        # One-shot: further identical cycles do not re-alert.
+        tracker._reconcile()
+        tracker._reconcile()
+        notifier.notify_warning.assert_called_once()
+
+    def test_resolved_mismatch_resets_escalation(self):
+        import config as cfg
+        notifier = MagicMock()
+        tracker = self._make_tracker(notifier)
+        for _ in range(cfg.RECONCILE_ESCALATE_AFTER_CYCLES):
+            tracker._reconcile()
+        notifier.notify_warning.assert_called_once()
+        # Mismatch resolves (margins now agree, non-zero) → escalation resets.
+        tracker._deribit_margin_usd = 1500.0
+        tracker._used_margin = 1500.0
+        tracker._reconcile()
+        assert tracker._reconcile_repeat_count == 0
+        assert tracker._reconcile_escalated is False
+
+
 # ── Tests: portfolio_view formatting ─────────────────────────────────────────
 
 class TestPortfolioView:

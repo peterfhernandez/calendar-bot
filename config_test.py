@@ -284,6 +284,12 @@ CLOSE_PRICE_CROSS_BUFFER_PCT = 0.02   # buffer when crossing bid/ask to close/ro
 TICK_SIZE_FETCH_RETRIES      = 1      # extra tick-size fetch attempts before fallback
 MIN_ROLL_NEAR_FAR_GAP_DAYS   = 1      # new near expiry must precede far by this many days
 
+# ── Phase 26 — legged-entry safety, roll resilience, tenor alignment, exec value ─
+MIN_NEAR_DTE_AT_ENTRY           = ROLL_TRIGGER_DAYS + 1   # reject entries already roll-eligible
+SPREAD_VALUE_BASIS              = "exec"  # thin testnet books: value at far_bid - near_ask
+CLOSE_PROCEEDS_WARN_PCT         = 0.50    # warn when expected proceeds < this fraction of mark
+RECONCILE_ESCALATE_AFTER_CYCLES = 12      # escalate a persistent mismatch to a one-shot alert
+
 MIN_CONTRACT_SIZE      = 0.1
 STRIKE_CORRELATION_PCT = 0.05
 

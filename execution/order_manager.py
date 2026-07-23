@@ -53,6 +53,10 @@ class OrderState(Enum):
     PARTIAL   = "partial"
     FILLED    = "filled"
     CANCELLED = "cancelled"
+    # Cancelled after a timeout with a non-zero filled portion that had to be
+    # flattened separately (Phase 26a).  The filled amount is recorded on the
+    # TrackedOrder so the partial exposure is never invisible.
+    CANCELLED_PARTIAL = "cancelled_partial"
     FAILED    = "failed"
 
 
@@ -70,6 +74,7 @@ class TrackedOrder:
     label:       str    = ""
     state:       OrderState = OrderState.SUBMITTED
     fill_price:  Optional[float] = None
+    filled_amount: float = 0.0   # partial fill recorded on CANCELLED_PARTIAL (Phase 26a)
     submitted_at: float = field(default_factory=time.monotonic)
     updated_at:   float = field(default_factory=time.monotonic)
 
@@ -79,7 +84,12 @@ class TrackedOrder:
 
     @property
     def is_terminal(self) -> bool:
-        return self.state in (OrderState.FILLED, OrderState.CANCELLED, OrderState.FAILED)
+        return self.state in (
+            OrderState.FILLED,
+            OrderState.CANCELLED,
+            OrderState.CANCELLED_PARTIAL,
+            OrderState.FAILED,
+        )
 
     @property
     def is_stuck(self) -> bool:
@@ -116,11 +126,12 @@ class OrderManager:
 
     def update(
         self,
-        order_id:   str,
-        state:      OrderState,
-        fill_price: Optional[float] = None,
+        order_id:      str,
+        state:         OrderState,
+        fill_price:    Optional[float] = None,
+        filled_amount: Optional[float] = None,
     ) -> None:
-        """Update an order's state (and optionally its fill price)."""
+        """Update an order's state (and optionally its fill price / filled amount)."""
         with self._lock:
             order = self._orders.get(order_id)
             if order is None:
@@ -130,6 +141,8 @@ class OrderManager:
             order.updated_at = time.monotonic()
             if fill_price is not None:
                 order.fill_price = fill_price
+            if filled_amount is not None:
+                order.filled_amount = filled_amount
             logger.debug(
                 "Order %s → %s%s",
                 order_id, state.value,

@@ -129,6 +129,16 @@ class DryRunExecutor:
             "[DRY-RUN] Would close trade_id=%s  asset=%s  strike=%.0f",
             position.get("trade_id"), position.get("asset"), position.get("strike", 0),
         )
+        # Phase 26e: return the position's last known mark-to-market spread value
+        # rather than net_debit × qty.  Returning net_debit × qty closed every
+        # paper position at *entry* value, so every paper close logged
+        # gross_pnl=0.00 and paper results overstated real economics (trade 208
+        # recorded −4.85 in fees while carrying a ~$69 MTM loss).  The decision
+        # engine still prefers its own market/B-S `spread_value` when it has one;
+        # this return is the fallback used for expiry/roll-fail/drain closes.
+        last_sv = position.get("last_spread_value", 0.0) or 0.0
+        if last_sv > 0:
+            return last_sv
         return position.get("net_debit", 0.0) * position.get("qty", 1.0)
 
     def roll_near_leg(self, position: dict, new_candidate: CalendarCandidate) -> bool:
@@ -823,9 +833,24 @@ class DecisionEngine:
             logger.warning("No IV for trade %d — skipping status check", trade_id)
             return "__NO_IV__", 0.0
 
-        market_sv = self._get_market_spread_value(pos)
+        mark_sv, exec_sv = self._get_spread_values(pos)
+        # Decision basis (Phase 26e): "exec" prices stop/TP/roll at the executable
+        # far_bid − near_ask (what a close would actually fetch); "mark" uses
+        # mid-to-mid.  Both are logged so a divergence is visible before it costs.
+        if config.SPREAD_VALUE_BASIS == "exec":
+            market_sv = exec_sv if exec_sv is not None else mark_sv
+        else:
+            market_sv = mark_sv
         if market_sv is None:
             logger.debug("trade_id=%d  no market prices for legs — falling back to B-S", trade_id)
+        else:
+            logger.debug(
+                "trade_id=%d  sv_mark=%s  sv_exec=%s  basis=%s",
+                trade_id,
+                f"{mark_sv:.2f}" if mark_sv is not None else "n/a",
+                f"{exec_sv:.2f}" if exec_sv is not None else "n/a",
+                config.SPREAD_VALUE_BASIS,
+            )
         status, sv, pct, msg = check_calendar_status(
             spot, iv, near_days_left, far_days_left, pos, market_sv=market_sv
         )
@@ -882,6 +907,22 @@ class DecisionEngine:
                     pos, intended, label, failure_count
                 ), 0.0
 
+            # Pre-close proceeds sanity check (Phase 26e): warn when the executable
+            # proceeds (far_bid − near_ask) are well below the marked value driving
+            # this close, so a mark-vs-executable gap is surfaced in the log rather
+            # than only showing up later as a surprising realised loss.
+            if (
+                mark_sv is not None and exec_sv is not None and mark_sv > 0
+                and exec_sv < config.CLOSE_PROCEEDS_WARN_PCT * mark_sv
+            ):
+                logger.warning(
+                    "trade_id=%d closing: executable proceeds $%.2f are %.0f%% of "
+                    "marked value $%.2f (< %.0f%% warn threshold) — realised P&L "
+                    "will fall short of the mark",
+                    trade_id, exec_sv, (exec_sv / mark_sv) * 100, mark_sv,
+                    config.CLOSE_PROCEEDS_WARN_PCT * 100,
+                )
+
             result = self._close_position(pos, spot, reason, sv)
             if "FAILED" in result:
                 self._close_roll_failures[trade_id] = failure_count + 1
@@ -910,16 +951,26 @@ class DecisionEngine:
                     "DRAIN MODE — trade_id=%d near leg expires in %d day(s), closing instead of rolling",
                     trade_id, near_days_left,
                 )
-                return self._close_position(pos, spot, "Drain mode — closing instead of rolling"), 0.0
+                return self._close_position(
+                    pos, spot, "Drain mode — closing instead of rolling", sv,
+                    close_label="Closed (Drain)",
+                ), 0.0
 
-            # Cap roll/close retry attempts per position — prevents unbounded retry loops
+            # Roll retry cap (Phase 26c): a single failed roll no longer liquidates
+            # a healthy position.  Roll failures are retried up to
+            # POSITION_FAILURE_RETRY_CAP; monitor ticks are ~60s apart so the whole
+            # budget is consumed in minutes, but a healthy position survives one bad
+            # scan tick.  Only when the cap is reached is the position closed.
             failure_count = self._close_roll_failures.get(trade_id, 0)
             if failure_count >= config.POSITION_FAILURE_RETRY_CAP:
                 logger.error(
-                    "trade_id=%d roll/close failed %d times — halting retries, closing position",
+                    "trade_id=%d roll failed %d times — retry cap reached, closing position",
                     trade_id, failure_count,
                 )
-                result = self._close_position(pos, spot, "Roll/close retry limit exceeded — closing")
+                result = self._close_position(
+                    pos, spot, "Roll failed (retry cap) — closing", sv,
+                    close_label="Closed (Roll Failed)",
+                )
                 if "FAILED" in result:
                     # Even the final forced close failed — stop the loop here
                     # instead of re-attempting on every future monitor tick.
@@ -934,9 +985,21 @@ class DecisionEngine:
                 self._close_roll_failures.pop(trade_id, None)
                 return f"trade_id={trade_id} rolled near leg", 0.0
 
-            # If roll fails, increment counter and close cleanly
+            # Roll failed this tick — HOLD the position and retry next tick rather
+            # than liquidating a healthy position on a single bad scan tick.  The
+            # stop/TP checks above still run every tick, so a genuine loser still
+            # exits on its stop while the roll retries continue (Phase 26c).
             self._close_roll_failures[trade_id] = failure_count + 1
-            return self._close_position(pos, spot, "Roll failed — closing"), 0.0
+            logger.info(
+                "trade_id=%d roll failed (attempt %d/%d) — holding, will retry next tick",
+                trade_id, failure_count + 1, config.POSITION_FAILURE_RETRY_CAP,
+            )
+            unrealized = (
+                sv
+                - pos.get("net_debit", 0.0) * pos.get("qty", 1.0)
+                - pos.get("open_fees", 0.0)
+            )
+            return None, unrealized
 
         # Position held — compute unrealized P&L vs entry cost (debit + open fees).
         # sv is already qty-weighted (spread_value multiplies by qty internally),
@@ -1013,6 +1076,7 @@ class DecisionEngine:
         spot: float,
         reason: str,
         spread_value: float | None = None,
+        close_label: str | None = None,
     ) -> str:
         """
         Close a position and record it in the database.
@@ -1025,6 +1089,12 @@ class DecisionEngine:
             directly (more accurate than relying on the executor's return value,
             which in dry-run mode just echoes the entry debit).  Falls back to
             the executor return value when None (e.g. expiry or roll-fail close).
+        close_label
+            Explicit ``result`` string to record (Phase 26c).  When set it
+            overrides the pnl-sign / reason-keyword derivation, so a plumbing
+            exit (a failed roll, a drain close) is labelled honestly
+            (``Closed (Roll Failed)`` / ``Closed (Drain)``) instead of being
+            mislabelled ``Loss (Auto Stop)`` / ``Win (Auto TP)`` by pnl sign.
         """
         trade_id = pos["trade_id"]
         net_debit = pos.get("net_debit", 0.0)
@@ -1078,11 +1148,14 @@ class DecisionEngine:
         net_pnl = gross_pnl + roll_pnl_total - open_fees_usd - close_fees_usd  # include roll profit, deduct all fees
 
         pnl = net_pnl  # stored as true net P&L (entry + roll + exit fees already deducted)
-        result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
-        if "Take-profit" in reason:
+        if close_label is not None:
+            result = close_label
+        elif "Take-profit" in reason:
             result = "Win (Auto TP)"
         elif "Stop-loss" in reason:
             result = "Loss (Auto Stop)"
+        else:
+            result = "Win (Auto TP)" if pnl >= 0 else "Loss (Auto Stop)"
 
         close_calendar_trade(
             trade_id=trade_id,
@@ -1140,83 +1213,76 @@ class DecisionEngine:
         """
         Attempt to roll the near leg to a new expiry.
 
-        Scans for a fresh near candidate on the same asset/strike/type and asks
-        the executor to roll if one is found. Validates the new candidate meets
-        all entry criteria and recalculates EV before rolling.
+        Uses a roll-specific candidate search (Phase 26c) constrained to the
+        position's own strike/type/far leg, with entry-grade moneyness / POP /
+        contango relaxed (they gate new risk, not the continuation of existing
+        risk) but liquidity, OI, the near/far gap, and margin gates all retained.
+        Iterates every candidate — not just the top match — so a bad top match
+        (e.g. one whose near leg is the currently-held leg) doesn't abandon a
+        healthy position.
         """
-        candidates = scan(self._cache, assets=[pos["asset"]])
         target_strike = pos["strike"]
         opt_type      = pos.get("option_type", "Call")
         far_instr     = pos.get("far_instrument")
-        # Match against the position's OWN far leg (Phase 22f), not just
-        # strike/option_type across every scanned tenor pairing.  scan() returns
-        # candidates for many (near, far) pairings on the same strike; taking any
-        # of them let the winning candidate carry a near leg from a different
-        # pairing whose expiry could match — or exceed — the position's real far
-        # leg, producing a zero-width calendar that collapses to $0.00 and trips a
-        # large stop-loss (paper trade #207).
-        matches = [
-            c for c in candidates
-            if c.strike == target_strike
-            and c.option_type == opt_type
-            and c.far_instrument == far_instr
-        ]
-        if not matches:
+        held_near     = pos.get("near_instrument")
+        qty_pos       = pos.get("qty", 1.0)
+
+        roll_for = {
+            "asset":          pos["asset"],
+            "strike":         target_strike,
+            "option_type":    opt_type,
+            "far_instrument": far_instr,
+        }
+        candidates = scan(self._cache, roll_for=roll_for)
+        if not candidates:
             logger.info(
                 "Roll: no matching candidate for asset=%s strike=%.0f far=%s",
                 pos["asset"], target_strike, far_instr,
             )
             return False
 
-        new_candidate = matches[0]
-        new_candidate.qty = pos.get("qty", 1.0)
+        # Iterate ALL candidates and take the first genuine forward roll that
+        # passes the gates still relevant to a roll.  Previously only matches[0]
+        # was considered, so if the top match happened to be the currently-held
+        # near leg the whole roll was abandoned (trades 14/15).
+        new_candidate = None
+        for c in candidates:
+            # Skip the currently-held near leg — rolling to it is a no-op.
+            if c.near_instrument == held_near:
+                continue
+            # Reject a near leg that doesn't precede the far leg by at least
+            # MIN_ROLL_NEAR_FAR_GAP_DAYS (guards the zero-width spread of #207).
+            gap_days = _expiry_gap_days(c.near_instrument, far_instr)
+            if gap_days is not None and gap_days < config.MIN_ROLL_NEAR_FAR_GAP_DAYS:
+                logger.debug(
+                    "Roll: candidate near %s within %d day(s) of far %s — skipping",
+                    c.near_instrument, gap_days, far_instr,
+                )
+                continue
+            c.qty = qty_pos
+            reject = self._check_liquidity_gate(c)
+            if reject:
+                logger.debug("Roll: candidate %s failed liquidity gate — %s", c.near_instrument, reject)
+                continue
+            reject = self._check_margin_gate(c)
+            if reject:
+                logger.debug("Roll: candidate %s failed margin gate — %s", c.near_instrument, reject)
+                continue
+            new_candidate = c
+            break
 
-        # Fix 5: skip if the scanner returned the same near instrument we already hold —
-        # this means no later expiry is available yet; rolling would be a no-op.
-        if new_candidate.near_instrument == pos.get("near_instrument"):
+        if new_candidate is None:
             logger.info(
-                "Roll: new near instrument (%s) is the same as current — skipping",
-                new_candidate.near_instrument,
-            )
-            return False
-
-        # Reject a new near leg that does not expire strictly before the far leg
-        # by at least MIN_ROLL_NEAR_FAR_GAP_DAYS (Phase 22f).  This is the direct
-        # guard against rolling into a same-expiry (or later) near/far pair.
-        gap_days = _expiry_gap_days(new_candidate.near_instrument, far_instr)
-        if gap_days is not None and gap_days < config.MIN_ROLL_NEAR_FAR_GAP_DAYS:
-            logger.info(
-                "Roll: new near %s expires within %d day(s) of far %s "
-                "(< MIN_ROLL_NEAR_FAR_GAP_DAYS=%d) — skipping to avoid a zero-width spread",
-                new_candidate.near_instrument, gap_days, far_instr,
-                config.MIN_ROLL_NEAR_FAR_GAP_DAYS,
-            )
-            return False
-
-        # Validate new candidate passes liquidity gate (entry criteria)
-        rejection_reason = self._check_liquidity_gate(new_candidate)
-        if rejection_reason:
-            logger.info(
-                "Roll: candidate rejected by liquidity gate — %s (trade_id=%d)",
-                rejection_reason, pos.get("trade_id"),
-            )
-            return False
-
-        # Check margin gate: rolling changes portfolio composition and can trigger a margin call
-        margin_gate_reason = self._check_margin_gate(new_candidate)
-        if margin_gate_reason:
-            logger.info(
-                "Roll: candidate rejected by margin gate — %s (trade_id=%d)",
-                margin_gate_reason, pos.get("trade_id"),
+                "Roll: no acceptable roll candidate after gates for trade_id=%d",
+                pos.get("trade_id"),
             )
             return False
 
         # Roll fee gate: only roll if the expected theta gain exceeds the roll cost.
         # Theta gain ≈ premium collected on the new near leg (new_near_bid × qty).
         # If the roll fees eat up most or all of the gain, close instead.
-        qty_pos = pos.get("qty", 1.0)
+        near_price_now = pos.get("near_prem", new_candidate.near_bid) or new_candidate.near_bid
         try:
-            near_price_now = pos.get("near_prem", new_candidate.near_bid) or new_candidate.near_bid
             roll_cost = compute_roll_fees(
                 pos.get("asset", new_candidate.asset),
                 spot,
@@ -1349,48 +1415,74 @@ class DecisionEngine:
                 return snap.mark_iv if snap.mark_iv > 0 else None
         return None
 
-    def _get_market_spread_value(self, pos: dict) -> float | None:
+    def _get_spread_values(self, pos: dict) -> tuple[float | None, float | None]:
         """
-        Compute current spread value from live market mid-prices in the cache.
+        Return ``(mark_sv, exec_sv)`` — the qty-weighted mark and executable
+        spread values from live cache quotes (Phase 26e).
 
-        Returns (far_mid - near_mid) * qty, or None if either leg is missing.
-        This is far more reliable than Black-Scholes with a uniform IV, which
-        can diverge badly from market prices for options away from ATM or when
-        there is significant IV skew across the term structure.
+        - ``mark_sv`` = ``(far_mid − near_mid) × qty`` — mid-to-mid, the historical
+          basis.  Reflects where the book is quoted.
+        - ``exec_sv`` = ``(far_bid − near_ask) × qty`` — what a real close would
+          actually fetch after crossing the spread on both legs (sell the long far
+          at its bid, buy back the short near at its ask).  On thin testnet books
+          this can be far below the mark, which is why marks said 98–110% of debit
+          while the real closes recovered only ~5–10% (trades 14/15/16).
+
+        Either element is ``None`` when its inputs are unavailable.  The two-sided
+        quote requirement (Phase 21c) still applies: when
+        ``MARKET_SV_REQUIRE_TWO_SIDED`` is on, a leg lacking ``bid > 0 AND ask > 0``
+        is not trusted (both values fall back to None for that leg).
         """
         near_instrument = pos.get("near_instrument")
         far_instrument  = pos.get("far_instrument")
         if not near_instrument or not far_instrument:
-            return None
+            return None, None
 
-        # Require genuine two-sided quotes before trusting a live mark for
-        # stop/TP (Phase 21c).  On a thin testnet book a lone mark_price is often
-        # stale or synthetic; substituting it produced the 2026-07-14 spurious
-        # instant-TP/stop churn.  When require_two_sided is on and either leg
-        # lacks bid > 0 AND ask > 0, return None so the logged Black-Scholes
-        # fallback is used instead.
         require_two_sided = config.MARKET_SV_REQUIRE_TWO_SIDED
-
         chain = self._cache.get_chain(pos["asset"])
         near_mid = far_mid = None
+        near_ask = far_bid = None
         for snap in chain:
             if snap.instrument == near_instrument:
                 if snap.bid > 0 and snap.ask > 0:
                     near_mid = (snap.bid + snap.ask) / 2
+                    near_ask = snap.ask
                 elif not require_two_sided and snap.mark_price > 0:
-                    near_mid = snap.mark_price
+                    near_mid = near_ask = snap.mark_price
             elif snap.instrument == far_instrument:
                 if snap.bid > 0 and snap.ask > 0:
                     far_mid = (snap.bid + snap.ask) / 2
+                    far_bid = snap.bid
                 elif not require_two_sided and snap.mark_price > 0:
-                    far_mid = snap.mark_price
+                    far_mid = far_bid = snap.mark_price
 
-        if near_mid is None or far_mid is None:
-            return None
+        qty = pos.get("qty", 1.0)
         # A calendar spread cannot be worth less than zero — clamp guards against
-        # stale/inverted market data producing a negative spread value that, when
-        # multiplied by a large quantity, generates an enormous phantom loss.
-        return max(0.0, far_mid - near_mid) * pos.get("qty", 1.0)
+        # stale/inverted market data producing a negative value that, multiplied
+        # by a large quantity, would generate an enormous phantom loss.
+        mark_sv = (
+            max(0.0, far_mid - near_mid) * qty
+            if near_mid is not None and far_mid is not None else None
+        )
+        exec_sv = (
+            max(0.0, far_bid - near_ask) * qty
+            if near_ask is not None and far_bid is not None else None
+        )
+        return mark_sv, exec_sv
+
+    def _get_market_spread_value(self, pos: dict) -> float | None:
+        """
+        Basis-selected market spread value for stop/TP/roll decisions (Phase 26e).
+
+        Returns the executable value under ``SPREAD_VALUE_BASIS == "exec"`` (falling
+        back to the mark when the executable value is unavailable), otherwise the
+        mark value.  Kept as the single-value accessor consumed by
+        ``check_calendar_status`` and the scratch scripts.
+        """
+        mark_sv, exec_sv = self._get_spread_values(pos)
+        if config.SPREAD_VALUE_BASIS == "exec":
+            return exec_sv if exec_sv is not None else mark_sv
+        return mark_sv
 
     def _status(
         self,

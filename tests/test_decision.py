@@ -408,7 +408,10 @@ class TestMonitorTick:
 
         executor.roll_near_leg.assert_called_once()
 
-    def test_roll_failure_falls_back_to_close(self):
+    def test_roll_failure_holds_and_retries(self):
+        """Phase 26c: a single failed roll HOLDS the position (retries next tick)
+        instead of liquidating a healthy position — close is not called, and the
+        per-position failure counter is incremented."""
         executor = MagicMock()
         executor.roll_near_leg.return_value = False
         executor.close_spread.return_value = 0.02
@@ -417,7 +420,9 @@ class TestMonitorTick:
         pos = self._open_pos(near_days=2)
         pos["near_days"] = 7  # decayed from a 7d near leg to 2 days left (Phase 22f)
 
-        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+        # The position is HELD after the failed roll, so it is still open on the
+        # post-action refresh — its failure counter must survive the tick cleanup.
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], [pos]]), \
              patch("strategy.decision.check_calendar_status",
                    return_value=("ok", 0.025, 1.0, "OK")), \
              patch("strategy.decision.scan", return_value=[_make_candidate()]), \
@@ -426,7 +431,39 @@ class TestMonitorTick:
             engine._get_iv = MagicMock(return_value=0.80)
             status = engine.monitor_tick()
 
+        executor.roll_near_leg.assert_called_once()
+        executor.close_spread.assert_not_called()
+        assert engine._close_roll_failures.get(pos["trade_id"]) == 1
+
+    def test_roll_failure_closes_after_retry_cap(self):
+        """Phase 26c: once the roll retry cap is reached, the position is closed
+        and labelled honestly as a roll-failure close (not Loss (Auto Stop))."""
+        executor = MagicMock()
+        executor.roll_near_leg.return_value = False
+        executor.close_spread.return_value = 0.02
+
+        engine, _ = _make_engine(executor=executor)
+        pos = self._open_pos(near_days=2)
+        pos["near_days"] = 7
+        # Pre-seed the failure counter at the cap so this tick forces the close.
+        engine._close_roll_failures[pos["trade_id"]] = config.POSITION_FAILURE_RETRY_CAP
+
+        recorded = {}
+
+        def _capture(**kwargs):
+            recorded.update(kwargs)
+
+        with patch.object(engine, "_load_all_open_positions", side_effect=[[pos], []]), \
+             patch("strategy.decision.check_calendar_status",
+                   return_value=("ok", 0.025, 1.0, "OK")), \
+             patch("strategy.decision.scan", return_value=[_make_candidate()]), \
+             patch("strategy.decision.close_calendar_trade", side_effect=_capture):
+            engine._cache.get_spot.return_value = 90_000.0
+            engine._get_iv = MagicMock(return_value=0.80)
+            engine.monitor_tick()
+
         executor.close_spread.assert_called_once()
+        assert recorded.get("result") == "Closed (Roll Failed)"
 
 
 # ── Daily loss limit ──────────────────────────────────────────────────────────
@@ -2895,3 +2932,75 @@ class TestPrematureRollGuard:
         ) == 0
         # Unparseable → None
         assert _expiry_gap_days("BTC-BAD-90000-C", "BTC-ALSO-90000-C") is None
+
+
+class TestExecutableSpreadValue:
+    """Phase 26e: mark vs executable spread value and basis selection."""
+
+    def _pos(self, near_instr, far_instr, qty=1.0):
+        return {
+            "trade_id": 50, "status": "Open", "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0, "expiry_near": _future_label(10), "expiry_far": _future_label(35),
+            "qty": qty, "net_debit": 0.02, "spot_open": 90_000.0,
+            "near_days": 10, "far_days": 35,
+            "near_instrument": near_instr, "far_instrument": far_instr,
+            "open_fees": 0.0, "close_fees": 0.0,
+        }
+
+    def _cache(self, near_instr, far_instr, near_bid, near_ask, far_bid, far_ask):
+        cache = MagicMock()
+        cache.get_spot.return_value = 90_000.0
+        cache.get_chain.return_value = [
+            _make_snap(near_instr, bid=near_bid, ask=near_ask),
+            _make_snap(far_instr,  bid=far_bid,  ask=far_ask),
+        ]
+        return cache
+
+    def test_mark_and_exec_diverge(self):
+        near_instr, far_instr = "BTC-N-90000-C", "BTC-F-90000-C"
+        # near: bid 0.010 ask 0.030 (mid 0.020); far: bid 0.040 ask 0.060 (mid 0.050)
+        cache = self._cache(near_instr, far_instr, 0.010, 0.030, 0.040, 0.060)
+        engine, _ = _make_engine(cache=cache)
+        pos = self._pos(near_instr, far_instr, qty=1.0)
+        mark_sv, exec_sv = engine._get_spread_values(pos)
+        # mark = far_mid - near_mid = 0.050 - 0.020 = 0.030
+        assert mark_sv == pytest.approx(0.030)
+        # exec = far_bid - near_ask = 0.040 - 0.030 = 0.010
+        assert exec_sv == pytest.approx(0.010)
+
+    def test_basis_selects_exec(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "SPREAD_VALUE_BASIS", "exec")
+        near_instr, far_instr = "BTC-N-90000-C", "BTC-F-90000-C"
+        cache = self._cache(near_instr, far_instr, 0.010, 0.030, 0.040, 0.060)
+        engine, _ = _make_engine(cache=cache)
+        pos = self._pos(near_instr, far_instr, qty=1.0)
+        assert engine._get_market_spread_value(pos) == pytest.approx(0.010)  # exec
+
+    def test_basis_selects_mark(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "SPREAD_VALUE_BASIS", "mark")
+        near_instr, far_instr = "BTC-N-90000-C", "BTC-F-90000-C"
+        cache = self._cache(near_instr, far_instr, 0.010, 0.030, 0.040, 0.060)
+        engine, _ = _make_engine(cache=cache)
+        pos = self._pos(near_instr, far_instr, qty=1.0)
+        assert engine._get_market_spread_value(pos) == pytest.approx(0.030)  # mark
+
+
+class TestDryRunCloseRealisesMtm:
+    """Phase 26e: DryRunExecutor.close_spread returns last known spread value."""
+
+    def test_returns_last_spread_value_when_positive(self):
+        from strategy.decision import DryRunExecutor
+        ex = DryRunExecutor()
+        pos = {"trade_id": 1, "asset": "BTC", "strike": 90_000.0,
+               "net_debit": 0.02, "qty": 1.0, "last_spread_value": 0.013}
+        # Returns the MTM value (0.013), not net_debit*qty (0.02).
+        assert ex.close_spread(pos) == pytest.approx(0.013)
+
+    def test_falls_back_to_entry_value_when_no_mtm(self):
+        from strategy.decision import DryRunExecutor
+        ex = DryRunExecutor()
+        pos = {"trade_id": 1, "asset": "BTC", "strike": 90_000.0,
+               "net_debit": 0.02, "qty": 1.0, "last_spread_value": 0.0}
+        assert ex.close_spread(pos) == pytest.approx(0.02)
