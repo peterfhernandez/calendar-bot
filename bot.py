@@ -161,6 +161,7 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
             client_id=config.DERIBIT_CLIENT_ID,
             client_secret=config.DERIBIT_CLIENT_SECRET,
             portfolio_value=portfolio_value,
+            notifier=notifier,
         )
         await _cancel_open_orders(config.DERIBIT_CLIENT_ID, config.DERIBIT_CLIENT_SECRET)
 
@@ -170,6 +171,7 @@ async def _run(portfolio_value: float, collect: bool, drain: bool) -> None:
         portfolio = PortfolioTracker(
             client_id=config.DERIBIT_CLIENT_ID,
             client_secret=config.DERIBIT_CLIENT_SECRET,
+            notifier=notifier,
         )
 
     loop = BotLoop(

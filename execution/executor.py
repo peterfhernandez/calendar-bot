@@ -470,21 +470,40 @@ def _round_to_tick(
     return float(steps * tick_dec)
 
 
-def _check_slippage(fill_price_usd: float, intended_usd: float, limit_pct: float) -> None:
+def _check_slippage(
+    fill_price_usd: float,
+    intended_usd:   float,
+    limit_pct:      float,
+    side:           str | None = None,   # "buy" | "sell" | None (legacy symmetric)
+) -> None:
     """
-    Raise SlippageError if the fill price deviates too far from the intended limit.
+    Raise SlippageError only on an *adverse* fill (Phase 26b).
 
-    We compare fill to the limit price we set (near_bid for sells, far_ask for buys)
-    rather than to mid. This catches orders where the market moved between submission
-    and fill, resulting in a significantly worse-than-intended execution price.
+    We compare the fill to the limit price we set (near_bid for sells, far_ask for
+    buys) rather than to mid.  The check is directional: for a ``sell`` only a fill
+    *below* the intended price is adverse (we received less); for a ``buy`` only a
+    fill *above* it is adverse (we paid more).  Price *improvement* always passes —
+    the old symmetric ``abs()`` check rejected the only deviation a limit order can
+    actually produce (an improved fill), abandoning good spreads.
+
+    When ``side`` is ``None`` the legacy symmetric behaviour is kept so existing
+    callers and tests are unaffected.  Since both legs are limit orders, an adverse
+    fill is in principle unreachable — this remains purely as a sanity invariant.
     """
     if intended_usd <= 0:
         return
-    deviation = abs(fill_price_usd - intended_usd) / intended_usd
+    signed = fill_price_usd - intended_usd
+    if side == "buy":
+        adverse = max(0.0, signed)      # filled above intended → paid more
+    elif side == "sell":
+        adverse = max(0.0, -signed)     # filled below intended → received less
+    else:
+        adverse = abs(signed)           # legacy symmetric
+    deviation = adverse / intended_usd
     if deviation > limit_pct:
         raise SlippageError(
-            f"Fill ${fill_price_usd:.4f} is {deviation:.1%} from intended ${intended_usd:.4f} "
-            f"(limit {limit_pct:.1%})"
+            f"Adverse fill ${fill_price_usd:.4f} is {deviation:.1%} worse than "
+            f"intended ${intended_usd:.4f} (limit {limit_pct:.1%}, side={side})"
         )
 
 
@@ -511,6 +530,87 @@ async def _wait_for_fill(
         await asyncio.sleep(poll_interval)
         poll_interval = min(poll_interval * 1.5, 5.0)
     raise OrderTimeoutError(f"Order {order_id} not filled after {timeout}s")
+
+
+async def _cancel_and_flatten(
+    client:        _DeribitRPCClient,
+    order_manager: OrderManager,
+    order_id:      str,
+    instrument:    str,
+    orig_direction: str,     # direction of the order being cancelled ("buy"|"sell")
+    reverse_price: float,    # crossed limit price for the flattening order
+    asset:         str,
+    notifier=None,
+    context:       str = "",
+) -> float:
+    """
+    Cancel *order_id* and flatten any partial fill it left behind (Phase 26a).
+
+    Cancelling a partially-filled Deribit limit order only removes the *unfilled*
+    remainder — the contracts that already filled stay on the exchange.  The old
+    timeout-cancel paths ignored this, leaving untracked naked inventory (the
+    2026-07 run left −13 naked short puts from three timed-out legged entries).
+
+    This reads the order's ``filled_amount`` (from the ``private/cancel`` response,
+    falling back to ``private/get_order_state``) and, if non-zero, submits an
+    immediate reverse order for exactly that amount at a crossed price so the
+    position returns to its pre-order state.  A flatten failure is logged
+    ``CRITICAL`` and raises a one-shot operator alert naming the exact naked
+    exposure — it must never fail silently.
+
+    Returns the flattened (filled) amount; ``0.0`` when nothing had filled.
+    """
+    filled = 0.0
+    try:
+        cancel_result = await client.cancel_order(order_id)
+        if isinstance(cancel_result, dict):
+            filled = float(cancel_result.get("filled_amount", 0.0) or 0.0)
+    except Exception as exc:
+        logger.warning("Cancel of %s (%s) failed: %s", order_id, instrument, exc)
+
+    # Fall back to an explicit order-state query when the cancel response did not
+    # carry the filled amount (or the cancel itself raised).
+    if filled <= 0:
+        try:
+            state = await client.get_order_state(order_id)
+            filled = float(state.get("filled_amount", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    if filled <= 0:
+        order_manager.update(order_id, OrderState.CANCELLED)
+        return 0.0
+
+    reverse = "sell" if orig_direction == "buy" else "buy"
+    logger.warning(
+        "Partial fill on cancelled %s order %s (%s): %.4f filled — flattening with "
+        "a %s at %.4f%s",
+        orig_direction, order_id, instrument, filled, reverse, reverse_price,
+        f" [{context}]" if context else "",
+    )
+    order_manager.update(order_id, OrderState.CANCELLED_PARTIAL, filled_amount=filled)
+    try:
+        await client.place_order(
+            instrument, reverse, filled, max(reverse_price, 0.0001),
+            label=f"FLATTEN-PARTIAL-{asset}",
+        )
+        logger.info("Flattened %.4f of %s after partial fill", filled, instrument)
+    except Exception as exc:
+        logger.critical(
+            "FAILED to flatten %.4f naked %s of %s after partial fill: %s — "
+            "MANUAL ACTION REQUIRED",
+            filled, orig_direction, instrument, exc,
+        )
+        if notifier is not None:
+            try:
+                notifier.notify_warning(
+                    f"MANUAL ACTION REQUIRED: {filled} naked {orig_direction} of "
+                    f"{instrument} left on the exchange after a partial fill could "
+                    f"not be flattened ({exc})"
+                )
+            except Exception:
+                pass
+    return filled
 
 
 # ── Core async logic ──────────────────────────────────────────────────────────
@@ -627,6 +727,7 @@ async def _async_enter_spread(
     slippage_pct: float = SLIPPAGE_LIMIT_PCT,
     order_timeout: int = ORDER_TIMEOUT_SEC,
     combo_timeout: int | None = None,
+    notifier=None,
 ) -> dict | None:
     """
     Async implementation of enter_spread.
@@ -747,16 +848,20 @@ async def _async_enter_spread(
             near_state = await _wait_for_fill(client, near_order_id, order_timeout)
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.error("Near leg fill failed: %s — cancelling", exc)
-            try:
-                await client.cancel_order(near_order_id)
-            except Exception:
-                pass
-            order_manager.update(near_order_id, OrderState.CANCELLED)
+            # Flatten any partial fill (Phase 26a): the near leg is a SELL, so a
+            # partial fill leaves a naked short — buy it back at a crossed price.
+            await _cancel_and_flatten(
+                client, order_manager, near_order_id, near_instr,
+                orig_direction="sell", reverse_price=near_limit * 1.05,
+                asset=asset, notifier=notifier, context="near-entry-timeout",
+            )
             return None
 
         near_fill_price = near_state.get("average_price", near_limit)
         near_fill_usd = _usd_price(near_fill_price, spot, asset)
-        _check_slippage(near_fill_usd, near_intended_usd, slippage_pct)
+        # Directional slippage check (Phase 26b): the near leg is a SELL, so only
+        # a fill *below* the intended price is adverse; a better (higher) fill passes.
+        _check_slippage(near_fill_usd, near_intended_usd, slippage_pct, side="sell")
         order_manager.update(near_order_id, OrderState.FILLED, fill_price=near_fill_price)
         logger.info("Near leg filled: price=%.4f", near_fill_price)
 
@@ -797,19 +902,57 @@ async def _async_enter_spread(
         try:
             far_state = await _wait_for_fill(client, far_order_id, order_timeout)
         except (OrderTimeoutError, RuntimeError) as exc:
-            logger.error("Far leg fill failed: %s — closing near leg", exc)
+            logger.error("Far leg fill failed: %s — flattening far partial + closing near leg", exc)
+            # Flatten any partial far fill (Phase 26a): far is a BUY, so a partial
+            # fill leaves a naked long — sell it back at a crossed price.
+            await _cancel_and_flatten(
+                client, order_manager, far_order_id, far_instr,
+                orig_direction="buy", reverse_price=far_limit * 0.95,
+                asset=asset, notifier=notifier, context="far-entry-timeout",
+            )
+            # Close the fully-filled near leg to avoid leg risk.
             try:
-                await client.cancel_order(far_order_id)
                 await client.place_order(near_instr, "buy", amount, near_limit * 1.05,
                                          label=f"FLATTEN-NEAR-{asset}")
             except Exception as inner:
                 logger.critical("FAILED to close near leg after far leg timeout: %s", inner)
-            order_manager.update(far_order_id, OrderState.CANCELLED)
             raise LegRiskError(f"Far leg timeout: {exc}")
 
         far_fill_price = far_state.get("average_price", far_limit)
         far_fill_usd   = _usd_price(far_fill_price, spot, asset)
-        _check_slippage(far_fill_usd, far_intended_usd, slippage_pct)
+        # Directional slippage check (Phase 26b): far is a BUY, so only a fill
+        # *above* the intended price is adverse.  If it ever fires here — both legs
+        # are already filled — unwind both legs before raising so an executed
+        # spread is never abandoned unrecorded on the exchange.
+        try:
+            _check_slippage(far_fill_usd, far_intended_usd, slippage_pct, side="buy")
+        except SlippageError:
+            logger.error(
+                "Far-leg slippage after both legs filled — unwinding both legs to "
+                "avoid an abandoned unrecorded spread"
+            )
+            try:
+                # Reverse near (we sold it → buy back) and far (we bought → sell).
+                await client.place_order(near_instr, "buy", amount, near_limit * 1.05,
+                                         label=f"UNWIND-NEAR-{asset}")
+                await client.place_order(far_instr, "sell", amount, far_limit * 0.95,
+                                         label=f"UNWIND-FAR-{asset}")
+                logger.info("Unwound both legs after far-leg slippage")
+            except Exception as unwind_exc:
+                logger.critical(
+                    "FAILED to unwind both legs after far-leg slippage: %s — "
+                    "MANUAL ACTION REQUIRED", unwind_exc,
+                )
+                if notifier is not None:
+                    try:
+                        notifier.notify_warning(
+                            f"MANUAL ACTION REQUIRED: {asset} calendar spread "
+                            f"({near_instr}/{far_instr}) filled then failed to unwind "
+                            f"after a slippage check — verify positions on Deribit"
+                        )
+                    except Exception:
+                        pass
+            raise
         order_manager.update(far_order_id, OrderState.FILLED, fill_price=far_fill_price)
         logger.info("Far leg filled: price=%.4f", far_fill_price)
 
@@ -837,6 +980,7 @@ async def _async_close_spread(
     client_secret: str,
     order_manager: OrderManager,
     order_timeout: int = ORDER_TIMEOUT_SEC,
+    notifier=None,
 ) -> tuple[float, float, float] | None:
     """
     Close both legs of a calendar spread.
@@ -934,22 +1078,30 @@ async def _async_close_spread(
             near_state = await _wait_for_fill(client, near_close_id, order_timeout)
             near_filled = True
         except (OrderTimeoutError, RuntimeError) as exc:
-            logger.warning("Near leg close timed out: %s — will attempt to cancel", exc)
-            try:
-                await client.cancel_order(near_close_id)
-            except Exception as cancel_exc:
-                logger.warning("Failed to cancel near close order %s: %s", near_close_id, cancel_exc)
+            logger.warning("Near leg close timed out: %s — cancelling + flattening any partial", exc)
+            # near-close is a BUY (buying back the short); a partial fill is
+            # reversed by selling the filled portion back (Phase 26a) so the
+            # position stays whole for a clean retry.
+            near_sell_px = (near_bid if near_bid > 0 else near_mid) * (1 - buffer)
+            await _cancel_and_flatten(
+                client, order_manager, near_close_id, near_instr,
+                orig_direction="buy", reverse_price=near_sell_px or 0.001,
+                asset=asset, notifier=notifier, context="near-close-timeout",
+            )
 
         # Wait for far leg fill
         try:
             far_state = await _wait_for_fill(client, far_close_id, order_timeout)
             far_filled = True
         except (OrderTimeoutError, RuntimeError) as exc:
-            logger.warning("Far leg close timed out: %s", exc)
-            try:
-                await client.cancel_order(far_close_id)
-            except Exception as cancel_exc:
-                logger.warning("Failed to cancel far close order %s: %s", far_close_id, cancel_exc)
+            logger.warning("Far leg close timed out: %s — cancelling + flattening any partial", exc)
+            # far-close is a SELL; a partial fill is reversed by buying it back.
+            far_buy_px = (far_ask if far_ask > 0 else far_mid) * (1 + buffer)
+            await _cancel_and_flatten(
+                client, order_manager, far_close_id, far_instr,
+                orig_direction="sell", reverse_price=far_buy_px or 0.001,
+                asset=asset, notifier=notifier, context="far-close-timeout",
+            )
 
         # If one leg filled but the other didn't, unwind the filled leg to avoid leg risk
         if near_filled and not far_filled:
@@ -1021,6 +1173,7 @@ async def _async_roll_near_leg(
     order_manager: OrderManager,
     slippage_pct: float = SLIPPAGE_LIMIT_PCT,
     order_timeout: int = ORDER_TIMEOUT_SEC,
+    notifier=None,
 ) -> bool:
     """
     Roll the near leg: close the current short near leg and open a new one.
@@ -1067,7 +1220,14 @@ async def _async_roll_near_leg(
             await _wait_for_fill(client, close_id, order_timeout)
             order_manager.update(close_id, OrderState.FILLED)
         except (OrderTimeoutError, RuntimeError) as exc:
-            logger.error("Roll: close of near leg failed: %s", exc)
+            logger.error("Roll: close of near leg failed: %s — flattening any partial", exc)
+            # roll-close is a BUY; reverse a partial by selling it back (Phase 26a).
+            roll_sell_px = (near_bid if near_bid > 0 else near_ask) * (1 - buffer)
+            await _cancel_and_flatten(
+                client, order_manager, close_id, near_instr,
+                orig_direction="buy", reverse_price=roll_sell_px or 0.001,
+                asset=asset, notifier=notifier, context="roll-close-timeout",
+            )
             return False
 
         # Sell new near leg
@@ -1087,7 +1247,13 @@ async def _async_roll_near_leg(
             await _wait_for_fill(client, sell_id, order_timeout)
             order_manager.update(sell_id, OrderState.FILLED)
         except (OrderTimeoutError, RuntimeError) as exc:
-            logger.error("Roll: open of new near leg failed: %s — position is far-leg-only", exc)
+            logger.error("Roll: open of new near leg failed: %s — flattening any partial", exc)
+            # roll-open is a SELL; reverse a partial by buying it back (Phase 26a).
+            await _cancel_and_flatten(
+                client, order_manager, sell_id, new_near,
+                orig_direction="sell", reverse_price=new_limit * 1.05,
+                asset=asset, notifier=notifier, context="roll-open-timeout",
+            )
             return False
 
     logger.info("Near leg rolled from %s → %s", near_instr, new_near)
@@ -1130,6 +1296,7 @@ class CalendarExecutor:
         order_manager:   OrderManager | None = None,
         slippage_pct:    float = SLIPPAGE_LIMIT_PCT,
         order_timeout:   int   = ORDER_TIMEOUT_SEC,
+        notifier=None,
         # Legacy: paper=True/False still accepted but ignored; mode comes from config
         paper:           bool | None = None,
     ) -> None:
@@ -1139,6 +1306,9 @@ class CalendarExecutor:
         self.order_manager   = order_manager or OrderManager()
         self.slippage_pct    = slippage_pct
         self.order_timeout   = order_timeout
+        # Optional notifier for one-shot operator alerts on a failed partial-fill
+        # flatten (Phase 26a) — logged CRITICAL regardless, alerted when present.
+        self._notifier       = notifier
         # Populated by close_spread() with the last close's per-leg fill prices
         # so the decision engine can compute exit fees from real fills (Phase 25c).
         self.last_close_fills: dict[str, float] | None = None
@@ -1209,6 +1379,7 @@ class CalendarExecutor:
                     portfolio_value=self.portfolio_value,
                     slippage_pct=self.slippage_pct,
                     order_timeout=self.order_timeout,
+                    notifier=self._notifier,
                 )
             )
         except LegRiskError:
@@ -1241,6 +1412,7 @@ class CalendarExecutor:
                     client_secret=self.client_secret,
                     order_manager=self.order_manager,
                     order_timeout=self.order_timeout,
+                    notifier=self._notifier,
                 )
             )
         except Exception:
@@ -1276,6 +1448,7 @@ class CalendarExecutor:
                     order_manager=self.order_manager,
                     slippage_pct=self.slippage_pct,
                     order_timeout=self.order_timeout,
+                    notifier=self._notifier,
                 )
             )
         except Exception:

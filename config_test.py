@@ -284,8 +284,39 @@ CLOSE_PRICE_CROSS_BUFFER_PCT = 0.02   # buffer when crossing bid/ask to close/ro
 TICK_SIZE_FETCH_RETRIES      = 1      # extra tick-size fetch attempts before fallback
 MIN_ROLL_NEAR_FAR_GAP_DAYS   = 1      # new near expiry must precede far by this many days
 
-MIN_CONTRACT_SIZE      = 0.1
-STRIKE_CORRELATION_PCT = 0.05
+# ── Phase 26 — legged-entry safety, roll resilience, tenor alignment, exec value ─
+# Reject an entry whose *matched* near-leg DTE is below this floor.  A near leg
+# already inside ROLL_TRIGGER_DAYS at entry (e.g. a 2-DTE leg matched to near
+# target 1 via NEAR_DAY_TOLERANCE) is roll-eligible almost immediately, so the
+# position hits the roll path — and its failure modes — hours after opening.
+# Default ROLL_TRIGGER_DAYS + 1 so a fresh entry always has at least one full
+# day of life before it can decay into roll-eligibility (strategy/scanner.py).
+MIN_NEAR_DTE_AT_ENTRY = ROLL_TRIGGER_DAYS + 1
+
+# Basis used to value a spread for stop/TP/roll decisions:
+#   "mark" → far_mid - near_mid (mid-to-mid; current behaviour)
+#   "exec" → far_bid - near_ask (what a real close would actually fetch after
+#            crossing the spread on both legs — much closer to realised P&L on
+#            thin books where marks and executable value diverge sharply).
+# config.py defaults to "mark" until exec-basis is validated on the live book;
+# config_test.py uses "exec" where testnet books are thin and fills are real.
+# Both values are always logged (sv_mark / sv_exec) so divergence is visible.
+SPREAD_VALUE_BASIS = "exec"
+
+# Before a close, warn (no action) when the expected executable proceeds are
+# below this fraction of the marked spread value — surfaces a mark-vs-executable
+# gap that would otherwise only show up as a surprising realised loss.
+CLOSE_PROCEEDS_WARN_PCT = 0.50
+
+# When the same reconcile-mismatch fingerprint (Deribit vs SQLite margin) recurs
+# this many consecutive refresh cycles, escalate from a warn-only log to a
+# one-shot Telegram alert — a mismatch that never resolves is an alarm, not noise
+# (portfolio/tracker.py).
+RECONCILE_ESCALATE_AFTER_CYCLES = 12
+
+# Position sizing (strategy/sizer.py, execution/executor.py)
+MIN_CONTRACT_SIZE      = 0.1    # config-level sanity floor on contract size (BTC/ETH)
+STRIKE_CORRELATION_PCT = 0.05   # positions within ±5% of an open strike are correlated
 
 # ── Phase 25a/25b — per-instrument order-amount minimums ──────────────────────
 DEFAULT_MIN_TRADE_AMOUNTS = {   # asset → (min_trade_amount, amount_step)

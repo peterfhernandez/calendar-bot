@@ -329,6 +329,7 @@ def load_calendar_state(asset: str, db_path: Path = DB_PATH) -> dict:
             "ev_score":           trade.ev_score,
             "ev_score_initial":   trade.ev_score_initial,
             "ev_score_at_roll":   trade.ev_score_at_roll,
+            "last_spread_value":  trade.last_spread_value,
         }
         for trade in trades
         # Exclude close_stuck positions from the monitor's read path (Phase 22a):

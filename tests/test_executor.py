@@ -400,11 +400,14 @@ class TestAsyncEnterSpread:
                 )
 
     def test_slippage_rejection_near_leg(self):
-        """Fill price deviating too far from intended raises SlippageError."""
-        # near_bid=$200 (intended sell price). Fill at 0.004 BTC = $400 → 100% deviation → SlippageError.
-        candidate = _make_candidate()  # near_bid=200 USD
-        # Fill in index fraction: 0.004 BTC = $400, intended was $200 → 100% deviation
-        mock_client = self._make_mock_client(near_fill_price=0.004, far_fill_price=0.006)
+        """An *adverse* near-leg fill raises SlippageError (Phase 26b: directional).
+
+        The near leg is a SELL at an intended $200. A fill *below* that ($100 =
+        0.001 BTC) means we received materially less than intended — adverse — so
+        SlippageError is raised.
+        """
+        candidate = _make_candidate()  # near_bid=200 USD (intended sell price)
+        mock_client = self._make_mock_client(near_fill_price=0.001, far_fill_price=0.006)
 
         with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
              patch.object(config, "TRADING_MODE", "test"):
@@ -417,6 +420,29 @@ class TestAsyncEnterSpread:
                         order_manager=mgr, portfolio_value=50_000.0, slippage_pct=0.02,
                     )
                 )
+
+    def test_slippage_allows_near_leg_price_improvement(self):
+        """Phase 26b: a *better* near-leg fill (sold for more) must NOT raise.
+
+        The old symmetric abs() check rejected price improvement — the only
+        deviation a limit order can actually produce.  A near SELL filling at $400
+        (0.004 BTC) vs the intended $200 is favourable and must pass the near-leg
+        slippage check (the trade may still fail later on the far leg mock; we only
+        assert no SlippageError escapes for the near-leg improvement).
+        """
+        candidate = _make_candidate()  # near_bid=200 USD
+        mock_client = self._make_mock_client(near_fill_price=0.004, far_fill_price=0.006)
+
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
+            mgr = OrderManager()
+            # Should not raise SlippageError for the improved near-leg fill.
+            self._run(
+                _async_enter_spread(
+                    candidate, client_id="", client_secret="",
+                    order_manager=mgr, portfolio_value=50_000.0, slippage_pct=0.02,
+                )
+            )
 
     def test_paper_mode_returns_simulated_fill(self):
         """In paper mode, enter_spread returns a simulated fill without any API calls."""
@@ -1379,3 +1405,163 @@ class TestCloseFillTracking:
             credit = ex.close_spread(position)
         assert credit is None
         assert ex.last_close_fills is None
+
+
+# ── Tests: Phase 26 — partial-fill flatten, directional slippage, unwind ──────
+
+class TestPartialFillFlatten:
+    """Phase 26a: a timeout-cancel that left a partial fill flattens it."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_flatten_reverses_partial_sell(self):
+        from execution.executor import _cancel_and_flatten
+        client = AsyncMock()
+        client.cancel_order.return_value = {"order_id": "n1", "filled_amount": 3.0}
+        client.place_order.return_value = {"order": {"order_id": "flat-1"}}
+        mgr = OrderManager()
+        mgr.track(TrackedOrder(
+            order_id="n1", instrument="BTC-25JUL26-1750-P",
+            direction="sell", amount=7.0, limit_price=0.002,
+        ))
+        filled = self._run(_cancel_and_flatten(
+            client, mgr, "n1", "BTC-25JUL26-1750-P",
+            orig_direction="sell", reverse_price=0.003, asset="BTC",
+        ))
+        assert filled == 3.0
+        client.place_order.assert_awaited_once()
+        args, _ = client.place_order.call_args
+        assert args[1] == "buy"    # a partial SELL is flattened by buying it back
+        assert args[2] == 3.0      # exactly the filled amount
+        tracked = mgr.get("n1")
+        assert tracked.state == OrderState.CANCELLED_PARTIAL
+        assert tracked.filled_amount == 3.0
+
+    def test_no_partial_marks_cancelled(self):
+        from execution.executor import _cancel_and_flatten
+        client = AsyncMock()
+        client.cancel_order.return_value = {"order_id": "n1", "filled_amount": 0.0}
+        client.get_order_state.return_value = {"filled_amount": 0.0}
+        mgr = OrderManager()
+        mgr.track(TrackedOrder(
+            order_id="n1", instrument="X", direction="sell", amount=7.0, limit_price=0.002,
+        ))
+        filled = self._run(_cancel_and_flatten(
+            client, mgr, "n1", "X", orig_direction="sell", reverse_price=0.003, asset="BTC",
+        ))
+        assert filled == 0.0
+        client.place_order.assert_not_called()
+        assert mgr.get("n1").state == OrderState.CANCELLED
+
+    def test_flatten_failure_raises_operator_alert(self):
+        from execution.executor import _cancel_and_flatten
+        client = AsyncMock()
+        client.cancel_order.return_value = {"filled_amount": 5.0}
+        client.place_order.side_effect = RuntimeError("exchange down")
+        notifier = MagicMock()
+        mgr = OrderManager()
+        mgr.track(TrackedOrder(
+            order_id="f1", instrument="ETH-24JUL26-1750-P",
+            direction="buy", amount=5.0, limit_price=0.006,
+        ))
+        filled = self._run(_cancel_and_flatten(
+            client, mgr, "f1", "ETH-24JUL26-1750-P",
+            orig_direction="buy", reverse_price=0.005, asset="ETH", notifier=notifier,
+        ))
+        assert filled == 5.0
+        notifier.notify_warning.assert_called_once()
+
+    def test_filled_amount_from_order_state_fallback(self):
+        """When the cancel response omits filled_amount, get_order_state supplies it."""
+        from execution.executor import _cancel_and_flatten
+        client = AsyncMock()
+        client.cancel_order.return_value = {"order_id": "n1"}  # no filled_amount
+        client.get_order_state.return_value = {"filled_amount": 2.0}
+        client.place_order.return_value = {"order": {"order_id": "flat-1"}}
+        mgr = OrderManager()
+        mgr.track(TrackedOrder(
+            order_id="n1", instrument="X", direction="sell", amount=7.0, limit_price=0.002,
+        ))
+        filled = self._run(_cancel_and_flatten(
+            client, mgr, "n1", "X", orig_direction="sell", reverse_price=0.003, asset="BTC",
+        ))
+        assert filled == 2.0
+        client.place_order.assert_awaited_once()
+
+
+class TestDirectionalSlippage:
+    """Phase 26b: _check_slippage rejects only adverse fills, not improvement."""
+
+    def test_sell_below_intended_is_adverse(self):
+        with pytest.raises(SlippageError):
+            _check_slippage(90.0, 100.0, 0.02, side="sell")  # received less
+
+    def test_sell_above_intended_passes(self):
+        _check_slippage(110.0, 100.0, 0.02, side="sell")  # sold for more — favourable
+
+    def test_buy_above_intended_is_adverse(self):
+        with pytest.raises(SlippageError):
+            _check_slippage(110.0, 100.0, 0.02, side="buy")  # paid more
+
+    def test_buy_below_intended_passes(self):
+        _check_slippage(90.0, 100.0, 0.02, side="buy")  # bought cheaper — favourable
+
+    def test_legacy_symmetric_still_rejects_both(self):
+        with pytest.raises(SlippageError):
+            _check_slippage(110.0, 100.0, 0.02)  # no side → symmetric
+        with pytest.raises(SlippageError):
+            _check_slippage(90.0, 100.0, 0.02)
+
+
+class TestBothLegsFilledSlippageUnwind:
+    """Phase 26b: an adverse far-leg fill after both legs filled unwinds both."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_far_slippage_after_fill_unwinds_both_legs(self):
+        candidate = _make_candidate()  # far_ask=600 USD intended (0.006)
+        # near fills at intended 0.002; far fills adverse at 0.010 = $1000 (>2%).
+        mock_client = _MockRPCClient(
+            place_order_results=[
+                _submitted_order_result("near-1", 0.002),
+                _submitted_order_result("far-1",  0.010),
+                _submitted_order_result("unwind-near", 0.002),
+                _submitted_order_result("unwind-far",  0.006),
+            ],
+            order_states={
+                "near-1": [_filled_order_state("near-1", 0.002)],
+                "far-1":  [_filled_order_state("far-1",  0.010)],
+            },
+        )
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"):
+            mgr = OrderManager()
+            with pytest.raises(SlippageError):
+                self._run(
+                    _async_enter_spread(
+                        candidate, client_id="", client_secret="",
+                        order_manager=mgr, portfolio_value=50_000.0, slippage_pct=0.02,
+                    )
+                )
+        # near(sell) + far(buy) + unwind-near(buy) + unwind-far(sell)
+        assert len(mock_client.placed_orders) == 4
+        assert mock_client.placed_orders[2]["direction"] == "buy"   # unwind near
+        assert mock_client.placed_orders[3]["direction"] == "sell"  # unwind far
+
+
+class TestCancelledPartialState:
+    """Phase 26a: order_manager exposes the CANCELLED_PARTIAL terminal state."""
+
+    def test_cancelled_partial_is_terminal_and_records_amount(self):
+        mgr = OrderManager()
+        mgr.track(TrackedOrder(
+            order_id="p1", instrument="X", direction="sell", amount=7.0, limit_price=0.002,
+        ))
+        mgr.update("p1", OrderState.CANCELLED_PARTIAL, filled_amount=3.0)
+        o = mgr.get("p1")
+        assert o.state == OrderState.CANCELLED_PARTIAL
+        assert o.is_terminal
+        assert o.filled_amount == 3.0
+        assert o not in mgr.open_orders()

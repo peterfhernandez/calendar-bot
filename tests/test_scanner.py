@@ -431,6 +431,10 @@ class TestOneDayNearLeg:
         monkeypatch.setattr(cfg, "NEAR_DAYS_OPTIONS", [1])
         monkeypatch.setattr(cfg, "FAR_DAYS_OPTIONS",  [far_days])
         monkeypatch.setattr(cfg, "MAX_FAR_DAYS_FOR_1D_NEAR", 14)
+        # Isolate the far-day-pairing logic under test from the Phase 26d
+        # entry-tenor floor (default 3), which would otherwise reject a 1-DTE
+        # near leg before the far-day rules are even reached.
+        monkeypatch.setattr(cfg, "MIN_NEAR_DTE_AT_ENTRY", 1)
         cache = _make_cache(snaps)
         return scan(
             cache, assets=["BTC"],
@@ -484,6 +488,7 @@ class TestOneDayNearLeg:
         """Setting MAX_FAR_DAYS_FOR_1D_NEAR=0 disables the limit — 1d/30d is then allowed."""
         import config as cfg
         monkeypatch.setattr(cfg, "MAX_FAR_DAYS_FOR_1D_NEAR", 0)
+        monkeypatch.setattr(cfg, "MIN_NEAR_DTE_AT_ENTRY", 1)  # isolate from Phase 26d floor
         snaps = self._snaps_1d_near(30)
         cache = _make_cache(snaps)
         results = scan(
@@ -781,3 +786,80 @@ class TestMoneynessFilter:
         # Per-asset override loosens BTC to 30% → now within the window.
         monkeypatch.setitem(cfg.ASSET_OVERRIDES, "BTC", {"MAX_MONEYNESS_PCT": 0.30})
         assert _eval_candidate(*args, **kw) is not None
+
+
+class TestEntryTenorFloor:
+    """Phase 26d: reject entries whose matched near DTE is below the floor."""
+
+    def _eval(self, near_dte: int, is_roll: bool = False):
+        from strategy.scanner import _eval_candidate
+        near = _make_snap("BTC", near_dte, 100_000, "C", mark_iv=0.90, bid=4800, ask=5200, open_interest=600)
+        far  = _make_snap("BTC", 30,       100_000, "C", mark_iv=0.75, bid=8200, ask=8800, open_interest=600)
+        return _eval_candidate(
+            "BTC", 100_000.0, "Call", near_dte, near, 30, far, 100_000.0,
+            min_oi_near=100, min_oi_far=100, min_iv_contango=0.02, min_pop=0.01,
+            is_roll=is_roll,
+        )
+
+    def test_short_dte_entry_rejected(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_NEAR_DTE_AT_ENTRY", 3)
+        # 2-DTE near matched at entry is roll-eligible almost immediately → rejected.
+        assert self._eval(near_dte=2) is None
+
+    def test_adequate_dte_entry_passes(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_NEAR_DTE_AT_ENTRY", 3)
+        assert self._eval(near_dte=7) is not None
+
+    def test_floor_skipped_for_rolls(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "MIN_NEAR_DTE_AT_ENTRY", 3)
+        # A roll may legitimately open a short-dated near leg — the floor is skipped.
+        assert self._eval(near_dte=2, is_roll=True) is not None
+
+
+class TestRollModeScan:
+    """Phase 26c: roll_for mode constrains and relaxes the scan."""
+
+    def _snaps(self, strike=100_000):
+        # A deep-OTM strike (30% from spot) that would fail entry-grade moneyness,
+        # but must remain a valid ROLL target for an existing position.
+        return [
+            _make_snap("BTC", 7,  strike, "C", mark_iv=0.80, bid=4800, ask=5200, open_interest=600),
+            _make_snap("BTC", 30, strike, "C", mark_iv=0.82, bid=8200, ask=8800, open_interest=600),
+        ]
+
+    def test_roll_mode_relaxes_moneyness_and_contango(self):
+        # Deep-OTM strike + backwardation (near_iv > far_iv is False here) would be
+        # rejected as an entry, but roll mode relaxes both filters.
+        strike = 130_000  # 30% from 100k spot
+        snaps = self._snaps(strike)
+        cache = _make_cache(snaps)
+        far_instr = snaps[1].instrument
+        roll_for = {
+            "asset": "BTC", "strike": float(strike),
+            "option_type": "Call", "far_instrument": far_instr,
+        }
+        results = scan(cache, roll_for=roll_for,
+                       near_days_options=[7], far_days_options=[30])
+        assert len(results) >= 1
+        assert all(c.far_instrument == far_instr for c in results)
+
+    def test_roll_mode_constrains_to_position_strike(self):
+        snaps = (
+            self._snaps(100_000)
+            + [_make_snap("BTC", 7,  120_000, "C", mark_iv=0.90, bid=1000, ask=1100, open_interest=600),
+               _make_snap("BTC", 30, 120_000, "C", mark_iv=0.75, bid=3000, ask=3200, open_interest=600)]
+        )
+        cache = _make_cache(snaps)
+        far_instr = snaps[1].instrument  # the 100k far leg
+        roll_for = {
+            "asset": "BTC", "strike": 100_000.0,
+            "option_type": "Call", "far_instrument": far_instr,
+        }
+        results = scan(cache, roll_for=roll_for,
+                       near_days_options=[7], far_days_options=[30])
+        # Only the 100k strike (and its own far leg) should appear.
+        assert results
+        assert all(c.strike == 100_000.0 for c in results)
