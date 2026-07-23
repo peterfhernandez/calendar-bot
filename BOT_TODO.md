@@ -1426,3 +1426,57 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 - [x] `tests/test_portfolio.py`: `kind=any` reconcile lists a futures position; open-order margin appears in the warning; option-only fallback on parse failure
 - [x] `tests/test_config_centralization.py`: new keys present in both `config.py` and `config_test.py`
 - [x] Add `scratch/scratch_amount_validation.py` — fetches live BTC/ETH option instrument minimums and demonstrates clamp/skip decisions without placing orders; aborts if `TRADING_MODE == "live"`
+
+## Phase 26 — Legged-Entry Fill Safety, Roll-Failure Resilience, Entry-Tenor Alignment, and Executable-Value Monitoring
+
+**Status:** Planned — not yet implemented. From analysis of the 2026-07-22 → 2026-07-23 test-mode run (trades 14–18) and the 2026-07-22 paper-mode close of trade 208: three healthy positions (110%/101%/98% of debit) force-liquidated on a single failed roll attempt (−162.42/−61.59/−89.65); trade 208 closed the same way after its strike drifted past the moneyness cap; deep-ITM trade 17 (14.77% moneyness) stopped at "0% of debit" 3 minutes after entry (−100.80); three failed legged ETH-1750 entries left untracked exchange inventory (−13 naked 24JUL26-1750-P + an unrecorded 5×5 24JUL/7AUG calendar) that warned `RECONCILE MISMATCH` every 5 minutes for 30+ hours. See [BOT_PLAN.md Phase 26](BOT_PLAN.md#phase-26--legged-entry-fill-safety-roll-failure-resilience-entry-tenor-alignment-and-executable-value-monitoring) for full root-cause detail.
+
+### 26a — Partial-fill-aware cancel (Defect A: timeout-cancel abandoned −13 naked shorts)
+
+- [ ] After every timeout-cancel in `execution/executor.py` (legged entry near-leg path ~746–755, close paths ~919–952, roll path), read `filled_amount` from the `private/cancel` response (fall back to `private/get_order_state`)
+- [ ] If `filled_amount > 0`: submit a reverse order for exactly the filled amount at a crossed price (Phase 22 pricing); log `WARNING` with instrument, amount, and fill price; record the flatten cost
+- [ ] If the flatten fails: `CRITICAL` log + one-shot Telegram alert naming the exact naked position and amount
+- [ ] `execution/order_manager.py`: new `CANCELLED_PARTIAL` state carrying the filled amount
+
+### 26b — Directional slippage check with unwind (Defect B: price improvement rejected after both legs filled)
+
+- [ ] `_check_slippage` gains a `side` parameter — reject only adverse fills (sell below intended / buy above intended); price improvement passes (attempt 3's $22.08 vs $23.04 far BUY must pass)
+- [ ] Document that both legs are limit orders, so a beyond-limit adverse fill is unreachable — the check remains as a sanity invariant only
+- [ ] If the far-leg check ever fires after both legs are filled: unwind both legs at crossed prices before raising (mirror the far-leg-timeout flatten); a filled spread must end recorded in the DB or flat on the exchange — never abandoned
+- [ ] `enter_spread`'s `SlippageError` handler logs whether an unwind occurred and its cost
+
+### 26c — Roll-failure resilience (Observation 3: one bad scan tick liquidates a healthy position)
+
+- [ ] `strategy/decision.py:931–939`: on `_try_roll` failure, increment `_close_roll_failures` and **hold the position** (normal held/MTM return); close only at `POSITION_FAILURE_RETRY_CAP` or `near_days_left == 0`
+- [ ] `_try_roll` iterates all matches, skipping any candidate whose near instrument equals the held near (fixes trades 14/15 giving up on `matches[0]`)
+- [ ] Roll-specific candidate search (`scan(roll_for=pos)` or `scan_roll_candidates()`): constrained to the position's strike/type/far leg; moneyness/POP/contango **not** re-applied to existing risk (fixes trade 208); two-sided-quote, OI, liquidity gate, `MIN_ROLL_NEAR_FAR_GAP_DAYS`, margin gate all retained
+- [ ] Honest close labels: `result='Closed (Roll Failed)'` / `'Closed (Drain)'` instead of pnl-sign defaulting into `'Loss (Auto Stop)'`/`'Win (Auto TP)'`
+- [ ] Stop/TP checks still evaluated every tick before the roll path (a genuine loser still exits on its stop while roll retries continue)
+
+### 26d — Entry-tenor alignment (Observation 1: 2-DTE entries guaranteed an immediate roll attempt)
+
+- [ ] New config key `MIN_NEAR_DTE_AT_ENTRY` (default `ROLL_TRIGGER_DAYS + 1`) in `config.py` and `config_test.py` (parity test)
+- [ ] Scanner/RANK gate rejects candidates whose **matched** near DTE (not the target) is below the floor; skip logged
+- [ ] Regression test reproducing trades 14–16: a 24JUL26 near leg matched via near-target 1 ± 3-day tolerance at 2 DTE must be rejected at entry
+
+### 26e — Executable-value monitoring and realistic paper closes (Observation 2: marks said 98–110%, closes recovered 5–10%)
+
+- [ ] `_get_market_spread_value` returns both mark value and executable value (far bid − near ask, qty-weighted)
+- [ ] New config key `SPREAD_VALUE_BASIS` (`"mark"` | `"exec"`) selecting the basis for stop/TP/roll decisions — `exec` in `config_test.py`, `mark` in `config.py` until validated
+- [ ] Monitor log lines show both (`sv_mark=… sv_exec=…`)
+- [ ] Pre-close sanity check: `WARNING` when expected proceeds < `CLOSE_PROCEEDS_WARN_PCT` of marked value
+- [ ] `DryRunExecutor.close_spread` returns the position's last known spread value (`last_spread_value` / live cache) instead of `net_debit × qty`, so paper closes realise MTM P&L (trade 208 logged −4.85 while carrying a ~$69 mark loss)
+
+### 26f — Operator cleanup and reconcile escalation
+
+- [ ] One-time operator action: manually clear the orphaned 1750 inventory on test.deribit.com (−13 × 24JUL26-1750-P, +5 × 7AUG26-1750-P with its −5 inside the 24JUL total); no DB rows exist for it — confirmation is the reconcile warning going quiet
+- [ ] `portfolio/tracker.py`: escalate a persistent identical mismatch fingerprint to a one-shot Telegram alert after `RECONCILE_ESCALATE_AFTER_CYCLES` cycles (warn-only forever is not an alarm)
+
+### 26g — Tests and scratch
+
+- [ ] `tests/test_executor.py`: partial fill flattened after timeout-cancel; flatten failure alerts; `CANCELLED_PARTIAL` recorded; directional slippage passes price improvement and rejects adverse; both-legs-filled violation unwinds both legs
+- [ ] `tests/test_decision.py`: roll failure holds position until cap/expiry; all matches iterated with held-near excluded; roll search relaxes moneyness/POP/contango but keeps liquidity/gap/margin gates; `MIN_NEAR_DTE_AT_ENTRY` skip; `Closed (Roll Failed)` label; exec-basis stop/TP; paper close returns last spread value
+- [ ] `tests/test_portfolio.py`: reconcile escalation fires once after N identical mismatches
+- [ ] `tests/test_config_centralization.py`: new keys present in both `config.py` and `config_test.py`
+- [ ] Add `scratch/scratch_partial_fill_flatten.py` — demonstrates timeout-cancel partial-fill flatten (aborts in live)
+- [ ] Add `scratch/scratch_roll_resilience.py` — replays the trade 14/15/16/208 roll scenarios showing hold-and-retry instead of first-tick liquidation
