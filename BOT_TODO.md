@@ -1488,8 +1488,9 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 
 ## Phase 27 — Option Amount Step Blocks All BTC Entries
 
-**Status:** 27a complete (the BTC entry blocker). 27b–27d are the remaining
-findings from the same log analysis, not yet started. Full root-cause detail in
+**Status:** 27a complete (the BTC entry blocker); 27b complete (the fill-wait
+defect that unwound a fully-filled leg). 27c–27e are the remaining findings from
+the same log analysis, not yet started. Full root-cause detail in
 [BOT_PLAN.md Phase 27](BOT_PLAN.md#phase-27--option-amount-step-blocks-all-btc-entries).
 
 Found by analysing `logs/bot_test.log.1` for the two `LegRiskError: Far leg
@@ -1543,18 +1544,42 @@ which is why every observed `LegRiskError` was ETH and BTC simply never traded.
 
 ### 27b — `_wait_for_fill` is all-or-nothing and blind at the deadline
 
-- [ ] `_wait_for_fill` treats "not 100% filled at the last poll" as total
+- [x] `_wait_for_fill` treats "not 100% filled at the last poll" as total
       failure. Occurrence 2 (`ETH-82752446337`, qty 8) reported
       `8.0000 filled` on cancel — a **complete** fill — yet was declared a
       timeout, unwound at a crossed price, and triggered a `FLATTEN-NEAR` on a
       near leg that had filled correctly: a round trip through the spread on
       both legs for nothing
-- [ ] The `poll_interval * 1.5` backoff (capped at 5.0s) puts the last state
+- [x] The `poll_interval * 1.5` backoff (capped at 5.0s) puts the last state
       observation at t≈28.1s while the loop does not exit until t≈33.1s — a ~5s
       window in which a completing fill is invisible. Log timing corroborates:
       fallback 06:17:58 → error 06:18:32 is 34s, not the 30s the message claims
-- [ ] Make the wait partial-fill aware, poll once more immediately before
+- [x] Make the wait partial-fill aware, poll once more immediately before
       giving up, and report the true elapsed time in the timeout message
+- [x] Completion is now detected by **quantity** (`filled_amount` vs the
+      submitted amount) as well as by `order_state`, so a fill whose state field
+      has not yet flipped is recognised instead of unwound. `_wait_for_fill`
+      takes the submitted `amount` (threaded through all seven call sites —
+      combo, entry near/far, close near/far, roll close/open) and falls back to
+      the order's own `amount` field when it is not supplied
+- [x] The sleep is clamped to the time remaining (`min(poll_interval,
+      remaining)`), so the loop always polls once more *at* the deadline before
+      giving up — closing the ~5s blind window
+- [x] `OrderTimeoutError` carries `order_id`, `filled_amount`, `amount`, and
+      `elapsed_sec`, and its message reports true elapsed time plus fill
+      progress (`Order X not filled after 33.1s (timeout 30s, filled 3.0000/8.0000)`)
+      instead of restating the nominal timeout
+- [x] `tests/test_executor.py::TestWaitForFillPartialAware` (7 tests) — a
+      complete fill with a lagging `order_state` returns instead of raising;
+      amount inferred from the state when not passed; a genuine 3-of-8 partial
+      still times out and carries its progress; a poll happens at the deadline
+      (the late-fill case the old loop never saw); elapsed time does not
+      overshoot the timeout; `cancelled`/`rejected` still raises `RuntimeError`;
+      an unknown quantity is not read as "complete" at `filled=0`
+- [x] `scratch/scratch_wait_for_fill.py` — offline demo replaying the logged
+      `ETH-82752446337` fill, the blind-window fill, and the honest-elapsed
+      timeout (11 checks, no network, no live orders). Aborts in live mode.
+- [x] Full suite green: 697 passing (690 baseline + 7 new)
 
 ### 27c — Combo path fails on every entry, and the reason is invisible
 
