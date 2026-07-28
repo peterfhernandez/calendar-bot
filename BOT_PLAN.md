@@ -1785,3 +1785,91 @@ Also: a roll-failure close is recorded as `result='Loss (Auto Stop)'` purely bec
 | Relaxing moneyness/POP/contango on rolls re-inherits the deep-ITM churn Phase 21 fixed | Relaxation applies only to the position's own strike on a *roll* (existing risk), never to new entries; liquidity, OI, gap, and margin gates still apply; Phase 21's entry-side guards untouched |
 | `exec` basis on thin testnet books triggers stops that `mark` basis would not | `SPREAD_VALUE_BASIS` is per-config: exec in `config_test.py` where books are thin and fills are real, mark default in `config.py` until validated; both values logged either way |
 | Paper closes at `last_spread_value` diverge from what a real close would achieve | Documented limitation — still strictly better than closing at entry value (gross ≡ 0); exec-basis valuation narrows the gap where quotes exist |
+
+---
+
+## Phase 27 — Option Amount Step Blocks All BTC Entries
+
+**Status:** 27a complete (the BTC entry blocker); 27b–27e identified and
+documented, not yet implemented. Checklist in BOT_TODO.md Phase 27. Offline
+demo: `python -m scratch.scratch_option_amount_step` (no live orders).
+
+### How this was found
+
+Two `LegRiskError: Far leg timeout` Telegram alerts (2026-07-26 20:03 and
+2026-07-27 06:18) prompted an analysis of `logs/bot_test.log.1`. The alerts
+themselves turned out to be the less serious finding: the same log window showed
+that **no BTC order reached the exchange at all** during the run.
+
+### Root cause (27a)
+
+`execution/executor.py::_DeribitRPCClient._fetch_amount_info` derived an
+instrument's order-amount step as:
+
+```python
+step = meta.get("contract_size") or min_amt
+```
+
+On Deribit, an **option's** `contract_size` is the quantity of underlying per
+contract — always `1` — and has nothing to do with the granularity an order
+amount must land on. That granularity is `min_trade_amount` (BTC options `0.1`,
+ETH options `1`). Reading `contract_size` as the step quantised BTC option
+orders to whole BTC, so a sizer-approved `0.2` went through
+`_clamp_amount_to_step(0.2, min_amount=0.1, step=1.0)`, floored to `0.0`, and
+returned `None` — surfacing as:
+
+```text
+RANK approved: BTC Put strike=64000  qty=0.2  ev=-0.0713
+AMOUNT GATE: entry aborted — amount 0.2 below exchange minimum for BTC-31JUL26-64000-P
+```
+
+The message was wrong on its face: `0.2` is twice the real minimum. It was the
+*step*, not the minimum, that rejected the order.
+
+Two things kept this hidden:
+
+1. **ETH masks it.** ETH options report `min_trade_amount = 1` and
+   `contract_size = 1`, so both readings agree and ETH orders were unaffected.
+   Every observed `LegRiskError` was therefore ETH — BTC never got far enough to
+   produce one.
+2. **The tests only used ETH fixtures.** Every case in
+   `TestAmountValidation` passed `{"min_trade_amount": 1.0, "contract_size": 1.0}`,
+   where the two fields are indistinguishable. No fixture existed in which they
+   differed, so the defect was invisible to the suite.
+
+The `AmountBelowMinimumError` message also could not report the step, because
+`clamp_amount` returned a bare `None` and the caller had no access to the
+resolved `(min, step)` pair.
+
+### Fix (27a)
+
+- `_fetch_amount_info` steps options on `min_trade_amount`; futures and
+  perpetuals keep `contract_size`, which genuinely *is* their step (e.g. $10
+  contracts).
+- New `_is_option_instrument(instrument, kind)` prefers the API `kind` field and
+  falls back to the instrument name (Deribit options always end `-C` or `-P`),
+  so a missing or unrecognised `kind` cannot fall through to the futures
+  reading. This bot trades only options, and that mis-read is precisely what
+  blocked BTC.
+- `resolve_amount_info()` is split out of `clamp_amount()` so `place_order` can
+  name both the minimum and the step in the rejection message.
+- Resolved amount info is logged at DEBUG per instrument.
+
+### Remaining findings from the same analysis
+
+| Sub-phase | Finding |
+| --- | --- |
+| 27b | `_wait_for_fill` is all-or-nothing and blind for ~5s before its deadline. `ETH-82752446337` reported `8.0000 filled` of 8 — a complete fill — yet was declared a timeout and unwound at a crossed price, with a `FLATTEN-NEAR` fired against a correctly-filled near leg. |
+| 27c | The combo path fails ~2s after RANK approval on every entry (vs. a 30s `COMBO_FILL_TIMEOUT_SEC`), so `create_combo`/combo `place_order` is raising. Both paths log at DEBUG; 27a enables `execution.executor: DEBUG` in `config_test.py` to surface the reason. |
+| 27d | `CalendarExecutor._run`'s blocking `.result()` runs inside `_scan_job` on the shared asyncio loop, freezing the feed, listener, and monitor for 47–57s per failed entry. |
+| 27e | The liquidity gate compares `ask_size` to the constant `MIN_LEG_ASK_SIZE = 1`, never to `candidate.qty` — qty 29 was approved into a book with 8 available. A leg quoting `ask_size == 0` skips the check entirely. |
+
+### New/changed files (27a)
+
+| File | Change |
+| --- | --- |
+| `execution/executor.py` | `_fetch_amount_info` steps options on `min_trade_amount`; + `_is_option_instrument`; + `resolve_amount_info`; richer `AmountBelowMinimumError` message |
+| `config.py` | Corrected the Phase 25a comment documenting `contract_size` as the step |
+| `config_test.py` | + `execution.executor: DEBUG` in `LOG_LEVEL_OVERRIDES` |
+| `tests/test_executor.py` | + `TestOptionAmountStep` (8 tests); `_amount_client` helper extracted for reuse |
+| `scratch/scratch_option_amount_step.py` | New — replays the logged BTC 0.2 failure old vs new, shows ETH unchanged, verifies against live metadata in test mode |
