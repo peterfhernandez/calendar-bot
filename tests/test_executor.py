@@ -1633,6 +1633,106 @@ class TestBothLegsFilledSlippageUnwind:
         assert mock_client.placed_orders[3]["direction"] == "sell"  # unwind far
 
 
+class TestWaitForFillPartialAware:
+    """
+    Phase 27b: _wait_for_fill must not declare a completing order a timeout.
+
+    Two defects covered: the all-or-nothing reliance on ``order_state``, and the
+    blind window created by sleeping the full backoff interval past the deadline.
+    """
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _client(self, states: list[dict]) -> AsyncMock:
+        client = AsyncMock()
+        client.get_order_state.side_effect = list(states)
+        return client
+
+    def test_full_fill_by_quantity_while_state_lags(self):
+        """The logged ETH-82752446337 case: 8.0000 of 8 filled, order_state still 'open'."""
+        from execution.executor import _wait_for_fill
+        client = self._client([
+            {"order_id": "e1", "order_state": "open", "amount": 8.0, "filled_amount": 8.0},
+        ])
+        state = self._run(_wait_for_fill(client, "e1", timeout=5, amount=8.0))
+        assert state["filled_amount"] == 8.0
+        assert client.get_order_state.await_count == 1
+
+    def test_amount_inferred_from_order_state_when_not_passed(self):
+        from execution.executor import _wait_for_fill
+        client = self._client([
+            {"order_id": "e1", "order_state": "open", "amount": 8.0, "filled_amount": 8.0},
+        ])
+        state = self._run(_wait_for_fill(client, "e1", timeout=5))
+        assert state["order_id"] == "e1"
+
+    def test_partial_fill_is_not_treated_as_filled(self):
+        from execution.executor import _wait_for_fill
+        client = self._client([
+            {"order_id": "e1", "order_state": "open", "amount": 8.0, "filled_amount": 3.0},
+            {"order_id": "e1", "order_state": "open", "amount": 8.0, "filled_amount": 3.0},
+        ])
+        with pytest.raises(OrderTimeoutError) as exc:
+            self._run(_wait_for_fill(client, "e1", timeout=1, amount=8.0))
+        assert exc.value.filled_amount == 3.0
+        assert exc.value.amount == 8.0
+        assert "3.0000/8.0000" in str(exc.value)
+
+    def test_final_poll_happens_at_the_deadline(self):
+        """
+        A fill landing in the old blind window is now seen.
+
+        With a 0.05s timeout the old loop slept the full 1.0s backoff and exited
+        without re-polling; the state below only reports the fill on the *second*
+        poll, so this passes only if a poll happens at the deadline.
+        """
+        from execution.executor import _wait_for_fill
+        client = self._client([
+            {"order_id": "e1", "order_state": "open",   "amount": 8.0, "filled_amount": 0.0},
+            {"order_id": "e1", "order_state": "filled", "amount": 8.0, "filled_amount": 8.0},
+        ])
+        state = self._run(_wait_for_fill(client, "e1", timeout=0.05, amount=8.0))
+        assert state["order_state"] == "filled"
+        assert client.get_order_state.await_count == 2
+
+    def test_elapsed_does_not_overshoot_the_timeout(self):
+        """
+        The old backoff slept past the deadline (last observation t≈28.1s, exit
+        t≈33.1s on a 30s timeout).  Sleeps are now clamped to the time remaining.
+        """
+        from execution.executor import _wait_for_fill
+        open_state = {"order_id": "e1", "order_state": "open", "amount": 8.0, "filled_amount": 0.0}
+        client = AsyncMock()
+        client.get_order_state.return_value = open_state
+        started = time.monotonic()
+        with pytest.raises(OrderTimeoutError) as exc:
+            self._run(_wait_for_fill(client, "e1", timeout=2, amount=8.0))
+        wall = time.monotonic() - started
+        assert exc.value.elapsed_sec == pytest.approx(2.0, abs=0.3)
+        assert wall < 2.5           # old code overshot to ~2.5s on this schedule
+        assert "not filled after" in str(exc.value)
+
+    def test_cancelled_order_still_raises_runtime_error(self):
+        from execution.executor import _wait_for_fill
+        client = self._client([
+            {"order_id": "e1", "order_state": "cancelled", "amount": 8.0, "filled_amount": 0.0},
+        ])
+        with pytest.raises(RuntimeError) as exc:
+            self._run(_wait_for_fill(client, "e1", timeout=5, amount=8.0))
+        assert not isinstance(exc.value, OrderTimeoutError)
+
+    def test_zero_amount_order_falls_back_to_state_field(self):
+        """An unknown quantity must not be read as 'complete' at filled=0."""
+        from execution.executor import _wait_for_fill
+        client = AsyncMock()
+        client.get_order_state.return_value = {"order_id": "e1", "order_state": "open"}
+        with pytest.raises(OrderTimeoutError) as exc:
+            self._run(_wait_for_fill(client, "e1", timeout=1))
+        assert exc.value.filled_amount == 0.0
+        assert exc.value.amount is None
+
+
 class TestCancelledPartialState:
     """Phase 26a: order_manager exposes the CANCELLED_PARTIAL terminal state."""
 

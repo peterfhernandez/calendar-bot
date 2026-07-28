@@ -1790,9 +1790,11 @@ Also: a roll-failure close is recorded as `result='Loss (Auto Stop)'` purely bec
 
 ## Phase 27 — Option Amount Step Blocks All BTC Entries
 
-**Status:** 27a complete (the BTC entry blocker); 27b–27e identified and
-documented, not yet implemented. Checklist in BOT_TODO.md Phase 27. Offline
-demo: `python -m scratch.scratch_option_amount_step` (no live orders).
+**Status:** 27a complete (the BTC entry blocker); 27b complete (the fill-wait
+defect that unwound a fully-filled leg); 27c–27e identified and documented, not
+yet implemented. Checklist in BOT_TODO.md Phase 27. Offline demos:
+`python -m scratch.scratch_option_amount_step` and
+`python -m scratch.scratch_wait_for_fill` (no live orders).
 
 ### How this was found
 
@@ -1855,11 +1857,59 @@ resolved `(min, step)` pair.
   name both the minimum and the step in the rejection message.
 - Resolved amount info is logged at DEBUG per instrument.
 
+### Root cause (27b)
+
+`_wait_for_fill` decided an order's fate on two things, and both were wrong.
+
+**All-or-nothing fill detection.** The only success condition was
+`order_state == "filled"`. Deribit's `order_state` field can lag the last fill,
+so an order that has *fully* filled by quantity is still reported `open` for a
+short window. Occurrence 2 in the log (`ETH-82752446337`, qty 8) reported
+`8.0000 filled` on the cancel that followed — a complete fill — yet the wait had
+already raised `OrderTimeoutError`. The caller then unwound the far leg at a
+crossed price *and* fired a `FLATTEN-NEAR` against a near leg that had filled
+correctly: a round trip through the spread on both legs, for nothing.
+
+**A blind window before the deadline.** The poll interval starts at 1.0s and
+backs off by ×1.5 (capped at 5.0s), and the loop slept the full interval
+regardless of how much of the timeout was left:
+
+```text
+poll t=0.0  sleep 1.0 → poll t=1.0  sleep 1.5 → poll t=2.5  sleep 2.25
+→ poll t=4.75 … → poll t=28.1  sleep 5.0 → loop exits t=33.1  (30s timeout)
+```
+
+The last state observation lands at t≈28.1s while the loop does not give up
+until t≈33.1s, so a fill completing in those ~5s is never seen. The log timing
+corroborates it exactly: the 06:17:58 fallback → 06:18:32 error gap is 34s, not
+the 30s the message claimed — and the message claimed the nominal timeout
+because it was formatted from `timeout`, not from measured elapsed time.
+
+### Fix (27b)
+
+- Completion is detected by **quantity** as well as by state: when
+  `filled_amount >= amount` the order is treated as filled (logged at INFO,
+  naming the lagging `order_state`, so the condition stays visible in the log).
+  `_wait_for_fill` takes the submitted `amount`, threaded through all seven call
+  sites (combo, entry near/far, close near/far, roll close/open), and falls back
+  to the order's own `amount` field when it is not supplied.
+- The sleep is clamped to the time remaining (`min(poll_interval, remaining)`),
+  so the loop always polls once more *at* the deadline before raising — the
+  blind window is closed without changing the backoff schedule elsewhere.
+- `OrderTimeoutError` carries `order_id`, `filled_amount`, `amount`, and
+  `elapsed_sec`; its message reports measured elapsed time and fill progress
+  (`Order X not filled after 33.1s (timeout 30s, filled 3.0000/8.0000)`), so a
+  genuinely dead order is distinguishable from one that was still filling.
+
+A genuine partial fill still times out and still goes through Phase 26a's
+`_cancel_and_flatten`, which re-reads `filled_amount` after the cancel — that
+remains the authoritative figure for the flatten, since more can fill between the
+final poll and the cancel.
+
 ### Remaining findings from the same analysis
 
 | Sub-phase | Finding |
 | --- | --- |
-| 27b | `_wait_for_fill` is all-or-nothing and blind for ~5s before its deadline. `ETH-82752446337` reported `8.0000 filled` of 8 — a complete fill — yet was declared a timeout and unwound at a crossed price, with a `FLATTEN-NEAR` fired against a correctly-filled near leg. |
 | 27c | The combo path fails ~2s after RANK approval on every entry (vs. a 30s `COMBO_FILL_TIMEOUT_SEC`), so `create_combo`/combo `place_order` is raising. Both paths log at DEBUG; 27a enables `execution.executor: DEBUG` in `config_test.py` to surface the reason. |
 | 27d | `CalendarExecutor._run`'s blocking `.result()` runs inside `_scan_job` on the shared asyncio loop, freezing the feed, listener, and monitor for 47–57s per failed entry. |
 | 27e | The liquidity gate compares `ask_size` to the constant `MIN_LEG_ASK_SIZE = 1`, never to `candidate.qty` — qty 29 was approved into a book with 8 available. A leg quoting `ask_size == 0` skips the check entirely. |
@@ -1873,3 +1923,11 @@ resolved `(min, step)` pair.
 | `config_test.py` | + `execution.executor: DEBUG` in `LOG_LEVEL_OVERRIDES` |
 | `tests/test_executor.py` | + `TestOptionAmountStep` (8 tests); `_amount_client` helper extracted for reuse |
 | `scratch/scratch_option_amount_step.py` | New — replays the logged BTC 0.2 failure old vs new, shows ETH unchanged, verifies against live metadata in test mode |
+
+### New/changed files (27b)
+
+| File | Change |
+| --- | --- |
+| `execution/executor.py` | `_wait_for_fill` detects completion by quantity, clamps its sleep to the deadline and polls once more there, and reports true elapsed time; + `_state_filled_amount`/`_state_order_amount`; `amount` threaded through all seven call sites; `OrderTimeoutError` carries `order_id`/`filled_amount`/`amount`/`elapsed_sec` |
+| `tests/test_executor.py` | + `TestWaitForFillPartialAware` (7 tests) |
+| `scratch/scratch_wait_for_fill.py` | New — replays the logged `ETH-82752446337` fill, the blind-window fill, and the honest-elapsed timeout (11 offline checks) |

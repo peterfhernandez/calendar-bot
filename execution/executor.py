@@ -81,7 +81,27 @@ class LegRiskError(Exception):
 
 
 class OrderTimeoutError(Exception):
-    """Order not fully filled within ORDER_TIMEOUT_SEC seconds."""
+    """
+    Order not fully filled within ORDER_TIMEOUT_SEC seconds.
+
+    Carries the fill progress observed on the final poll (Phase 27b) so callers
+    and log readers can tell a genuinely dead order from one that was still
+    filling when the deadline expired.
+    """
+
+    def __init__(
+        self,
+        message:       str,
+        order_id:      str | None = None,
+        filled_amount: float = 0.0,
+        amount:        float | None = None,
+        elapsed_sec:   float = 0.0,
+    ) -> None:
+        super().__init__(message)
+        self.order_id      = order_id
+        self.filled_amount = filled_amount
+        self.amount        = amount
+        self.elapsed_sec   = elapsed_sec
 
 
 # ── Internal fill result ──────────────────────────────────────────────────────
@@ -555,29 +575,101 @@ def _check_slippage(
         )
 
 
+def _state_filled_amount(state: dict) -> float:
+    """Filled quantity reported on a Deribit order-state object (0.0 if absent)."""
+    try:
+        return float(state.get("filled_amount", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _state_order_amount(state: dict) -> float:
+    """Total ordered quantity reported on a Deribit order-state object."""
+    try:
+        return float(state.get("amount", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 async def _wait_for_fill(
-    client: _DeribitRPCClient,
+    client:   _DeribitRPCClient,
     order_id: str,
-    timeout: int = ORDER_TIMEOUT_SEC,
+    timeout:  int = ORDER_TIMEOUT_SEC,
+    amount:   float | None = None,
 ) -> dict:
     """
     Poll Deribit until the order is fully filled or the timeout expires.
 
     Returns the final order state dict.
     Raises OrderTimeoutError if not filled in time.
+
+    Phase 27b — two defects fixed here:
+
+    1. **Blind window before the deadline.**  The poll interval backs off
+       (1.0s → ×1.5, capped at 5.0s) and the old loop slept the *full* interval
+       regardless of how much time was left, so with a 30s timeout the last
+       state observation landed at t≈28.1s while the loop did not give up until
+       t≈33.1s — roughly five seconds in which a completing fill was invisible.
+       The sleep is now clamped to the remaining time and the loop always polls
+       once more *at* the deadline before raising, so a fill that lands in that
+       window is seen.
+
+    2. **All-or-nothing fill detection.**  Only ``order_state == "filled"`` was
+       accepted.  A fully-filled order whose state field had not yet flipped
+       (observed on ``ETH-82752446337``: ``8.0000`` of 8 filled, still declared a
+       timeout, unwound at a crossed price, and a ``FLATTEN-NEAR`` fired against
+       a correctly-filled near leg) is now recognised by comparing
+       ``filled_amount`` against the ordered quantity.
+
+    ``amount`` is the quantity submitted; when omitted the order's own ``amount``
+    field from the state response is used.  On timeout the raised
+    ``OrderTimeoutError`` reports the true elapsed time and the fill progress.
     """
-    deadline = time.monotonic() + timeout
+    started       = time.monotonic()
+    deadline      = started + timeout
     poll_interval = 1.0
-    while time.monotonic() < deadline:
-        state = await client.get_order_state(order_id)
+    filled        = 0.0
+    target        = amount if (amount or 0) > 0 else 0.0
+
+    while True:
+        state       = await client.get_order_state(order_id)
         order_state = state.get("order_state", "")
+        filled      = _state_filled_amount(state)
+        if target <= 0:
+            target = _state_order_amount(state)
+
         if order_state == "filled":
             return state
+
+        # Quantity-based completion: the state field can lag the last fill.
+        if target > 0 and filled + 1e-9 >= target:
+            logger.info(
+                "Order %s fully filled by quantity (%.4f/%.4f) while order_state=%r "
+                "— treating as filled",
+                order_id, filled, target, order_state,
+            )
+            return state
+
         if order_state in ("cancelled", "rejected"):
             raise RuntimeError(f"Order {order_id} {order_state}")
-        await asyncio.sleep(poll_interval)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Never sleep past the deadline: the next iteration is the final poll.
+        await asyncio.sleep(min(poll_interval, remaining))
         poll_interval = min(poll_interval * 1.5, 5.0)
-    raise OrderTimeoutError(f"Order {order_id} not filled after {timeout}s")
+
+    elapsed  = time.monotonic() - started
+    progress = f"{filled:.4f}/{target:.4f}" if target > 0 else f"{filled:.4f}"
+    raise OrderTimeoutError(
+        f"Order {order_id} not filled after {elapsed:.1f}s "
+        f"(timeout {timeout}s, filled {progress})",
+        order_id=order_id,
+        filled_amount=filled,
+        amount=target if target > 0 else None,
+        elapsed_sec=elapsed,
+    )
 
 
 async def _cancel_and_flatten(
@@ -717,7 +809,7 @@ async def _async_enter_spread_combo(
         ))
 
         try:
-            final_state = await _wait_for_fill(client, combo_order_id, combo_timeout)
+            final_state = await _wait_for_fill(client, combo_order_id, combo_timeout, amount=amount)
         except OrderTimeoutError:
             logger.info("Combo order timed out after %ds — falling back to individual legs", combo_timeout)
             try:
@@ -893,7 +985,7 @@ async def _async_enter_spread(
         assert near_order_id
 
         try:
-            near_state = await _wait_for_fill(client, near_order_id, order_timeout)
+            near_state = await _wait_for_fill(client, near_order_id, order_timeout, amount=amount)
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.error("Near leg fill failed: %s — cancelling", exc)
             # Flatten any partial fill (Phase 26a): the near leg is a SELL, so a
@@ -948,7 +1040,7 @@ async def _async_enter_spread(
             raise LegRiskError("Far leg failed; near leg closed")
 
         try:
-            far_state = await _wait_for_fill(client, far_order_id, order_timeout)
+            far_state = await _wait_for_fill(client, far_order_id, order_timeout, amount=amount)
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.error("Far leg fill failed: %s — flattening far partial + closing near leg", exc)
             # Flatten any partial far fill (Phase 26a): far is a BUY, so a partial
@@ -1123,7 +1215,7 @@ async def _async_close_spread(
 
         # Wait for near leg fill
         try:
-            near_state = await _wait_for_fill(client, near_close_id, order_timeout)
+            near_state = await _wait_for_fill(client, near_close_id, order_timeout, amount=amount)
             near_filled = True
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.warning("Near leg close timed out: %s — cancelling + flattening any partial", exc)
@@ -1139,7 +1231,7 @@ async def _async_close_spread(
 
         # Wait for far leg fill
         try:
-            far_state = await _wait_for_fill(client, far_close_id, order_timeout)
+            far_state = await _wait_for_fill(client, far_close_id, order_timeout, amount=amount)
             far_filled = True
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.warning("Far leg close timed out: %s — cancelling + flattening any partial", exc)
@@ -1265,7 +1357,7 @@ async def _async_roll_near_leg(
         ))
 
         try:
-            await _wait_for_fill(client, close_id, order_timeout)
+            await _wait_for_fill(client, close_id, order_timeout, amount=amount)
             order_manager.update(close_id, OrderState.FILLED)
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.error("Roll: close of near leg failed: %s — flattening any partial", exc)
@@ -1292,7 +1384,7 @@ async def _async_roll_near_leg(
         ))
 
         try:
-            await _wait_for_fill(client, sell_id, order_timeout)
+            await _wait_for_fill(client, sell_id, order_timeout, amount=amount)
             order_manager.update(sell_id, OrderState.FILLED)
         except (OrderTimeoutError, RuntimeError) as exc:
             logger.error("Roll: open of new near leg failed: %s — flattening any partial", exc)
