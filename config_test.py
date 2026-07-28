@@ -224,6 +224,7 @@ LOG_LEVEL_OVERRIDES = {
     "strategy.decision": "DEBUG",
     "strategy.sizer":    "DEBUG",
     "apscheduler.executors.default": "DEBUG",
+    "execution.executor": "DEBUG",
 }
 
 # ── Network / timeout / retry constants (Phase 20b + 20c) ─────────────────────
