@@ -1309,6 +1309,24 @@ class TestForceClosePnLFix:
 
 # ── Tests: amount validation (Phase 25a/25b) ──────────────────────────────────
 
+def _amount_client(meta: dict | Exception):
+    """Build a _DeribitRPCClient whose public/get_instrument returns *meta*."""
+    from execution.executor import _DeribitRPCClient, _AMOUNT_INFO_CACHE
+    _AMOUNT_INFO_CACHE.clear()
+    client = _DeribitRPCClient()
+
+    async def fake_rpc(method, params):
+        if method == "public/get_instrument":
+            if isinstance(meta, Exception):
+                raise meta
+            return meta
+        # order placement echo
+        return {"order": {"order_id": "x-1", "order_state": "open"}}
+
+    client._rpc = fake_rpc  # type: ignore[assignment]
+    return client
+
+
 class TestAmountValidation:
     """Per-instrument order-amount clamping and the AMOUNT GATE abort."""
 
@@ -1316,20 +1334,7 @@ class TestAmountValidation:
         return asyncio.run(coro)
 
     def _client_with_meta(self, meta: dict | Exception):
-        from execution.executor import _DeribitRPCClient, _AMOUNT_INFO_CACHE
-        _AMOUNT_INFO_CACHE.clear()
-        client = _DeribitRPCClient()
-
-        async def fake_rpc(method, params):
-            if method == "public/get_instrument":
-                if isinstance(meta, Exception):
-                    raise meta
-                return meta
-            # order placement echo
-            return {"order": {"order_id": "x-1", "order_state": "open"}}
-
-        client._rpc = fake_rpc  # type: ignore[assignment]
-        return client
+        return _amount_client(meta)
 
     def test_clamp_amount_uses_live_min(self):
         client = self._client_with_meta({"min_trade_amount": 1.0, "contract_size": 1.0})
@@ -1359,6 +1364,83 @@ class TestAmountValidation:
             client.place_order("COMBO-X", "buy", 0.1, 0.01, validate_amount=False)
         )
         assert result["order"]["order_id"] == "x-1"
+
+
+# ── Tests: option amount step is min_trade_amount, not contract_size ──────────
+
+class TestOptionAmountStep:
+    """
+    Regression cover for the BTC entry blocker (Phase 27).
+
+    A Deribit option reports ``contract_size = 1`` (underlying per contract) and
+    ``min_trade_amount = 0.1`` for BTC.  Treating ``contract_size`` as the amount
+    step floored every sub-1-BTC order to zero, so a sizer-approved ``0.2`` was
+    rejected as "below exchange minimum" despite the real minimum being ``0.1``.
+    ETH masked it because both fields are ``1`` there.
+    """
+
+    # Live BTC option metadata: the two fields genuinely differ.
+    BTC_META = {"min_trade_amount": 0.1, "contract_size": 1.0, "kind": "option"}
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _client_with_meta(self, meta: dict | Exception):
+        return _amount_client(meta)
+
+    def test_btc_option_step_is_min_trade_amount_not_contract_size(self):
+        client = self._client_with_meta(self.BTC_META)
+        info = self._run(client._fetch_amount_info("BTC-31JUL26-64000-P"))
+        assert info == (0.1, 0.1)  # step tracks min_trade_amount, not contract_size
+
+    def test_btc_option_quarter_size_is_submittable(self):
+        """The exact log scenario: qty=0.2 must survive the gate, not floor to 0."""
+        client = self._client_with_meta(self.BTC_META)
+        out = self._run(client.clamp_amount("BTC-31JUL26-64000-P", 0.2))
+        assert out == pytest.approx(0.2)
+
+    def test_btc_option_place_order_does_not_raise_amount_gate(self):
+        client = self._client_with_meta(self.BTC_META)
+        result = self._run(
+            client.place_order("BTC-31JUL26-64000-P", "buy", 0.2, 0.01)
+        )
+        assert result["order"]["order_id"] == "x-1"
+
+    def test_btc_option_rounds_down_to_tenth_step(self):
+        client = self._client_with_meta(self.BTC_META)
+        out = self._run(client.clamp_amount("BTC-31JUL26-64000-P", 0.37))
+        assert out == pytest.approx(0.3)
+
+    def test_btc_option_below_real_minimum_still_rejected(self):
+        """The gate must still fire for a genuinely sub-minimum amount."""
+        client = self._client_with_meta(self.BTC_META)
+        assert self._run(client.clamp_amount("BTC-31JUL26-64000-P", 0.05)) is None
+
+    def test_future_still_uses_contract_size_as_step(self):
+        """Futures are the one case where contract_size *is* the step."""
+        client = self._client_with_meta(
+            {"min_trade_amount": 10.0, "contract_size": 10.0, "kind": "future"}
+        )
+        info = self._run(client._fetch_amount_info("BTC-PERPETUAL"))
+        assert info == (10.0, 10.0)
+
+    def test_option_detected_from_name_when_kind_absent(self):
+        """A missing 'kind' must not fall through to the futures reading."""
+        client = self._client_with_meta(
+            {"min_trade_amount": 0.1, "contract_size": 1.0}  # no "kind"
+        )
+        info = self._run(client._fetch_amount_info("BTC-31JUL26-64000-C"))
+        assert info == (0.1, 0.1)
+
+    def test_amount_gate_message_names_minimum_and_step(self):
+        """The old message claimed 0.2 was 'below minimum' when the min was 0.1."""
+        client = self._client_with_meta(
+            {"min_trade_amount": 1.0, "contract_size": 1.0, "kind": "option"}
+        )
+        with pytest.raises(AmountBelowMinimumError) as exc:
+            self._run(client.place_order("ETH-31JUL26-2050-C", "buy", 0.5, 0.01))
+        msg = str(exc.value)
+        assert "minimum 1.0" in msg and "step 1.0" in msg
 
 
 # ── Tests: close_spread stashes fill prices (Phase 25c) ───────────────────────

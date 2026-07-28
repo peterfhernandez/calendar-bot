@@ -1483,3 +1483,109 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 - [x] `tests/test_config_centralization.py`: new keys present in both `config.py` and `config_test.py`
 - [x] Add `scratch/scratch_partial_fill_flatten.py` — demonstrates timeout-cancel partial-fill flatten (aborts in live)
 - [x] Add `scratch/scratch_roll_resilience.py` — replays the trade 14/15/16/208 roll scenarios showing hold-and-retry instead of first-tick liquidation
+
+---
+
+## Phase 27 — Option Amount Step Blocks All BTC Entries
+
+**Status:** 27a complete (the BTC entry blocker). 27b–27d are the remaining
+findings from the same log analysis, not yet started. Full root-cause detail in
+[BOT_PLAN.md Phase 27](BOT_PLAN.md#phase-27--option-amount-step-blocks-all-btc-entries).
+
+Found by analysing `logs/bot_test.log.1` for the two `LegRiskError: Far leg
+timeout` alerts on 2026-07-26 20:03 and 2026-07-27 06:18. Those alerts led to a
+separate and more damaging defect: **no BTC order reached the exchange at all**
+during the run. Every BTC entry aborted at the amount gate:
+
+```text
+RANK approved: BTC Put strike=64000  qty=0.2  ev=-0.0713
+AMOUNT GATE: entry aborted — amount 0.2 below exchange minimum for BTC-31JUL26-64000-P
+```
+
+0.2 is twice the real BTC option minimum of 0.1, so the message was wrong on its
+face. `_DeribitRPCClient._fetch_amount_info` derived the amount step as
+`meta.get("contract_size") or min_amt`. A Deribit **option** reports
+`contract_size = 1` (underlying per contract) and `min_trade_amount = 0.1` for
+BTC — `contract_size` is not the order-amount granularity. Reading it as the step
+quantised BTC orders to whole BTC, so `_clamp_amount_to_step(0.2, 0.1, 1.0)`
+floored to `0.0` and returned `None`. ETH concealed the bug completely: there
+`min_trade_amount` and `contract_size` are both `1`, so both readings agree —
+which is why every observed `LegRiskError` was ETH and BTC simply never traded.
+
+### 27a — Option amount step is `min_trade_amount`, not `contract_size`
+
+- [x] `execution/executor.py::_fetch_amount_info` — options step on
+      `min_trade_amount`; futures/perpetuals keep `contract_size` as the step
+- [x] Add `_is_option_instrument(instrument, kind)` — prefers the API `kind`
+      field, falls back to the `-C`/`-P` instrument-name suffix so a missing
+      `kind` cannot silently fall through to the futures reading
+- [x] Split `resolve_amount_info()` out of `clamp_amount()` so the
+      `AmountBelowMinimumError` message can name the minimum *and* the step —
+      the old text reported 0.2 as "below exchange minimum" when the minimum was
+      0.1 and the step was what actually rejected it
+- [x] Log resolved amount info at DEBUG per instrument
+- [x] `config.py` — correct the Phase 25a comment that documented
+      `contract_size` as the step
+- [x] `config_test.py` — add `execution.executor: DEBUG` to
+      `LOG_LEVEL_OVERRIDES`; root `LOG_LEVEL` is `WARNING`, which suppressed the
+      executor's entire INFO trail (`Submitting far leg BUY … amount=…`,
+      `Near leg filled`) and the DEBUG reason a combo order fails
+- [x] `tests/test_executor.py::TestOptionAmountStep` (8 tests) — BTC option step
+      resolves to 0.1; qty 0.2 is submittable and reaches `place_order`; 0.37
+      rounds to 0.3; genuinely sub-minimum 0.05 still rejected; futures still
+      step on `contract_size`; option detected from name when `kind` absent;
+      error message names minimum and step
+- [x] `scratch/scratch_option_amount_step.py` — replays the logged BTC 0.2
+      failure through the old and new derivations side by side, shows ETH is
+      unchanged, and (in test mode with credentials) confirms against live
+      exchange metadata. Aborts in live mode.
+- [x] Full suite green: 690 passing (682 baseline + 8 new)
+
+### 27b — `_wait_for_fill` is all-or-nothing and blind at the deadline
+
+- [ ] `_wait_for_fill` treats "not 100% filled at the last poll" as total
+      failure. Occurrence 2 (`ETH-82752446337`, qty 8) reported
+      `8.0000 filled` on cancel — a **complete** fill — yet was declared a
+      timeout, unwound at a crossed price, and triggered a `FLATTEN-NEAR` on a
+      near leg that had filled correctly: a round trip through the spread on
+      both legs for nothing
+- [ ] The `poll_interval * 1.5` backoff (capped at 5.0s) puts the last state
+      observation at t≈28.1s while the loop does not exit until t≈33.1s — a ~5s
+      window in which a completing fill is invisible. Log timing corroborates:
+      fallback 06:17:58 → error 06:18:32 is 34s, not the 30s the message claims
+- [ ] Make the wait partial-fill aware, poll once more immediately before
+      giving up, and report the true elapsed time in the timeout message
+
+### 27c — Combo path fails on every entry, and the reason is invisible
+
+- [ ] `RANK approved` → `Falling back to individual legs` is consistently ~2s
+      (06:17:56→06:17:58, 05:52:56→05:52:57, 06:02:56→06:02:58), far too fast
+      for `COMBO_FILL_TIMEOUT_SEC = 30` — so `create_combo` or the combo
+      `place_order` is raising, not timing out
+- [ ] Both failure paths log at DEBUG (`executor.py:646, 661`). 27a enables
+      `execution.executor: DEBUG` in `config_test.py`, which will surface the
+      reason on the next occurrence
+- [ ] Every entry is currently taking the individual-leg path that BOT_PLAN §5
+      designates as a rare last resort requiring both legs to be liquid
+
+### 27d — Blocking `.result()` freezes the shared event loop
+
+- [ ] `CalendarExecutor._run` (`executor.py:1329`) calls
+      `pool.submit(asyncio.run, coro).result()` — a blocking call — from
+      `_scan_job`, an `async def` on the AsyncIOScheduler loop. `bot.py` runs the
+      feed, scheduler, Telegram listener, and collector as tasks on that one loop
+- [ ] Measured impact: the two failed entries blocked the loop for **57s** and
+      **47s**, each losing a whole monitor tick
+      (`Run time of job "BotLoop._monitor_job" was missed by 0:00:46.679841`)
+      and freezing the WS feed, which then reports
+      `106 stale instrument(s) excluded from ETH chain` on the next tick
+- [ ] `trade_id=22` was at 63% of debit against a 50% hard stop during one of
+      those blind windows
+
+### 27e — Liquidity gate ignores the sized quantity
+
+- [ ] `decision.py:611-616` checks `ask_size >= MIN_LEG_ASK_SIZE` (constant `1`)
+      and never against `candidate.qty`. Occurrence 1 approved qty 29 into a book
+      with 8 available, producing the partial fill that timed out
+- [ ] A leg reporting `ask_size == 0` skips the check entirely rather than
+      failing it (`if far_snap.ask_size > 0:`)

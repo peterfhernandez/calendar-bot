@@ -238,8 +238,21 @@ class _DeribitRPCClient:
 
     async def _fetch_amount_info(self, instrument: str) -> tuple[float, float] | None:
         """
-        Fetch and cache an instrument's ``min_trade_amount`` and amount step
-        (``contract_size``) from ``public/get_instrument`` (Phase 25a).
+        Fetch and cache an instrument's ``min_trade_amount`` and amount step from
+        ``public/get_instrument`` (Phase 25a).
+
+        For **options** the amount step is ``min_trade_amount`` — *not*
+        ``contract_size``.  On Deribit, an option's ``contract_size`` is the
+        quantity of underlying per contract (always ``1``), which has nothing to
+        do with the granularity an order amount must land on.  Reading it as the
+        step quantised BTC option orders to whole BTC: a sizer-approved ``0.2``
+        floored to ``0.0`` and was rejected as "below exchange minimum" even
+        though the real minimum is ``0.1``.  That silently blocked every BTC
+        entry while leaving ETH unaffected (there ``min_trade_amount`` and
+        ``contract_size`` are both ``1``, so the two readings coincide).
+
+        For **futures/perpetuals** ``contract_size`` *is* the step (e.g. $10
+        contracts), so it is still used for those.
 
         Returns ``(min_trade_amount, amount_step)`` or ``None`` on failure so the
         caller falls back to the static per-asset table in config.
@@ -252,17 +265,22 @@ class _DeribitRPCClient:
         if not isinstance(meta, dict):
             return None
         min_amt = meta.get("min_trade_amount")
-        step    = meta.get("contract_size") or min_amt
+        if _is_option_instrument(instrument, meta.get("kind")):
+            step = min_amt
+        else:
+            step = meta.get("contract_size") or min_amt
         if min_amt and step:
             info = (float(min_amt), float(step))
             _AMOUNT_INFO_CACHE[instrument] = info
+            logger.debug(
+                "Amount info for %s: min_trade_amount=%s step=%s", instrument, *info,
+            )
             return info
         return None
 
-    async def clamp_amount(self, instrument: str, amount: float) -> float | None:
+    async def resolve_amount_info(self, instrument: str) -> tuple[float, float]:
         """
-        Round ``amount`` down to the instrument's amount step and return it, or
-        ``None`` if the result is below the exchange minimum (Phase 25a).
+        Return the ``(min_trade_amount, amount_step)`` in force for *instrument*.
 
         Uses live ``public/get_instrument`` metadata (cached); on fetch failure
         falls back to ``config.DEFAULT_MIN_TRADE_AMOUNTS`` keyed by the asset and
@@ -278,7 +296,15 @@ class _DeribitRPCClient:
                 "AMOUNT GATE: could not fetch live minimum for %s — using static "
                 "fallback (min=%s, step=%s)", instrument, info[0], info[1],
             )
-        return _clamp_amount_to_step(amount, info[0], info[1])
+        return info
+
+    async def clamp_amount(self, instrument: str, amount: float) -> float | None:
+        """
+        Round ``amount`` down to the instrument's amount step and return it, or
+        ``None`` if the result is below the exchange minimum (Phase 25a).
+        """
+        min_amt, step = await self.resolve_amount_info(instrument)
+        return _clamp_amount_to_step(amount, min_amt, step)
 
     async def place_order(
         self,
@@ -296,8 +322,14 @@ class _DeribitRPCClient:
         if validate_amount:
             clamped = await self.clamp_amount(instrument, amount)
             if clamped is None:
+                # Name the minimum *and* the step: an amount can be above the
+                # minimum yet still unsubmittable because it floors below it
+                # (0.2 with a 1.0 step → 0.0), and the old message reported
+                # that as "below exchange minimum", which was actively wrong.
+                min_amt, step = await self.resolve_amount_info(instrument)
                 raise AmountBelowMinimumError(
-                    f"amount {amount} below exchange minimum for {instrument}"
+                    f"amount {amount} not submittable for {instrument} "
+                    f"(exchange minimum {min_amt}, step {step})"
                 )
             amount = clamped
 
@@ -371,6 +403,22 @@ def _asset_from_instrument(instrument: str) -> str:
     now submits the sizer-approved qty directly instead of recomputing it.)
     """
     return instrument.split("-", 1)[0].upper() if instrument else ""
+
+
+def _is_option_instrument(instrument: str, kind: str | None = None) -> bool:
+    """
+    Return True when *instrument* is a Deribit option.
+
+    Prefers the ``kind`` field from ``public/get_instrument`` when present and
+    falls back to the instrument name, whose option form always ends in ``-C``
+    or ``-P`` (e.g. ``BTC-31JUL26-64000-P``).  The name fallback matters because
+    a missing/unrecognised ``kind`` must not silently fall through to the
+    futures reading of ``contract_size`` — this bot only trades options, and
+    that mis-read is exactly what blocked every BTC entry.
+    """
+    if kind:
+        return kind.strip().lower() == "option"
+    return instrument.strip().upper().endswith(("-C", "-P"))
 
 
 def _clamp_amount_to_step(amount: float, min_amount: float, step: float) -> float | None:

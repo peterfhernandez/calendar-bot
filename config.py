@@ -389,14 +389,19 @@ MIN_CONTRACT_SIZE      = 0.1    # config-level sanity floor on contract size (BT
 STRIKE_CORRELATION_PCT = 0.05   # positions within ±5% of an open strike are correlated
 
 # ── Phase 25a/25b — per-instrument order-amount validation ────────────────────
-# Deribit enforces a per-instrument minimum trade amount and amount step (from
-# public/get_instrument: min_trade_amount / contract_size).  BTC options accept
-# 0.1 in 0.1 steps; ETH options require a minimum of 1 in integer steps; an
-# amount below the minimum is rejected at the exchange with "-32602 Invalid
+# Deribit enforces a per-instrument minimum trade amount and amount step.  For
+# OPTIONS both come from public/get_instrument's min_trade_amount: BTC options
+# accept 0.1 in 0.1 steps; ETH options require a minimum of 1 in integer steps.
+# An amount below the minimum is rejected at the exchange with "-32602 Invalid
 # params" — which is exactly what collapsed every ETH entry in the 2026-07 test
 # run.  The executor fetches the live values per instrument and clamps the
 # sizer-approved qty to them.  These static fallbacks are used only when the
 # live metadata fetch fails, and the fallback is logged loudly.
+#
+# Note (Phase 27): an option's contract_size is the underlying per contract
+# (always 1) and is NOT the amount step — reading it as the step floored BTC
+# orders to whole BTC and blocked every BTC entry.  It is the step for
+# futures/perpetuals only.  Keep the (min, step) pairs below in that shape.
 DEFAULT_MIN_TRADE_AMOUNTS = {   # asset → (min_trade_amount, amount_step)
     "BTC": (0.1, 0.1),
     "ETH": (1.0, 1.0),

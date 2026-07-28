@@ -224,6 +224,11 @@ LOG_LEVEL_OVERRIDES = {
     "strategy.decision": "DEBUG",
     "strategy.sizer":    "DEBUG",
     "apscheduler.executors.default": "DEBUG",
+    # Root LOG_LEVEL is WARNING here, which suppressed the executor's whole INFO
+    # trail — "Submitting far leg BUY … amount=…", "Near leg filled", and the
+    # DEBUG-level reason a combo order fails.  Without it a legged-entry failure
+    # is only visible as its final ERROR, with no way to see the order amount or
+    # why the combo path was abandoned.
     "execution.executor": "DEBUG",
 }
 
