@@ -1489,7 +1489,8 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 ## Phase 27 — Option Amount Step Blocks All BTC Entries
 
 **Status:** 27a complete (the BTC entry blocker); 27b complete (the fill-wait
-defect that unwound a fully-filled leg). 27c–27e are the remaining findings from
+defect that unwound a fully-filled leg); 27c complete (the combo path that
+failed silently on every entry). 27d–27e are the remaining findings from
 the same log analysis, not yet started. Full root-cause detail in
 [BOT_PLAN.md Phase 27](BOT_PLAN.md#phase-27--option-amount-step-blocks-all-btc-entries).
 
@@ -1583,15 +1584,57 @@ which is why every observed `LegRiskError` was ETH and BTC simply never traded.
 
 ### 27c — Combo path fails on every entry, and the reason is invisible
 
-- [ ] `RANK approved` → `Falling back to individual legs` is consistently ~2s
+- [x] `RANK approved` → `Falling back to individual legs` is consistently ~2s
       (06:17:56→06:17:58, 05:52:56→05:52:57, 06:02:56→06:02:58), far too fast
       for `COMBO_FILL_TIMEOUT_SEC = 30` — so `create_combo` or the combo
       `place_order` is raising, not timing out
-- [ ] Both failure paths log at DEBUG (`executor.py:646, 661`). 27a enables
-      `execution.executor: DEBUG` in `config_test.py`, which will surface the
-      reason on the next occurrence
-- [ ] Every entry is currently taking the individual-leg path that BOT_PLAN §5
-      designates as a rare last resort requiring both legs to be liquid
+- [x] **Root cause found by inspection, confirmed against the live exchange.**
+      `public/get_combos` (both test.deribit.com and www.deribit.com) returns a
+      combo as `{"id": "BTC-CCAL-25DEC26_31JUL26-115000", "state": "active",
+      "legs": [{"instrument_name": "...", "amount": -1}, {..., "amount": 1}]}`.
+      Two mismatches against what the executor did:
+      1. **Identifier field.** `_async_enter_spread_combo` read
+         `combo_result.get("combo_id") or combo_result.get("instrument_name")`
+         — Deribit returns neither, so *every successful* `create_combo` was
+         discarded on the "returned no combo_id" branch, well inside the ~2s
+         observed. Fixed by `_combo_id_from_result()`, which reads `id` and
+         accepts the two old names as aliases.
+      2. **Leg ratio vs trade size.** The legs were sent with
+         `amount=candidate.qty`. A combo's legs define its *ratio* in small
+         integers; the traded size belongs on the order placed against the combo
+         instrument. A fractional ratio (BTC `0.2`) is not a valid definition,
+         and even where accepted would mint a distinct combo per position size.
+         Fixed by `_combo_ratio_legs()` — always 1:1 (sell near / buy far) —
+         with the sized qty submitted on the combo order
+- [x] Both failure paths logged at DEBUG (invisible under the root `WARNING`
+      level, which is why a path failing on 100% of entries went unnoticed).
+      Every combo failure — create, placement, rejection, timeout — now logs at
+      WARNING as `COMBO: <reason> — falling back to individual legs`, and the
+      reason is threaded back to the caller via a `reason_sink` so the
+      individual-leg fallback WARNING names it instead of the generic
+      "(combo timed out or unavailable)"
+- [x] Successful-fill leg attribution corrected while the path was dead: Deribit
+      reports a combo fill as a single **net** price with no per-leg breakdown,
+      and the old fallback recorded the near leg at the net-debit limit and the
+      far leg at *twice* it — figures unrelated to either fill, feeding fees and
+      P&L. `_combo_leg_fills()` now uses an explicit per-leg breakdown when
+      present, otherwise attributes the near leg its intended limit price and
+      derives the far leg so `far - near` equals the net actually filled
+- [x] Every entry is currently taking the individual-leg path that BOT_PLAN §5
+      designates as a rare last resort requiring both legs to be liquid — with
+      the combo id and ratio fixed, the combo is attempted properly and the
+      fallback is reached only on a real combo failure, now named in the log
+- [x] `tests/test_executor.py::TestComboIdentifierAndRatio` (7 tests) — the real
+      `{"id": ...}` response drives the path; legs are a 1:1 integer ratio while
+      the order carries the sized qty; a missing id reports the keys it did
+      carry, at WARNING; a raising `create_combo` surfaces the exception text;
+      the fallback WARNING names the combo reason; leg fills derived from the
+      net price satisfy `far - near == net`; an explicit per-leg breakdown wins
+- [x] `scratch/scratch_combo_path.py` — offline demo (13 checks, no network, no
+      live orders) contrasting the old and new identifier lookup on a real
+      Deribit response, showing the 1:1 ratio, running the combo path end to end,
+      and printing the now-visible WARNING. Aborts in live mode.
+- [x] Full suite green: 704 passing (697 baseline + 7 new)
 
 ### 27d — Blocking `.result()` freezes the shared event loop
 

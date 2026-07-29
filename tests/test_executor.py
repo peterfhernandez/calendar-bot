@@ -44,6 +44,8 @@ from execution.executor import (
     _usd_price,
     _async_enter_spread,
     _async_enter_spread_combo,
+    _combo_id_from_result,
+    _combo_leg_fills,
     _async_close_spread,
     _async_roll_near_leg,
 )
@@ -827,6 +829,154 @@ class TestComboOrder:
             )
 
         assert result is None
+
+
+class TestComboIdentifierAndRatio:
+    """
+    Phase 27c — the combo path failed on every entry and said nothing about it.
+
+    Deribit returns a created combo's identifier as ``id`` (verified against
+    ``public/get_combos``: ``{"id": "BTC-CCAL-25DEC26_31JUL26-115000", "legs":
+    [{"instrument_name": ..., "amount": -1}, ...]}``).  The executor read only
+    ``combo_id``/``instrument_name``, so every successful creation was discarded
+    as "no combo_id" and the entry fell through to the individual-leg path that
+    BOT_PLAN §5 designates a last resort — within ~2s, despite a 30s combo
+    timeout.  Both failure branches logged at DEBUG, invisible at the default
+    WARNING level.
+    """
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _combo_client(self, create_result, order_state=None):
+        state = order_state or {
+            "order_id": "combo-1", "order_state": "filled",
+            "average_price": 0.004, "amount": 0.2,
+        }
+
+        class ComboMockClient(_MockRPCClient):
+            combo_legs: list | None = None
+
+            async def create_combo(self, legs):
+                type(self).combo_legs = legs
+                if isinstance(create_result, Exception):
+                    raise create_result
+                return create_result
+
+            async def place_order(self, instrument, direction, amount, price, label="", validate_amount=True):
+                self.placed_orders.append(
+                    {"instrument": instrument, "direction": direction,
+                     "amount": amount, "price": price}
+                )
+                return {"order": {"order_id": "combo-1", "order_state": "open", "price": price}}
+
+            async def get_order_state(self, order_id):
+                return state
+
+        return ComboMockClient()
+
+    def _enter(self, client, reasons=None, amount=0.2):
+        with patch("execution.executor._DeribitRPCClient", return_value=client):
+            return self._run(
+                _async_enter_spread_combo(
+                    candidate=_make_candidate(),
+                    client_id="", client_secret="",
+                    order_manager=OrderManager(),
+                    amount=amount,
+                    net_debit_limit_index=0.004,
+                    combo_timeout=5,
+                    reason_sink=reasons,
+                )
+            )
+
+    def test_deribit_id_field_is_accepted(self):
+        """The real Deribit response shape ({"id": ...}) drives the combo path."""
+        client = self._combo_client(
+            {"id": "BTC-CCAL-28AUG26_31JUL26-100000", "state": "active", "legs": []}
+        )
+        result = self._enter(client)
+
+        assert result is not None
+        assert result["via_combo"] is True
+        assert client.placed_orders[0]["instrument"] == "BTC-CCAL-28AUG26_31JUL26-100000"
+
+    def test_combo_legs_are_integer_ratio_not_sized_quantity(self):
+        """Combo legs define a 1:1 ratio; the sized qty rides on the order."""
+        client = self._combo_client({"id": "BTC-CCAL-X", "state": "active"})
+        self._enter(client, amount=0.2)
+
+        legs = type(client).combo_legs
+        assert [l["amount"] for l in legs] == [1, 1]
+        assert [l["direction"] for l in legs] == ["sell", "buy"]
+        assert all(isinstance(l["amount"], int) for l in legs)
+        # The position size is carried by the order placed on the combo.
+        assert client.placed_orders[0]["amount"] == pytest.approx(0.2)
+
+    def test_missing_id_reports_reason_at_warning(self, caplog):
+        """A response with no usable id names the keys it did carry."""
+        reasons: list[str] = []
+        client = self._combo_client({"state": "active", "legs": []})
+        with caplog.at_level("WARNING", logger="execution.executor"):
+            result = self._enter(client, reasons=reasons)
+
+        assert result is None
+        assert reasons and "no usable combo id" in reasons[0]
+        assert any("COMBO:" in r.getMessage() for r in caplog.records)
+
+    def test_create_combo_exception_reason_captured(self):
+        """A raising create_combo surfaces the exception text as the reason."""
+        reasons: list[str] = []
+        client = self._combo_client(RuntimeError("Deribit error -32602: Invalid params"))
+        result = self._enter(client, reasons=reasons)
+
+        assert result is None
+        assert reasons and "-32602" in reasons[0]
+
+    def test_fallback_warning_names_the_combo_reason(self, caplog):
+        """_async_enter_spread's fallback WARNING says why the combo was skipped."""
+        mock_client = _MockRPCClient(   # create_combo raises by default
+            place_order_results=[
+                _submitted_order_result("near-1", 0.002),
+                _submitted_order_result("far-1",  0.006),
+            ],
+            order_states={
+                "near-1": [_filled_order_state("near-1", 0.002)],
+                "far-1":  [_filled_order_state("far-1",  0.006)],
+            },
+        )
+        with patch("execution.executor._DeribitRPCClient", return_value=mock_client), \
+             patch.object(config, "TRADING_MODE", "test"), \
+             caplog.at_level("WARNING", logger="execution.executor"):
+            result = self._run(
+                _async_enter_spread(
+                    _make_candidate(), client_id="", client_secret="",
+                    order_manager=OrderManager(), portfolio_value=50_000.0,
+                )
+            )
+
+        assert result is not None and result["via_combo"] is False
+        fallback = [r.getMessage() for r in caplog.records
+                    if "Falling back to individual legs" in r.getMessage()]
+        assert fallback and "create_combo" in fallback[0]
+
+    def test_leg_fills_derived_from_net_when_no_breakdown(self):
+        """Without a per-leg breakdown, far - near equals the net price filled."""
+        candidate = _make_candidate()
+        near, far = _combo_leg_fills(
+            {"order_state": "filled", "average_price": 0.005}, candidate, 0.004
+        )
+        assert far - near == pytest.approx(0.005)
+        # Near leg keeps its intended (limit) price; only the split is inferred.
+        assert near == pytest.approx(_index_price(candidate.near_bid, candidate.spot, candidate.asset))
+
+    def test_leg_fills_prefer_explicit_per_leg_prices(self):
+        """An explicit per-leg breakdown is used verbatim."""
+        near, far = _combo_leg_fills(
+            {"legs": [{"direction": "sell", "price": 0.0021},
+                      {"direction": "buy",  "price": 0.0063}]},
+            _make_candidate(), 0.004,
+        )
+        assert (near, far) == (pytest.approx(0.0021), pytest.approx(0.0063))
 
 
 class TestIndividualLegFallback:
