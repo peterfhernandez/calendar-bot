@@ -502,7 +502,9 @@ class DecisionEngine:
 
     # ── Liquidity gate ────────────────────────────────────────────────────────
 
-    def _check_liquidity_gate(self, candidate: CalendarCandidate) -> str | None:
+    def _check_liquidity_gate(
+        self, candidate: CalendarCandidate, is_roll: bool = False
+    ) -> str | None:
         """
         Fine liquidity gate applied just before order submission.
 
@@ -513,9 +515,21 @@ class DecisionEngine:
            This catches cases where the bid/ask friction on two legs combines
            to make the trade start deeply underwater (e.g. paying $60 for a
            spread whose mid is $40).
-        3. Both legs must have bid_size >= MIN_LEG_BID_SIZE and
-           ask_size >= MIN_LEG_ASK_SIZE — ensures there is real size to hit/lift.
-           (Only checked when the cache provides non-zero size data.)
+        3. Quoted size must cover the order (Phase 27e).  The side each leg
+           actually hits is checked against max(MIN_LEG_*_SIZE, candidate.qty):
+           the near leg is sold into the bid, the far leg bought from the ask.
+           The untraded sides keep the plain MIN_LEG_*_SIZE floor.  Previously
+           every side was compared to the constant 1 regardless of order size,
+           so qty 29 was approved into a book quoting 8.
+
+        Parameters
+        ----------
+        is_roll
+            True when validating a roll candidate.  A roll only sells the new
+            near leg — the far leg is untouched — so the far leg is not
+            size-checked against qty (Phase 26c keeps roll-time gates to what
+            the roll actually trades, so a healthy position is not liquidated
+            over a leg it never touches).
 
         Returns a rejection reason string, or None if the candidate passes.
         """
@@ -586,34 +600,55 @@ class DecisionEngine:
                     f"(debit={candidate.net_debit:.4f}, spread_mid={spread_mid:.4f})"
                 )
 
-        # ── Bid/ask size check (requires live cache snapshot) ─────────────────
+        # ── Quoted-size check (requires live cache snapshot) ──────────────────
+        # Entry sells the near leg into the bid and buys the far leg from the
+        # ask, so those two sides have to absorb the whole order.  A roll only
+        # sells the new near leg.  Sides the trade does not hit keep the plain
+        # MIN_LEG_*_SIZE floor.
         near_snap = self._cache.get(candidate.near_instrument)
         far_snap  = self._cache.get(candidate.far_instrument)
 
-        if near_snap is not None and near_snap.bid_size > 0:
-            if near_snap.bid_size < config.MIN_LEG_BID_SIZE:
-                return (
-                    f"near-leg bid_size {near_snap.bid_size:.1f} < MIN_LEG_BID_SIZE "
-                    f"{config.MIN_LEG_BID_SIZE}"
-                )
-        if near_snap is not None and near_snap.ask_size > 0:
-            if near_snap.ask_size < config.MIN_LEG_ASK_SIZE:
-                return (
-                    f"near-leg ask_size {near_snap.ask_size:.1f} < MIN_LEG_ASK_SIZE "
-                    f"{config.MIN_LEG_ASK_SIZE}"
-                )
-        if far_snap is not None and far_snap.bid_size > 0:
-            if far_snap.bid_size < config.MIN_LEG_BID_SIZE:
-                return (
-                    f"far-leg bid_size {far_snap.bid_size:.1f} < MIN_LEG_BID_SIZE "
-                    f"{config.MIN_LEG_BID_SIZE}"
-                )
-        if far_snap is not None and far_snap.ask_size > 0:
-            if far_snap.ask_size < config.MIN_LEG_ASK_SIZE:
-                return (
-                    f"far-leg ask_size {far_snap.ask_size:.1f} < MIN_LEG_ASK_SIZE "
-                    f"{config.MIN_LEG_ASK_SIZE}"
-                )
+        qty = candidate.qty if config.REQUIRE_LEG_SIZE_FOR_QTY else 0.0
+
+        def _check_size(
+            leg: str, side: str, size: float | None, floor: float, needed: float
+        ) -> str | None:
+            """Compare one quoted size against its floor and the order size."""
+            required = max(floor, needed)
+            if size is None:
+                return None  # no snapshot at all — the spread checks above cover it
+            if size <= 0:
+                if config.REQUIRE_LEG_SIZE_DATA:
+                    return (
+                        f"{leg}-leg {side}_size is 0 (no quoted size; "
+                        f"need {required:.1f})"
+                    )
+                return None
+            if size < required:
+                floor_name = "MIN_LEG_BID_SIZE" if side == "bid" else "MIN_LEG_ASK_SIZE"
+                if needed > floor:
+                    return (
+                        f"{leg}-leg {side}_size {size:.1f} < order qty {needed:.1f}"
+                    )
+                return f"{leg}-leg {side}_size {size:.1f} < {floor_name} {floor}"
+            return None
+
+        checks = [
+            # (leg, side, snapshot size, floor, size the order needs on this side)
+            ("near", "bid", near_snap.bid_size if near_snap else None,
+             config.MIN_LEG_BID_SIZE, qty),
+            ("near", "ask", near_snap.ask_size if near_snap else None,
+             config.MIN_LEG_ASK_SIZE, 0.0),
+            ("far", "bid", far_snap.bid_size if far_snap else None,
+             config.MIN_LEG_BID_SIZE, 0.0),
+            ("far", "ask", far_snap.ask_size if far_snap else None,
+             config.MIN_LEG_ASK_SIZE, 0.0 if is_roll else qty),
+        ]
+
+        for leg, side, size, floor, needed in checks:
+            reason = _check_size(leg, side, size, floor, needed)
+            if reason:
+                return reason
 
         return None
 
@@ -1260,7 +1295,7 @@ class DecisionEngine:
                 )
                 continue
             c.qty = qty_pos
-            reject = self._check_liquidity_gate(c)
+            reject = self._check_liquidity_gate(c, is_roll=True)
             if reject:
                 logger.debug("Roll: candidate %s failed liquidity gate — %s", c.near_instrument, reject)
                 continue

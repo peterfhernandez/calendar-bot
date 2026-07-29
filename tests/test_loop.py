@@ -382,3 +382,187 @@ class TestBotLoopRun:
         with patch.object(loop.engine, "scan_tick", side_effect=RuntimeError("boom")):
             # Should not raise
             await loop._scan_job()
+
+
+# ── Phase 27d — slow ticks must not block the shared event loop ───────────────
+
+class TestTickOffload:
+    """
+    scan_tick()/monitor_tick() are synchronous and can block for tens of seconds
+    on a failed entry.  Awaited inline from the scheduler job they froze the one
+    event loop that also drives the WS feed and the Telegram listener, so the
+    chain cache went stale (observed: "106 stale instrument(s) excluded") and a
+    monitor tick was missed outright while a position sat past its stop.
+    """
+
+    def _loop(self, tmp_path: Path):
+        from monitor.loop import BotLoop
+        return BotLoop(
+            cache=_FakeCache(),
+            portfolio_value=10_000.0,
+            executor=_FakeExecutor(),
+            db_path=tmp_path / "offload.db",
+            log_dir=str(tmp_path / "logs"),
+        )
+
+    @staticmethod
+    def _status():
+        """An EngineStatus the job can log, so mocked ticks take the happy path."""
+        from strategy.decision import BotState, EngineStatus
+        return EngineStatus(
+            state=BotState.IDLE, open_positions=0, daily_pnl=0.0, message="ok",
+        )
+
+    def _slow_tick(self, seconds: float):
+        """A tick that blocks for *seconds* and returns a valid status."""
+        def _tick():
+            time.sleep(seconds)
+            return self._status()
+        return _tick
+
+    @pytest.mark.asyncio
+    async def test_loop_keeps_running_during_a_slow_tick(self, tmp_path: Path) -> None:
+        """A blocking tick must not stop other loop tasks from making progress."""
+        import config as _cfg
+        loop = self._loop(tmp_path)
+
+        heartbeats = 0
+
+        async def _heartbeat() -> None:
+            nonlocal heartbeats
+            while True:
+                await asyncio.sleep(0.01)
+                heartbeats += 1
+
+        beat = asyncio.create_task(_heartbeat())
+        try:
+            with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+                 patch.object(loop.engine, "scan_tick",
+                              side_effect=self._slow_tick(0.3)):
+                await loop._scan_job()
+        finally:
+            beat.cancel()
+
+        # With the tick on a worker thread the loop stayed live throughout the
+        # 0.3s block.  Awaited inline, heartbeats would be 0.
+        assert heartbeats > 5, f"event loop was starved (heartbeats={heartbeats})"
+
+    @pytest.mark.asyncio
+    async def test_tick_runs_off_the_event_loop_thread(self, tmp_path: Path) -> None:
+        """The tick body must execute on a worker thread, not the loop thread."""
+        import config as _cfg
+        import threading
+
+        loop = self._loop(tmp_path)
+        loop_thread = threading.get_ident()
+        tick_thread: list[int] = []
+
+        def _record():
+            tick_thread.append(threading.get_ident())
+            return self._status()
+
+        with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+             patch.object(loop.engine, "monitor_tick", side_effect=_record):
+            await loop._monitor_job()
+
+        assert tick_thread and tick_thread[0] != loop_thread
+
+    @pytest.mark.asyncio
+    async def test_offload_disabled_runs_inline(self, tmp_path: Path) -> None:
+        """TICK_OFFLOAD_ENABLED=False restores pre-27d inline execution."""
+        import config as _cfg
+        import threading
+
+        loop = self._loop(tmp_path)
+        loop_thread = threading.get_ident()
+        tick_thread: list[int] = []
+
+        with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", False), \
+             patch.object(loop.engine, "monitor_tick",
+                          side_effect=lambda: (tick_thread.append(threading.get_ident()),
+                                               self._status())[1]):
+            await loop._monitor_job()
+
+        assert tick_thread == [loop_thread]
+
+    @pytest.mark.asyncio
+    async def test_scan_and_monitor_ticks_never_overlap(self, tmp_path: Path) -> None:
+        """
+        Offloaded ticks must stay serialized — engine state (failure counters,
+        _just_entered, pnl accumulators) is not safe for two concurrent ticks.
+        """
+        import config as _cfg
+        loop = self._loop(tmp_path)
+
+        concurrent = 0
+        max_concurrent = 0
+
+        def _tick():
+            nonlocal concurrent, max_concurrent
+            concurrent += 1
+            max_concurrent = max(max_concurrent, concurrent)
+            time.sleep(0.15)
+            concurrent -= 1
+            return self._status()
+
+        with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+             patch.object(loop.engine, "scan_tick", side_effect=_tick), \
+             patch.object(loop.engine, "monitor_tick", side_effect=_tick):
+            await asyncio.gather(loop._scan_job(), loop._monitor_job())
+
+        assert max_concurrent == 1
+
+    @pytest.mark.asyncio
+    async def test_slow_tick_logs_a_warning(self, tmp_path: Path, caplog) -> None:
+        """A tick slower than TICK_SLOW_WARN_SEC is reported, not silent."""
+        import config as _cfg
+        loop = self._loop(tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger="monitor.loop"), \
+             patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+             patch.object(_cfg, "TICK_SLOW_WARN_SEC", 0.05), \
+             patch.object(loop.engine, "scan_tick",
+                          side_effect=self._slow_tick(0.2)):
+            await loop._scan_job()
+
+        assert any("TICK_SLOW_WARN_SEC" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_fast_tick_logs_no_warning(self, tmp_path: Path, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="monitor.loop"):
+            import config as _cfg
+            loop = self._loop(tmp_path)
+            with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+                 patch.object(_cfg, "TICK_SLOW_WARN_SEC", 5.0), \
+                 patch.object(loop.engine, "monitor_tick",
+                              return_value=self._status()):
+                await loop._monitor_job()
+
+        assert not any("TICK_SLOW_WARN_SEC" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_exception_in_offloaded_tick_is_still_caught(self, tmp_path: Path) -> None:
+        """The job's error handling must survive the tick moving to a thread."""
+        import config as _cfg
+        loop = self._loop(tmp_path)
+
+        with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+             patch.object(loop.engine, "scan_tick", side_effect=RuntimeError("boom")):
+            await loop._scan_job()   # must not raise
+
+    @pytest.mark.asyncio
+    async def test_lock_is_released_after_a_failing_tick(self, tmp_path: Path) -> None:
+        """A raising tick must not leave the tick lock held (deadlocking the bot)."""
+        import config as _cfg
+        loop = self._loop(tmp_path)
+
+        with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+             patch.object(loop.engine, "scan_tick", side_effect=RuntimeError("boom")):
+            await loop._scan_job()
+
+        assert not loop._tick_lock.locked()
+
+        with patch.object(_cfg, "TICK_OFFLOAD_ENABLED", True), \
+             patch.object(loop.engine, "monitor_tick",
+                          return_value=self._status()):
+            await asyncio.wait_for(loop._monitor_job(), timeout=5)

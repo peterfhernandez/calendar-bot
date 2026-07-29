@@ -92,6 +92,15 @@ COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individu
 MAX_LEG_SPREAD_ABS_TICKS = 2      # global default: 0 (disabled)
 MAX_LEG_SPREAD_ABS_USD   = 0.0    # global default: 0.0 (disabled)
 
+# ── Phase 27e — size the liquidity gate against the order, not a constant ─────
+# Held at config.py's values: submitting an order larger than the quoted size is
+# what produced the partial fill that had to be flattened, and testnet books are
+# exactly where that happens.  If test-mode entries dry up because the book is
+# genuinely one contract deep, lower MAX_LOSS_PCT (smaller qty) rather than
+# turning these off — the point is that the order fits the book.
+REQUIRE_LEG_SIZE_FOR_QTY = True   # global default: True
+REQUIRE_LEG_SIZE_DATA    = True   # global default: True
+
 # Position sizing
 MAX_LOSS_PCT       = 0.02   # max 2% of portfolio per trade
 MAX_POSITIONS      = 5      # max concurrent open calendar spreads
@@ -113,6 +122,12 @@ TAKE_PROFIT_PCT = 1.50  # close if spread value > 150% of debit paid
 SCAN_INTERVAL_SEC    = 300  # 5 minutes
 MONITOR_INTERVAL_SEC = 60   # 1 minute
 CHAIN_CACHE_TTL_SEC  = 30   # seconds before a cached ticker snapshot is considered stale
+
+# ── Phase 27d — keep slow ticks off the shared asyncio event loop ─────────────
+# Engine ticks run in a worker thread so a slow entry cannot freeze the feed and
+# the Telegram listener; ticks stay serialized against each other.
+TICK_OFFLOAD_ENABLED = True   # global default: True
+TICK_SLOW_WARN_SEC   = 30.0   # global default: 30.0
 
 # Trading mode:
 #   "paper" → test.deribit.com data, dry-run execution (no orders sent)

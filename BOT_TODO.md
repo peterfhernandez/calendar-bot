@@ -1488,10 +1488,12 @@ The warning is correct but not actionable: it does not identify *which* Deribit 
 
 ## Phase 27 — Option Amount Step Blocks All BTC Entries
 
-**Status:** 27a complete (the BTC entry blocker); 27b complete (the fill-wait
-defect that unwound a fully-filled leg); 27c complete (the combo path that
-failed silently on every entry). 27d–27e are the remaining findings from
-the same log analysis, not yet started. Full root-cause detail in
+**Status:** Complete — all five sub-phases done. 27a (the BTC entry blocker),
+27b (the fill-wait defect that unwound a fully-filled leg), 27c (the combo path
+that failed silently on every entry), 27d (the blocking `.result()` that froze
+the feed, listener, and monitor for 47–57s per failed entry), and 27e (the
+liquidity gate that compared quoted size to a constant instead of the order).
+Full suite 719 passing. Full root-cause detail in
 [BOT_PLAN.md Phase 27](BOT_PLAN.md#phase-27--option-amount-step-blocks-all-btc-entries).
 
 Found by analysing `logs/bot_test.log.1` for the two `LegRiskError: Far leg
@@ -1638,22 +1640,94 @@ which is why every observed `LegRiskError` was ETH and BTC simply never traded.
 
 ### 27d — Blocking `.result()` freezes the shared event loop
 
-- [ ] `CalendarExecutor._run` (`executor.py:1329`) calls
-      `pool.submit(asyncio.run, coro).result()` — a blocking call — from
-      `_scan_job`, an `async def` on the AsyncIOScheduler loop. `bot.py` runs the
-      feed, scheduler, Telegram listener, and collector as tasks on that one loop
-- [ ] Measured impact: the two failed entries blocked the loop for **57s** and
+- [x] `CalendarExecutor._run` calls `pool.submit(asyncio.run, coro).result()` —
+      a blocking call — from `_scan_job`, an `async def` on the AsyncIOScheduler
+      loop. `bot.py` runs the feed, scheduler, Telegram listener, and collector
+      as tasks on that one loop
+- [x] Measured impact: the two failed entries blocked the loop for **57s** and
       **47s**, each losing a whole monitor tick
       (`Run time of job "BotLoop._monitor_job" was missed by 0:00:46.679841`)
       and freezing the WS feed, which then reports
       `106 stale instrument(s) excluded from ETH chain` on the next tick
-- [ ] `trade_id=22` was at 63% of debit against a 50% hard stop during one of
+- [x] `trade_id=22` was at 63% of debit against a 50% hard stop during one of
       those blind windows
+- [x] **Fix — dispatch the tick, don't await it inline.** `scan_tick()` and
+      `monitor_tick()` are synchronous by design, so no amount of work inside
+      the executor makes them safe to await on the loop. `monitor/loop.py` gains
+      `_run_tick()`, which runs the tick via `asyncio.to_thread` so the loop
+      keeps pumping the feed and the Telegram listener throughout. Inside the
+      worker thread there is no running loop, so `_run` takes its plain
+      `asyncio.run` branch — the nested thread pool is no longer used on the
+      normal path
+- [x] A `BotLoop._tick_lock` keeps scan and monitor ticks serialized against each
+      other. Engine state (`_close_roll_failures`, `_just_entered`,
+      `_rolled_this_tick`, `_pending_close`, the pnl accumulators) is not safe
+      for two concurrent ticks, and one-tick-at-a-time is today's behaviour —
+      offloading must not silently change it. A long entry therefore still
+      *delays* the next monitor tick, but that tick now reads a live chain cache
+      instead of a stale one, and the feed/listener never stall
+- [x] `config.TICK_OFFLOAD_ENABLED` (default `True`) restores inline execution
+      if ever needed; `config.TICK_SLOW_WARN_SEC` (default `30.0`) logs a
+      WARNING naming any tick slower than that, so a 57s entry is visible in the
+      log rather than inferred from a missed-job message
+- [x] `execution/executor.py::_run`'s in-loop branch now logs a WARNING naming
+      the consequence (feed and listener stall) instead of blocking silently.
+      With ticks offloaded that branch should be unreachable; if some other
+      caller reaches it, the log says so
+- [x] `tests/test_loop.py::TestTickOffload` (8 tests) — a concurrent 10ms
+      coroutine runs 0 times through an inline blocking tick and >5 times
+      through an offloaded one; the tick body executes off the loop thread;
+      `TICK_OFFLOAD_ENABLED=False` runs inline; scan and monitor never overlap;
+      a slow tick warns and a fast one does not; a raising tick is still caught
+      and does not leave the lock held
+- [x] `scratch/scratch_tick_offload.py` — offline demo (11 checks, no network):
+      measures loop starvation inline (0 heartbeats) vs offloaded (~146) across
+      a 1.5s blocking tick, shows the thread identities, the serialization, the
+      slow-tick WARNING, and the executor's new in-loop warning. Aborts in live
+- [x] Full suite green: 712 passing (704 baseline + 8 new)
 
 ### 27e — Liquidity gate ignores the sized quantity
 
-- [ ] `decision.py:611-616` checks `ask_size >= MIN_LEG_ASK_SIZE` (constant `1`)
-      and never against `candidate.qty`. Occurrence 1 approved qty 29 into a book
-      with 8 available, producing the partial fill that timed out
-- [ ] A leg reporting `ask_size == 0` skips the check entirely rather than
-      failing it (`if far_snap.ask_size > 0:`)
+- [x] `_check_liquidity_gate` checked `ask_size >= MIN_LEG_ASK_SIZE` (constant
+      `1`) and never `candidate.qty`. Occurrence 1 approved qty 29 into a book
+      with 8 available, producing the partial fill that timed out — so a book
+      quoting one contract passed the gate for an order of any size
+- [x] A leg reporting `ask_size == 0` skipped the check entirely rather than
+      failing it (`if far_snap.ask_size > 0:`), making "nothing quoted"
+      indistinguishable from a deep book
+- [x] **Fix — require the quoted size to cover the order, on the side each leg
+      actually hits.** Entry sells the near leg into the bid and buys the far leg
+      from the ask, so those two sides are held to
+      `max(MIN_LEG_*_SIZE, candidate.qty)`. The two sides the entry never touches
+      (near ask, far bid) keep the plain constant floor, so the gate tightened
+      only where the order is filled rather than becoming blanket-stricter
+- [x] `qty` is already set at both call sites before the gate runs
+      (`scan_tick` assigns `candidate.qty = size.qty`, `_try_roll` assigns
+      `c.qty = qty_pos`), so no plumbing was needed
+- [x] `_check_liquidity_gate(candidate, is_roll=False)` — a roll only sells the
+      new near leg; the far leg is untouched, so it is not size-checked against
+      qty. Holding a roll to the depth of a leg it never trades would re-create
+      the Phase 26c failure where healthy positions were liquidated by gates
+      that did not apply to the roll. The near leg the roll *does* sell is still
+      held to the order size
+- [x] `config.REQUIRE_LEG_SIZE_FOR_QTY` (default `True`) and
+      `config.REQUIRE_LEG_SIZE_DATA` (default `True`) — the second is a separate
+      switch because a zero size can also mean the feed stopped populating
+      `best_bid_amount`/`best_ask_amount`; both mirrored into `config_test.py`
+- [x] Rejection messages now name what failed: `far-leg ask_size 8.0 < order qty
+      29.0` rather than a floor comparison that was never the binding constraint
+- [x] `tests/test_decision.py::TestLiquidityGateQtyAware` (6 tests) — the logged
+      qty-29-into-8 case rejects; the near bid side rejects too; a book exactly
+      covering the order passes; `REQUIRE_LEG_SIZE_FOR_QTY=False` restores the
+      floors; untraded sides keep the constant floor; a roll skips the far leg
+      but not its own near leg. `TestLiquidityGate::test_zero_size_is_rejected`
+      replaces `test_zero_size_skips_size_check`, which asserted the old
+      behaviour, plus a test that `REQUIRE_LEG_SIZE_DATA=False` restores it
+- [x] `tests/test_decision.py::_make_snap` now defaults to a real two-sided book
+      (10 contracts each way) instead of `bid_size=0/ask_size=0`. Every fixture
+      in the file quoted no size, which is why no test caught this — the same
+      blind spot as 27a's all-ETH fixtures
+- [x] `scratch/scratch_liquidity_gate_qty.py` — offline demo (10 checks, no
+      network): the logged failure old vs new, both traded sides, untraded sides
+      unaffected, zero-size handling, and the roll relaxation. Aborts in live
+- [x] Full suite green: 719 passing (712 + 7 new)

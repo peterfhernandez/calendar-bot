@@ -7,6 +7,12 @@ Sets up two APScheduler jobs:
   - scan_job  — runs DecisionEngine.scan_tick()  every SCAN_INTERVAL_SEC
   - monitor_job — runs DecisionEngine.monitor_tick() every MONITOR_INTERVAL_SEC
 
+Both ticks are synchronous and can block for tens of seconds (a failed entry
+waits out the full order timeout), so they are dispatched to a worker thread via
+_run_tick() rather than awaited inline — otherwise they freeze the single event
+loop that also drives the WebSocket feed and the Telegram listener (Phase 27d).
+A lock keeps the two ticks serialized against each other.
+
 Logging goes to both the console and a rotating file (logs/bot.log, max 10 MB,
 5 backups).
 
@@ -27,6 +33,7 @@ import asyncio
 import logging
 import logging.handlers
 import signal
+import time
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +126,11 @@ class BotLoop:
         self._scheduler = AsyncIOScheduler()
         self._stop_event = asyncio.Event()
         self._running = False
+        # Serializes scan and monitor ticks against each other (Phase 27d).
+        # Offloading the ticks to worker threads means the two jobs could
+        # otherwise overlap and mutate engine state concurrently; today's
+        # behaviour is one tick at a time, and this preserves it.
+        self._tick_lock = asyncio.Lock()
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -210,6 +222,49 @@ class BotLoop:
         self._running = False
         logger.info("BotLoop stopped.")
 
+    # ── Tick dispatch ─────────────────────────────────────────────────────────
+
+    async def _run_tick(self, name: str, tick):
+        """
+        Run one synchronous engine tick without blocking the event loop.
+
+        ``scan_tick``/``monitor_tick`` are synchronous and can take tens of
+        seconds — a failed entry blocks for the full order timeout.  Awaiting
+        them inline froze the single event loop shared with the WebSocket feed
+        and the Telegram listener, so the chain cache aged past its TTL and the
+        next monitor tick was missed (Phase 27d).  Running the tick in a worker
+        thread keeps the loop free; ``_tick_lock`` keeps the two ticks serialized
+        so engine state is still only ever touched by one of them at a time.
+
+        Set ``config.TICK_OFFLOAD_ENABLED = False`` to restore inline execution.
+
+        Returns whatever the tick returns.
+        """
+        if not config.TICK_OFFLOAD_ENABLED:
+            return tick()
+
+        waited_at = time.monotonic()
+        async with self._tick_lock:
+            waited = time.monotonic() - waited_at
+            if waited > 1.0:
+                logger.info(
+                    "%s waited %.1fs for the previous tick to finish", name, waited,
+                )
+            started = time.monotonic()
+            try:
+                return await asyncio.to_thread(tick)
+            finally:
+                elapsed = time.monotonic() - started
+                warn_after = config.TICK_SLOW_WARN_SEC
+                if warn_after > 0 and elapsed > warn_after:
+                    logger.warning(
+                        "%s took %.1fs (> TICK_SLOW_WARN_SEC %gs) — the event loop "
+                        "stayed responsive, but this tick delayed the next one",
+                        name, elapsed, warn_after,
+                    )
+                else:
+                    logger.debug("%s took %.1fs", name, elapsed)
+
     # ── Scheduler jobs ────────────────────────────────────────────────────────
 
     async def _scan_job(self) -> None:
@@ -218,7 +273,7 @@ class BotLoop:
             logger.warning("scan_job skipped — engine is HALTED")
             return
         try:
-            status = self._engine.scan_tick()
+            status = await self._run_tick("scan_tick", self._engine.scan_tick)
             logger.info(
                 "scan_job complete  state=%s  open=%d  daily_pnl=%.2f  "
                 "fees_paid_today=%.2f  msg=%s",
@@ -244,7 +299,7 @@ class BotLoop:
             logger.warning("monitor_job skipped — engine is HALTED")
             return
         try:
-            status = self._engine.monitor_tick()
+            status = await self._run_tick("monitor_tick", self._engine.monitor_tick)
             logger.info(
                 "monitor_job complete  state=%s  open=%d  daily_pnl=%.2f  "
                 "fees_paid_today=%.2f  msg=%s",

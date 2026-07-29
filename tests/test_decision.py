@@ -56,7 +56,15 @@ def _future_label(days: int) -> str:
 
 def _make_snap(instrument: str, mark_iv: float = 0.80, oi: float = 500,
                bid: float = 0.02, ask: float = 0.03,
-               bid_size: float = 0.0, ask_size: float = 0.0) -> TickerSnapshot:
+               bid_size: float = 10.0, ask_size: float = 10.0) -> TickerSnapshot:
+    """
+    Build a TickerSnapshot for tests.
+
+    Sizes default to a real two-sided book (10 contracts each way).  They used
+    to default to 0, which since Phase 27e means "no quoted size" and fails the
+    liquidity gate — a book with nothing quoted cannot absorb an order, so
+    fixtures exercising the happy path need genuine size.
+    """
     asset = instrument.split("-")[0]
     return TickerSnapshot(
         instrument=instrument,
@@ -1324,15 +1332,32 @@ class TestLiquidityGate:
         assert reason is not None
         assert "far-leg ask_size" in reason
 
-    def test_zero_size_skips_size_check(self, monkeypatch):
-        """bid_size=0 means the exchange did not report size data — skip, not reject."""
+    def test_zero_size_is_rejected(self, monkeypatch):
+        """
+        A leg quoting size 0 is rejected, not skipped (Phase 27e).
+
+        This previously passed the gate: the size check was skipped whenever a
+        size was 0, so a book with nothing quoted was indistinguishable from a
+        deep one.  Nothing quoted cannot absorb an order.
+        """
         import config as cfg
-        monkeypatch.setattr(cfg, "MIN_LEG_BID_SIZE", 100)
+        monkeypatch.setattr(cfg, "REQUIRE_LEG_SIZE_DATA", True)
         engine, candidate = self._engine_with_size_snaps(
             near_bid_sz=0.0, near_ask_sz=0.0, far_bid_sz=0.0, far_ask_sz=0.0
         )
         reason = engine._check_liquidity_gate(candidate)
-        assert reason is None
+        assert reason is not None
+        assert "no quoted size" in reason
+
+    def test_zero_size_passes_when_size_data_not_required(self, monkeypatch):
+        """REQUIRE_LEG_SIZE_DATA=False restores the treat-0-as-unknown behaviour."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "REQUIRE_LEG_SIZE_DATA", False)
+        monkeypatch.setattr(cfg, "MIN_LEG_BID_SIZE", 100)
+        engine, candidate = self._engine_with_size_snaps(
+            near_bid_sz=0.0, near_ask_sz=0.0, far_bid_sz=0.0, far_ask_sz=0.0
+        )
+        assert engine._check_liquidity_gate(candidate) is None
 
     def test_sufficient_size_passes(self, monkeypatch):
         import config as cfg
@@ -1343,6 +1368,115 @@ class TestLiquidityGate:
         )
         reason = engine._check_liquidity_gate(candidate)
         assert reason is None
+
+
+# ── Phase 27e — the gate must size against the order, not a constant ──────────
+
+class TestLiquidityGateQtyAware:
+    """
+    The liquidity gate compared every quoted size against MIN_LEG_*_SIZE (1),
+    never against the order it was about to submit.  A qty-29 entry was approved
+    into a book quoting 8 on the far ask — a guaranteed partial fill, which then
+    timed out and had to be flattened.
+    """
+
+    def _engine_and_candidate(self, near_bid_sz: float, far_ask_sz: float,
+                              qty: float, book_depth: float = 100.0):
+        gate = TestLiquidityGate()
+        candidate = gate._good_candidate()
+        candidate.qty = qty
+        near_snap = _make_snap(
+            candidate.near_instrument,
+            bid=candidate.near_bid, ask=candidate.near_ask,
+            bid_size=near_bid_sz, ask_size=book_depth,
+        )
+        far_snap = _make_snap(
+            candidate.far_instrument,
+            bid=candidate.far_bid, ask=candidate.far_ask,
+            bid_size=book_depth, ask_size=far_ask_sz,
+        )
+        cache = MagicMock()
+        cache.get.side_effect = {
+            candidate.near_instrument: near_snap,
+            candidate.far_instrument:  far_snap,
+        }.get
+        engine, _ = _make_engine(cache=cache)
+        return engine, candidate
+
+    def test_far_ask_size_below_qty_rejected(self):
+        """The logged failure: qty 29 approved into a far ask quoting 8."""
+        engine, candidate = self._engine_and_candidate(
+            near_bid_sz=100.0, far_ask_sz=8.0, qty=29.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None
+        assert "far-leg ask_size 8.0 < order qty 29.0" in reason
+
+    def test_near_bid_size_below_qty_rejected(self):
+        """Entry sells the near leg into the bid — that side must cover qty too."""
+        engine, candidate = self._engine_and_candidate(
+            near_bid_sz=3.0, far_ask_sz=100.0, qty=29.0
+        )
+        reason = engine._check_liquidity_gate(candidate)
+        assert reason is not None
+        assert "near-leg bid_size 3.0 < order qty 29.0" in reason
+
+    def test_size_covering_qty_passes(self):
+        engine, candidate = self._engine_and_candidate(
+            near_bid_sz=29.0, far_ask_sz=29.0, qty=29.0
+        )
+        assert engine._check_liquidity_gate(candidate) is None
+
+    def test_qty_check_disabled_by_config(self, monkeypatch):
+        """REQUIRE_LEG_SIZE_FOR_QTY=False falls back to the MIN_LEG_*_SIZE floors."""
+        import config as cfg
+        monkeypatch.setattr(cfg, "REQUIRE_LEG_SIZE_FOR_QTY", False)
+        engine, candidate = self._engine_and_candidate(
+            near_bid_sz=100.0, far_ask_sz=8.0, qty=29.0
+        )
+        assert engine._check_liquidity_gate(candidate) is None
+
+    def test_untraded_sides_keep_the_constant_floor(self):
+        """
+        Entry never lifts the near ask or hits the far bid, so those sides are
+        only held to MIN_LEG_*_SIZE — a thin quote there must not block entry.
+        """
+        gate = TestLiquidityGate()
+        candidate = gate._good_candidate()
+        candidate.qty = 29.0
+        near_snap = _make_snap(
+            candidate.near_instrument,
+            bid=candidate.near_bid, ask=candidate.near_ask,
+            bid_size=50.0, ask_size=1.0,     # thin ask — not the side we hit
+        )
+        far_snap = _make_snap(
+            candidate.far_instrument,
+            bid=candidate.far_bid, ask=candidate.far_ask,
+            bid_size=1.0, ask_size=50.0,     # thin bid — not the side we hit
+        )
+        cache = MagicMock()
+        cache.get.side_effect = {
+            candidate.near_instrument: near_snap,
+            candidate.far_instrument:  far_snap,
+        }.get
+        engine, _ = _make_engine(cache=cache)
+        assert engine._check_liquidity_gate(candidate) is None
+
+    def test_roll_does_not_size_check_the_untouched_far_leg(self):
+        """
+        A roll only sells the new near leg; the far leg is not traded.  Holding a
+        roll to far-ask depth would liquidate healthy positions over a leg the
+        roll never touches (the failure mode Phase 26c fixed).
+        """
+        engine, candidate = self._engine_and_candidate(
+            near_bid_sz=100.0, far_ask_sz=1.0, qty=29.0
+        )
+        assert engine._check_liquidity_gate(candidate, is_roll=True) is None
+        # ...but the near leg it does sell is still held to the order size.
+        engine2, candidate2 = self._engine_and_candidate(
+            near_bid_sz=3.0, far_ask_sz=100.0, qty=29.0
+        )
+        assert engine2._check_liquidity_gate(candidate2, is_roll=True) is not None
 
 
 # ── Notification wiring ───────────────────────────────────────────────────────
@@ -2109,7 +2243,12 @@ class TestDrainMode:
         executor = MagicMock()
         executor.enter_spread.return_value = {"near_prem": 0.02, "far_prem": 0.04, "net_debit": 0.02, "qty": 1.0}
 
-        with patch("strategy.decision.scan", return_value=[_make_candidate()]):
+        # Size explicitly: with MIN_NET_DEBIT relaxed the real sizer produces a
+        # qty far larger than the fixture book's quoted size, which the Phase 27e
+        # gate rejects.  This test is about drain mode, not sizing.
+        with patch("strategy.decision.scan", return_value=[_make_candidate()]), \
+             patch("strategy.decision.size_candidate",
+                   return_value=MagicMock(qty=1.0, reason="Approved")):
             engine, _ = _make_engine(executor=executor)
             engine.scan_tick()
 
