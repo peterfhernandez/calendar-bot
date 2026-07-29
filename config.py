@@ -125,6 +125,21 @@ COMBO_FILL_TIMEOUT_SEC = 30     # seconds to wait for combo fill before individu
 MAX_LEG_SPREAD_ABS_TICKS = 0     # spread <= N ticks always passes (0 = disabled)
 MAX_LEG_SPREAD_ABS_USD   = 0.0   # spread <= $X always passes (0 = disabled)
 
+# ── Phase 27e — size the liquidity gate against the order, not a constant ─────
+# MIN_LEG_BID_SIZE/MIN_LEG_ASK_SIZE are floors of 1 contract, so a qty-29 order
+# was approved into a book showing 8 available — the partial fill that then timed
+# out and had to be flattened.  With REQUIRE_LEG_SIZE_FOR_QTY the gate demands
+# max(MIN_LEG_*_SIZE, candidate.qty) on the side each leg actually hits: the near
+# leg is sold into the bid, the far leg bought from the ask.  On a roll only the
+# new near leg trades, so the far leg is not size-checked against qty.
+REQUIRE_LEG_SIZE_FOR_QTY = True   # False = only enforce the MIN_LEG_*_SIZE floors
+# A leg quoting size 0 previously skipped the size check entirely rather than
+# failing it, which is how a book with no quoted size passed the gate.  Zero can
+# also mean "the feed gave us no size data", so this is a separate switch: turn
+# it off if a venue/feed stops populating best_bid_amount/best_ask_amount and the
+# missing data starves entries.
+REQUIRE_LEG_SIZE_DATA    = True   # False = treat missing/zero size as unknown and pass
+
 # Position sizing
 MAX_LOSS_PCT       = 0.02  # max 2% of portfolio per trade
 MAX_POSITIONS      = 5     # max concurrent open calendar spreads
@@ -146,6 +161,17 @@ TAKE_PROFIT_PCT = 1.50  # close if spread value > 150% of debit paid
 SCAN_INTERVAL_SEC    = 300  # 5 minutes
 MONITOR_INTERVAL_SEC = 60   # 1 minute
 CHAIN_CACHE_TTL_SEC  = 30   # seconds before a cached ticker snapshot is considered stale
+
+# ── Phase 27d — keep slow ticks off the shared asyncio event loop ─────────────
+# scan_tick()/monitor_tick() are synchronous and can block for the full order
+# timeout on a failed entry (47–57s observed).  Called directly from the
+# scheduler's async job they froze the one event loop that also runs the
+# WebSocket feed and the Telegram listener, so the chain cache went stale and a
+# monitor tick was missed outright.  With offloading enabled the tick runs in a
+# worker thread and the loop keeps pumping; ticks are still serialized against
+# each other so engine state is never mutated by two ticks at once.
+TICK_OFFLOAD_ENABLED = True   # False = run ticks inline on the loop (pre-27d behaviour)
+TICK_SLOW_WARN_SEC   = 30.0   # log a WARNING when one tick takes longer than this (0 = never)
 
 # Trading mode:
 #   "paper" → test.deribit.com data, dry-run execution (no orders sent)
