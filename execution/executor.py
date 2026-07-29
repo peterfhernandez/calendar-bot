@@ -753,6 +753,105 @@ async def _cancel_and_flatten(
     return filled
 
 
+# ── Combo helpers (Phase 27c) ─────────────────────────────────────────────────
+
+# Field names a create_combo response may carry the combo identifier under.
+# Deribit returns it as ``id`` (e.g. "BTC-CCAL-25DEC26_31JUL26-115000"), which
+# doubles as the instrument name when placing an order against the combo.  The
+# aliases are accepted so a differently-shaped response (or a test double) still
+# resolves rather than silently disabling the combo path.
+_COMBO_ID_FIELDS = ("id", "combo_id", "instrument_name")
+
+
+def _combo_id_from_result(result: dict | None) -> str | None:
+    """
+    Extract the combo instrument name from a ``private/create_combo`` response.
+
+    The response identifier is ``id``.  Reading only ``combo_id``/
+    ``instrument_name`` — neither of which Deribit ever returns — meant every
+    successful combo creation was treated as "no combo_id" and discarded, so
+    every entry fell through to the individual-leg path within ~2s of RANK
+    approval, despite ``COMBO_FILL_TIMEOUT_SEC`` being 30 (Phase 27c).
+    """
+    if not isinstance(result, dict):
+        return None
+    for field in _COMBO_ID_FIELDS:
+        value = result.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _combo_ratio_legs(near_instrument: str, far_instrument: str) -> list[dict]:
+    """
+    Build the ``trades`` payload for ``private/create_combo``.
+
+    A combo's legs define its *ratio*, not its trade size: Deribit stores them as
+    small signed integers (``amount: 1`` / ``amount: -1``, confirmed against
+    ``public/get_combos``), and the size actually traded is the amount on the
+    order placed against the combo instrument.  Passing the sized quantity here
+    (e.g. ``0.2`` BTC) asks for a fractional ratio, which the exchange rejects —
+    and would define a distinct combo per position size even where accepted.
+
+    A calendar spread sells the near leg and buys the far leg in equal size, so
+    the ratio is always 1:1.
+    """
+    return [
+        {"instrument_name": near_instrument, "direction": "sell", "amount": 1},
+        {"instrument_name": far_instrument,  "direction": "buy",  "amount": 1},
+    ]
+
+
+def _combo_leg_fills(
+    final_state:           dict,
+    candidate:             CalendarCandidate,
+    net_debit_limit_index: float,
+) -> tuple[float, float]:
+    """
+    Resolve the per-leg fill prices (index fractions) of a filled combo order.
+
+    Deribit's order state for a combo reports the *net* price of the spread; it
+    does not break the fill out per leg (the legs surface as separate trades).
+    When a per-leg breakdown is present it is used directly; otherwise the near
+    leg is attributed its intended (limit) price and the far leg is derived so
+    that ``far - near`` equals the net price actually filled.  That keeps the
+    recorded net debit exact — it is what drives P&L — and confines the
+    approximation to how the net is split across the two legs.
+
+    The previous fallback used the net-debit limit for the near leg and *twice*
+    the net debit for the far leg, which bore no relation to either fill.
+    """
+    legs = final_state.get("legs") or []
+    if legs:
+        near = next(
+            (l.get("price") for l in legs
+             if isinstance(l, dict) and l.get("direction") == "sell" and l.get("price") is not None),
+            None,
+        )
+        far = next(
+            (l.get("price") for l in legs
+             if isinstance(l, dict) and l.get("direction") == "buy" and l.get("price") is not None),
+            None,
+        )
+        if near is not None and far is not None:
+            return float(near), float(far)
+
+    net_index = final_state.get("average_price")
+    if net_index is None:
+        net_index = final_state.get("price")
+    try:
+        net_index = float(net_index)
+    except (TypeError, ValueError):
+        net_index = net_debit_limit_index
+
+    near_index = _index_price(candidate.near_bid, candidate.spot, candidate.asset)
+    logger.debug(
+        "Combo fill had no per-leg breakdown — attributing near=%.6f, far=%.6f "
+        "from net=%.6f", near_index, near_index + net_index, net_index,
+    )
+    return near_index, near_index + net_index
+
+
 # ── Core async logic ──────────────────────────────────────────────────────────
 
 async def _async_enter_spread_combo(
@@ -763,6 +862,7 @@ async def _async_enter_spread_combo(
     amount: float,
     net_debit_limit_index: float,
     combo_timeout: int,
+    reason_sink: list[str] | None = None,
 ) -> dict | None:
     """
     Attempt to enter a calendar spread via a Deribit combo order.
@@ -770,26 +870,45 @@ async def _async_enter_spread_combo(
     Submits both legs atomically as a combo instrument. Returns a fill summary
     dict on success, or None if the combo times out or fails. The caller is
     responsible for falling back to individual legs on None.
+
+    Every failure is logged at WARNING and, when *reason_sink* is supplied, the
+    reason is appended to it so the caller's fallback warning can name it.  These
+    paths previously logged at DEBUG, which — under the default WARNING log level
+    — made a combo path that was failing on *every* entry completely invisible
+    (Phase 27c).
     """
     asset      = candidate.asset
     spot       = candidate.spot
     near_instr = candidate.near_instrument
     far_instr  = candidate.far_instrument
 
+    def _fail(reason: str) -> None:
+        logger.warning("COMBO: %s — falling back to individual legs", reason)
+        if reason_sink is not None:
+            reason_sink.append(reason)
+
     async with _DeribitRPCClient(client_id, client_secret) as client:
         try:
-            combo_result = await client.create_combo([
-                {"instrument_name": near_instr, "direction": "sell", "amount": amount},
-                {"instrument_name": far_instr,  "direction": "buy",  "amount": amount},
-            ])
+            combo_result = await client.create_combo(
+                _combo_ratio_legs(near_instr, far_instr)
+            )
         except Exception as exc:
-            logger.debug("create_combo failed (%s) — will use individual legs", exc)
+            _fail(f"create_combo({near_instr} sell / {far_instr} buy) failed: {exc}")
             return None
 
-        combo_id = combo_result.get("combo_id") or combo_result.get("instrument_name")
+        combo_id = _combo_id_from_result(combo_result)
         if not combo_id:
-            logger.debug("create_combo returned no combo_id — will use individual legs")
+            _fail(
+                f"create_combo returned no usable combo id for {near_instr}/{far_instr} "
+                f"(keys: {sorted(combo_result) if isinstance(combo_result, dict) else type(combo_result).__name__})"
+            )
             return None
+        logger.info(
+            "COMBO: created %s (state=%s) for %s sell / %s buy",
+            combo_id,
+            combo_result.get("state", "?") if isinstance(combo_result, dict) else "?",
+            near_instr, far_instr,
+        )
 
         try:
             order_result = await client.place_order(
@@ -798,7 +917,10 @@ async def _async_enter_spread_combo(
                 validate_amount=False,  # combo instrument has its own exchange minimum
             )
         except Exception as exc:
-            logger.debug("Combo order placement failed (%s) — will use individual legs", exc)
+            _fail(
+                f"combo order placement on {combo_id} "
+                f"(buy amount={amount} price={net_debit_limit_index:.6f}) failed: {exc}"
+            )
             return None
 
         combo_order_id = order_result["order"]["order_id"]
@@ -810,8 +932,8 @@ async def _async_enter_spread_combo(
 
         try:
             final_state = await _wait_for_fill(client, combo_order_id, combo_timeout, amount=amount)
-        except OrderTimeoutError:
-            logger.info("Combo order timed out after %ds — falling back to individual legs", combo_timeout)
+        except OrderTimeoutError as exc:
+            _fail(f"combo order {combo_order_id} on {combo_id} not filled: {exc}")
             try:
                 await client.cancel_order(combo_order_id)
             except Exception:
@@ -819,21 +941,16 @@ async def _async_enter_spread_combo(
             order_manager.update(combo_order_id, OrderState.CANCELLED)
             return None
         except RuntimeError as exc:
-            logger.warning("Combo order rejected (%s) — falling back to individual legs", exc)
+            _fail(f"combo order {combo_order_id} on {combo_id} rejected: {exc}")
             order_manager.update(combo_order_id, OrderState.CANCELLED)
             return None
 
         order_manager.update(combo_order_id, OrderState.FILLED)
 
-        # Extract per-leg fill prices from the combo fill result
-        legs_filled = final_state.get("legs", [])
-        near_fill_index = next(
-            (l.get("price", net_debit_limit_index) for l in legs_filled if l.get("direction") == "sell"),
-            net_debit_limit_index,
-        )
-        far_fill_index = next(
-            (l.get("price", net_debit_limit_index) for l in legs_filled if l.get("direction") == "buy"),
-            net_debit_limit_index + net_debit_limit_index,
+        # Resolve per-leg fill prices (Deribit reports a combo fill as a single
+        # net price; see _combo_leg_fills for how the split is attributed).
+        near_fill_index, far_fill_index = _combo_leg_fills(
+            final_state, candidate, net_debit_limit_index
         )
 
         near_fill_usd = _usd_price(near_fill_index, spot, asset)
@@ -934,6 +1051,7 @@ async def _async_enter_spread(
     effective_combo_timeout = combo_timeout if combo_timeout is not None else config.COMBO_FILL_TIMEOUT_SEC
     net_debit_limit_index   = far_limit - near_limit  # net debit as index fraction
 
+    combo_reasons: list[str] = []
     combo_fill = await _async_enter_spread_combo(
         candidate=candidate,
         client_id=client_id,
@@ -942,14 +1060,18 @@ async def _async_enter_spread(
         amount=amount,
         net_debit_limit_index=net_debit_limit_index,
         combo_timeout=effective_combo_timeout,
+        reason_sink=combo_reasons,
     )
     if combo_fill is not None:
         return combo_fill
 
     # ── Individual-leg fallback (WARNING logged) ──────────────────────────────
+    # BOT_PLAN §5 designates this path a last resort, so the warning names why
+    # the combo was not used rather than leaving it to a DEBUG line (Phase 27c).
     logger.warning(
-        "Falling back to individual legs for %s %s (combo timed out or unavailable)",
+        "Falling back to individual legs for %s %s — combo unavailable: %s",
         asset, near_instr,
+        combo_reasons[-1] if combo_reasons else "combo timed out or unavailable",
     )
 
     near_order_id: str | None = None

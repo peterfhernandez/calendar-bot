@@ -1791,10 +1791,12 @@ Also: a roll-failure close is recorded as `result='Loss (Auto Stop)'` purely bec
 ## Phase 27 — Option Amount Step Blocks All BTC Entries
 
 **Status:** 27a complete (the BTC entry blocker); 27b complete (the fill-wait
-defect that unwound a fully-filled leg); 27c–27e identified and documented, not
+defect that unwound a fully-filled leg); 27c complete (the combo path that
+failed silently on every entry); 27d–27e identified and documented, not
 yet implemented. Checklist in BOT_TODO.md Phase 27. Offline demos:
-`python -m scratch.scratch_option_amount_step` and
-`python -m scratch.scratch_wait_for_fill` (no live orders).
+`python -m scratch.scratch_option_amount_step`,
+`python -m scratch.scratch_wait_for_fill`, and
+`python -m scratch.scratch_combo_path` (no live orders).
 
 ### How this was found
 
@@ -1906,11 +1908,72 @@ A genuine partial fill still times out and still goes through Phase 26a's
 remains the authoritative figure for the flatten, since more can fill between the
 final poll and the cancel.
 
+### Root cause (27c)
+
+`RANK approved` → `Falling back to individual legs` was consistently ~2s
+(06:17:56→06:17:58, 05:52:56→05:52:57, 06:02:56→06:02:58) against a 30s
+`COMBO_FILL_TIMEOUT_SEC`, so the combo was not timing out — it was failing
+outright, on every single entry, leaving the individual-leg path that BOT_PLAN
+§5 designates a rare last resort as the *only* path the bot ever used. Both
+failure branches logged at DEBUG, and the root `LOG_LEVEL` is `WARNING`, so
+nothing in the log said why.
+
+Checked against the exchange rather than waiting for another occurrence:
+`public/get_combos` (identical shape on test.deribit.com and www.deribit.com)
+returns a combo as
+
+```json
+{"id": "BTC-CCAL-25DEC26_31JUL26-115000", "state": "active", "instrument_id": 667427,
+ "legs": [{"instrument_name": "BTC-31JUL26-115000-C", "amount": -1},
+          {"instrument_name": "BTC-25DEC26-115000-C", "amount":  1}]}
+```
+
+Two mismatches against what `_async_enter_spread_combo` did:
+
+1. **The identifier was read from fields Deribit never returns.** The code took
+   `combo_result.get("combo_id") or combo_result.get("instrument_name")`; the
+   identifier is `id` (and doubles as the instrument name when ordering against
+   the combo). So every *successful* `create_combo` fell into the "returned no
+   combo_id" branch and was discarded — one RPC round trip after RANK approval,
+   which is exactly the ~2s observed.
+
+2. **The sized quantity was sent as the leg ratio.** Legs were built with
+   `amount=candidate.qty`. A combo's legs define its *ratio* — small signed
+   integers, per the response above — while the traded size rides on the order
+   placed against the combo instrument. A fractional ratio (BTC `0.2`) is not a
+   valid combo definition, and even where accepted would mint a distinct combo
+   per position size.
+
+A third defect sat on the success path, latent only because that path had never
+executed: Deribit reports a combo fill as a single **net** price with no per-leg
+breakdown, and the fallback recorded the near leg at the net-debit limit and the
+far leg at *twice* it — numbers unrelated to either fill, which then fed fee
+calculation and P&L.
+
+### Fix (27c)
+
+- `_combo_id_from_result()` reads `id`, accepting `combo_id`/`instrument_name`
+  as aliases so a differently-shaped response or a test double still resolves
+  rather than silently disabling the combo path.
+- `_combo_ratio_legs()` always emits the 1:1 ratio a calendar spread has (sell
+  near, buy far) as integers; the sizer-approved qty is submitted on the combo
+  order, where it belongs.
+- Every combo failure — create, placement, rejection, timeout — logs at WARNING
+  as `COMBO: <reason> — falling back to individual legs`, and the reason is
+  threaded back through a `reason_sink` so the caller's individual-leg fallback
+  WARNING names it instead of the generic "(combo timed out or unavailable)".
+  A last-resort path being taken should never again be indistinguishable in the
+  log from the primary path working.
+- `_combo_leg_fills()` uses an explicit per-leg breakdown when one is present;
+  otherwise it attributes the near leg its intended limit price and derives the
+  far leg so `far - near` equals the net actually filled. The recorded net debit
+  — the figure that drives P&L — is therefore exact, and the approximation is
+  confined to how that net is split across the two legs.
+
 ### Remaining findings from the same analysis
 
 | Sub-phase | Finding |
 | --- | --- |
-| 27c | The combo path fails ~2s after RANK approval on every entry (vs. a 30s `COMBO_FILL_TIMEOUT_SEC`), so `create_combo`/combo `place_order` is raising. Both paths log at DEBUG; 27a enables `execution.executor: DEBUG` in `config_test.py` to surface the reason. |
 | 27d | `CalendarExecutor._run`'s blocking `.result()` runs inside `_scan_job` on the shared asyncio loop, freezing the feed, listener, and monitor for 47–57s per failed entry. |
 | 27e | The liquidity gate compares `ask_size` to the constant `MIN_LEG_ASK_SIZE = 1`, never to `candidate.qty` — qty 29 was approved into a book with 8 available. A leg quoting `ask_size == 0` skips the check entirely. |
 
@@ -1931,3 +1994,11 @@ final poll and the cancel.
 | `execution/executor.py` | `_wait_for_fill` detects completion by quantity, clamps its sleep to the deadline and polls once more there, and reports true elapsed time; + `_state_filled_amount`/`_state_order_amount`; `amount` threaded through all seven call sites; `OrderTimeoutError` carries `order_id`/`filled_amount`/`amount`/`elapsed_sec` |
 | `tests/test_executor.py` | + `TestWaitForFillPartialAware` (7 tests) |
 | `scratch/scratch_wait_for_fill.py` | New — replays the logged `ETH-82752446337` fill, the blind-window fill, and the honest-elapsed timeout (11 offline checks) |
+
+### New/changed files (27c)
+
+| File | Change |
+| --- | --- |
+| `execution/executor.py` | + `_combo_id_from_result` (reads Deribit's `id`), `_combo_ratio_legs` (1:1 integer ratio), `_combo_leg_fills` (net-price attribution); combo failures log at WARNING and report the reason through a new `reason_sink`; the individual-leg fallback WARNING names why the combo was skipped |
+| `tests/test_executor.py` | + `TestComboIdentifierAndRatio` (7 tests) |
+| `scratch/scratch_combo_path.py` | New — old vs new identifier lookup on a real Deribit response, the 1:1 ratio, an end-to-end combo entry, and the now-visible WARNING (13 offline checks) |
