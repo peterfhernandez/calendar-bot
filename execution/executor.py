@@ -1576,7 +1576,17 @@ class CalendarExecutor:
         self.last_close_fills: dict[str, float] | None = None
 
     def _run(self, coro):
-        """Run an async coroutine, handling both standalone and in-loop contexts."""
+        """
+        Run an async coroutine, handling both standalone and in-loop contexts.
+
+        The in-loop branch below blocks the calling event loop for the whole
+        duration of the order (up to the full order timeout).  Since Phase 27d
+        the scheduler dispatches engine ticks to a worker thread, so the normal
+        path here has no running loop and takes the plain asyncio.run() branch.
+        Reaching the in-loop branch means some caller is still driving the
+        executor from the loop thread and is starving the feed and the Telegram
+        listener while it waits — that is worth a loud log line, not silence.
+        """
         import concurrent.futures
         try:
             asyncio.get_running_loop()
@@ -1586,7 +1596,14 @@ class CalendarExecutor:
 
         if in_loop:
             # Already inside a running event loop — run in a new thread so that
-            # asyncio.run() can create its own event loop there.
+            # asyncio.run() can create its own event loop there.  The .result()
+            # call still blocks that loop; see the docstring.
+            logger.warning(
+                "Executor called from inside a running event loop — blocking it "
+                "until the order completes (feed and Telegram listener stall). "
+                "Engine ticks should reach the executor from a worker thread; "
+                "see config.TICK_OFFLOAD_ENABLED."
+            )
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(asyncio.run, coro).result()
         else:
