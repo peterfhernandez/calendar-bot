@@ -9,7 +9,7 @@ defaults:
     shell: powershell -ExecutionPolicy Bypass -Command "& '{0}'"
 jobs:
   deploy:
-    runs-on: self-hosted
+    runs-on: calendar-bot
     steps:
       - name: Fix git safe directory
         run: git config --global --add safe.directory C:/Users/Peter/coderepo/calendar-bot
