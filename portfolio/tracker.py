@@ -127,6 +127,9 @@ class PortfolioTracker:
         self._reconcile_fingerprint: tuple | None = None
         self._reconcile_repeat_count: int = 0
         self._reconcile_escalated: bool = False
+        # Phase 28a/28b: log each state transition once instead of every cycle.
+        self._cross_collateral_logged: bool = False
+        self._collateral_only_logged:  bool = False
 
         # Cached state — updated by refresh()
         self._equity_usd:             float = 0.0
@@ -340,11 +343,16 @@ class PortfolioTracker:
 
         token = self._authenticate()
 
-        total_equity_usd         = 0.0
-        total_available_usd      = 0.0
-        total_margin_usd         = 0.0
-        total_maintenance_usd    = 0.0
-        total_unrealized         = 0.0
+        # Equity and floating P&L are genuinely per-currency, so they accumulate.
+        # Margin and available funds are collected per currency and aggregated
+        # afterwards, because on a cross-collateral account they are the same
+        # account-wide number repeated in every currency's units (Phase 28a).
+        total_equity_usd  = 0.0
+        total_unrealized  = 0.0
+        available_usds:   list[float] = []
+        margin_usds:      list[float] = []
+        maintenance_usds: list[float] = []
+        cross_collateral = False
 
         currencies = _assets_to_currencies(config.ASSETS)
 
@@ -362,11 +370,13 @@ class PortfolioTracker:
                     p.get("floating_profit_loss", 0.0) * spot for p in positions
                 )
 
-                total_equity_usd         += equity_usd
-                total_available_usd      += available_usd
-                total_margin_usd         += margin_usd
-                total_maintenance_usd    += maintenance_usd
-                total_unrealized         += float_pnl_usd
+                total_equity_usd += equity_usd
+                total_unrealized += float_pnl_usd
+                available_usds.append(available_usd)
+                margin_usds.append(margin_usd)
+                maintenance_usds.append(maintenance_usd)
+                if _is_cross_collateral(summary):
+                    cross_collateral = True
 
                 logger.debug(
                     "Portfolio %s: equity=%.4f spot=%.2f → $%.2f "
@@ -380,11 +390,55 @@ class PortfolioTracker:
                 logger.debug("Could not fetch %s summary: %s", currency, exc)
                 raise
 
+        single_count = cross_collateral and config.CROSS_COLLATERAL_SINGLE_COUNT
+        if single_count:
+            # Every currency reports the same account-wide figure; max() rather
+            # than "first" so a currency whose summary is missing or zero (e.g. a
+            # currency with no balance) cannot drag the account total down.
+            total_available_usd   = max(available_usds,   default=0.0)
+            total_margin_usd      = max(margin_usds,      default=0.0)
+            total_maintenance_usd = max(maintenance_usds, default=0.0)
+            if len(currencies) > 1 and not self._cross_collateral_logged:
+                logger.info(
+                    "Cross-collateral account detected — margin and available "
+                    "funds single-counted across %d currencies (summing them "
+                    "would multiply the same account-wide figure by %d)",
+                    len(currencies), len(currencies),
+                )
+                self._cross_collateral_logged = True
+        else:
+            total_available_usd   = sum(available_usds)
+            total_margin_usd      = sum(margin_usds)
+            total_maintenance_usd = sum(maintenance_usds)
+
         self._equity_usd             = total_equity_usd
         self._available_cash         = max(0.0, total_available_usd)
         self._deribit_margin_usd     = total_margin_usd
         self._maintenance_margin_usd = total_maintenance_usd
         self._unrealized_pnl         = total_unrealized
+
+        self._check_available_cash_invariant()
+
+    def _check_available_cash_invariant(self) -> None:
+        """Warn if available cash exceeds equity — impossible for one account.
+
+        Available funds are equity (or margin balance) minus initial margin, so
+        they can never exceed equity.  A breach means the per-currency figures
+        were aggregated wrongly; this is the exact symptom the Phase 28a
+        double-count produced ($5,978 available against $3,486 equity) and went
+        unnoticed for weeks, so it is now surfaced directly rather than inferred.
+        """
+        equity = self._equity_usd
+        if equity <= 0:
+            return
+        ceiling = equity * (1.0 + config.AVAILABLE_CASH_INVARIANT_TOLERANCE_PCT)
+        if self._available_cash > ceiling:
+            logger.warning(
+                "AVAILABLE CASH INVARIANT BREACH: available $%.2f exceeds equity "
+                "$%.2f — per-currency account figures are being aggregated "
+                "incorrectly; position sizing is running off an inflated number",
+                self._available_cash, equity,
+            )
 
     def _authenticate(self) -> str:
         """Obtain a short-lived Deribit access token via client_credentials.
@@ -849,6 +903,12 @@ class PortfolioTracker:
 
     # ── Reconciliation ────────────────────────────────────────────────────────
 
+    def _reset_reconcile_escalation(self) -> None:
+        """Clear escalation state so a future mismatch starts a fresh count."""
+        self._reconcile_fingerprint = None
+        self._reconcile_repeat_count = 0
+        self._reconcile_escalated = False
+
     def _reconcile(self) -> None:
         """
         Warn if Deribit-reported margin and SQLite-computed margin diverge.
@@ -870,6 +930,37 @@ class PortfolioTracker:
             # (Phase 24a): the operator can see exactly what is open on the
             # exchange without logging into the Deribit UI separately.
             open_desc = self._describe_deribit_positions()
+
+            # ── Collateral-only divergence (Phase 28b) ────────────────────────
+            # Nothing open on either side: the DB has no open positions and
+            # Deribit reports no positions and no resting orders.  The residual
+            # Deribit margin is then the portfolio-margin haircut on the
+            # account's own crypto collateral, which the bot's SQLite figure
+            # (a sum of open-position net debits) can never match.  Warning
+            # every cycle about it is noise the operator cannot act on.
+            if (
+                config.RECONCILE_REQUIRE_POSITION_EVIDENCE
+                and db_margin <= 0
+                and not open_desc
+            ):
+                if not self._collateral_only_logged:
+                    logger.info(
+                        "Reconcile: Deribit reports $%.2f margin with no positions "
+                        "and no resting orders, and the DB has no open positions — "
+                        "attributing it to collateral margin on the account balance "
+                        "and suppressing the mismatch warning until something opens",
+                        api_margin,
+                    )
+                    self._collateral_only_logged = True
+                else:
+                    logger.debug(
+                        "Reconcile: collateral-only margin $%.2f — suppressed",
+                        api_margin,
+                    )
+                self._reset_reconcile_escalation()
+                return
+            self._collateral_only_logged = False
+
             if open_desc:
                 logger.warning(
                     "RECONCILE MISMATCH: Deribit margin $%.2f vs SQLite margin $%.2f "
@@ -883,12 +974,20 @@ class PortfolioTracker:
                     api_margin, db_margin, divergence * 100,
                 )
 
-            # ── Persistent-mismatch escalation (Phase 26f) ────────────────────
+            # ── Persistent-mismatch escalation (Phase 26f, fixed Phase 28c) ───
             # A mismatch that recurs unchanged cycle after cycle is an alarm, not
             # noise — warn-only forever means the operator may never notice.  Once
-            # the same fingerprint (rounded Deribit/SQLite margins) has persisted
-            # RECONCILE_ESCALATE_AFTER_CYCLES cycles, fire a single Telegram alert.
-            fingerprint = (round(api_margin), round(db_margin))
+            # the same fingerprint has persisted RECONCILE_ESCALATE_AFTER_CYCLES
+            # cycles, fire a single Telegram alert.
+            #
+            # The fingerprint is the live Deribit instrument set plus the DB
+            # margin, deliberately NOT the Deribit margin figure: that number is
+            # mark-to-market and drifts every cycle ($993.67 → $993.82 → …), so
+            # including it reset the counter and cleared the escalated flag
+            # whenever the rounded dollar changed.  The "one-shot" alert then
+            # re-armed and re-fired every time the value happened to hold steady
+            # for the threshold — 13 identical alerts over two days.
+            fingerprint = (open_desc, round(db_margin, 2))
             if fingerprint == self._reconcile_fingerprint:
                 self._reconcile_repeat_count += 1
             else:
@@ -901,11 +1000,17 @@ class PortfolioTracker:
                 and self._notifier is not None
             ):
                 try:
+                    # The leading text is held stable (the threshold constant, not
+                    # the live count or the drifting margin) because Notifier.send
+                    # deduplicates on the subject, which is the first 80 characters
+                    # of this message.  A varying prefix gave every alert a unique
+                    # key, defeating the cooldown as well as the one-shot flag.
                     self._notifier.notify_warning(
-                        f"RECONCILE MISMATCH persisting {self._reconcile_repeat_count} "
-                        f"cycles: Deribit margin ${api_margin:.2f} vs SQLite "
-                        f"${db_margin:.2f}. Deribit open: {open_desc or 'unknown'}. "
-                        f"Manual reconciliation required on Deribit."
+                        f"RECONCILE MISMATCH unresolved after "
+                        f"{config.RECONCILE_ESCALATE_AFTER_CYCLES} cycles — manual "
+                        f"reconciliation required on Deribit. "
+                        f"Deribit margin ${api_margin:.2f} vs SQLite ${db_margin:.2f}. "
+                        f"Deribit open: {open_desc or 'nothing reported'}."
                     )
                     self._reconcile_escalated = True
                     logger.warning(
@@ -917,9 +1022,8 @@ class PortfolioTracker:
         else:
             # Resolved — reset the escalation tracking so a future mismatch starts
             # its own fresh cycle count.
-            self._reconcile_fingerprint = None
-            self._reconcile_repeat_count = 0
-            self._reconcile_escalated = False
+            self._reset_reconcile_escalation()
+            self._collateral_only_logged = False
             logger.debug(
                 "RECONCILE OK: Deribit $%.2f vs SQLite $%.2f (divergence %.1f%%)",
                 api_margin, db_margin, divergence * 100,
@@ -927,6 +1031,25 @@ class PortfolioTracker:
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _is_cross_collateral(summary: dict) -> bool:
+    """True if this account summary describes a cross-collateral account.
+
+    On such an account (``margin_model`` ``cross_pm`` / ``cross_sm``, or
+    ``cross_collateral_enabled``) Deribit reports ``initial_margin``,
+    ``maintenance_margin`` and ``available_funds`` as one account-wide figure
+    denominated in the summary's own currency, so those fields must not be
+    summed across currencies (Phase 28a).
+
+    Absent both fields — which is how every pre-Phase-28 test fixture and any
+    segregated-margin account looks — this returns False and the historical
+    summing behaviour is preserved.
+    """
+    if summary.get("cross_collateral_enabled") is True:
+        return True
+    model = summary.get("margin_model")
+    return isinstance(model, str) and model.startswith("cross")
+
 
 def _assets_to_currencies(assets: list[str]) -> list[str]:
     """Deduplicate and return Deribit currency codes for the given asset list."""

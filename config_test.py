@@ -329,11 +329,19 @@ SPREAD_VALUE_BASIS = "exec"
 # gap that would otherwise only show up as a surprising realised loss.
 CLOSE_PROCEEDS_WARN_PCT = 0.50
 
-# When the same reconcile-mismatch fingerprint (Deribit vs SQLite margin) recurs
-# this many consecutive refresh cycles, escalate from a warn-only log to a
+# When the same reconcile-mismatch fingerprint (the live Deribit instrument set)
+# recurs this many consecutive refresh cycles, escalate from a warn-only log to a
 # one-shot Telegram alert — a mismatch that never resolves is an alarm, not noise
-# (portfolio/tracker.py).
+# (portfolio/tracker.py).  The fingerprint deliberately excludes the drifting
+# Deribit margin figure (Phase 28c).
 RECONCILE_ESCALATE_AFTER_CYCLES = 12
+
+# ── Phase 28 — cross-collateral accounting and reconcile scope ────────────────
+# The test account runs margin_model "cross_pm", which is exactly the account
+# shape these keys exist for, so both stay at the config.py defaults here.
+CROSS_COLLATERAL_SINGLE_COUNT          = True
+AVAILABLE_CASH_INVARIANT_TOLERANCE_PCT = 0.02
+RECONCILE_REQUIRE_POSITION_EVIDENCE    = True
 
 # Position sizing (strategy/sizer.py, execution/executor.py)
 MIN_CONTRACT_SIZE      = 0.1    # config-level sanity floor on contract size (BTC/ETH)

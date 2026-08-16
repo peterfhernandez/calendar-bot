@@ -1731,3 +1731,134 @@ which is why every observed `LegRiskError` was ETH and BTC simply never traded.
       network): the logged failure old vs new, both traded sides, untraded sides
       unaffected, zero-size handling, and the roll relaxation. Aborts in live
 - [x] Full suite green: 719 passing (712 + 7 new)
+
+---
+
+## Phase 28 — Cross-Collateral Margin Accounting and Reconcile Scope
+
+**Status:** Complete — all three sub-phases (28a–28c) implemented and tested.
+`tests/test_portfolio.py` goes from 52 to 74 tests (22 new); the full-suite
+failure set is unchanged from master (20 pre-existing test-ordering /
+Windows SQLite temp-dir failures, none in `test_portfolio.py`). Offline demo:
+`python -m scratch.scratch_cross_collateral_reconcile` (20 checks, no network,
+no live orders). Full root-cause detail in
+[BOT_PLAN.md Phase 28](BOT_PLAN.md#phase-28--cross-collateral-margin-accounting-and-reconcile-scope).
+
+Found from a Telegram screenshot: the same "RECONCILE MISMATCH persisting 12
+cycles: Deribit margin $994.11 vs SQLite $0.00. Deribit open: unknown." alert
+arrived 13 times over two days (01:26, 03:21, 05:16, 08:01, 10:41, 13:21,
+16:11 …), each claiming to be the one-shot escalation, while `/positions`
+replied "No open positions". A read-only probe of the test account
+(`private/get_account_summaries` extended, plus `private/get_positions` across
+all 14 currencies the account knows) found **zero positions and zero resting
+orders everywhere** — and non-zero margin in every currency.
+
+### 28a — Cross-collateral figures must not be summed across currencies
+
+- [x] **Root cause:** the account runs `margin_model = "cross_pm"` with
+      `cross_collateral_enabled = true`. Deribit reports `initial_margin`,
+      `maintenance_margin`, `available_funds` and `margin_balance` as ONE
+      account-wide figure denominated in each currency — the BTC row and the
+      ETH row are the same number in different units. Only `equity`/`balance`
+      are genuinely per-currency. `portfolio/tracker.py::_refresh_from_api`
+      accumulated all of them across `config.ASSETS`, multiplying margin and
+      available funds by the currency count (2× for BTC+ETH). Ground truth from
+      the account's BUIDL row (a ~$1-unit token, so already USD): initial margin
+      $496.83, available $2,988.52 — the bot logged $993.91 and $5,978.57
+- [x] **Impact beyond the alert:** `available_cash` feeds the sizer, so
+      `max_loss_usd=119.57 ... risk_cap=597.86` in the log is 2% and 10% of the
+      doubled figure — every test-mode position was sized off double the real
+      deployable capital. `margin_utilization_pct` read 22.8% instead of 11.4%,
+      making the Phase 17 margin gate twice as conservative as configured
+- [x] `_refresh_from_api` collects per-currency USD conversions and aggregates
+      at the end: equity and floating P&L still summed; margin, maintenance and
+      available_funds single-counted via `max()` on a cross-collateral account
+      (`max()` so a currency with a missing or zero summary cannot drag the
+      account total down)
+- [x] + `_is_cross_collateral(summary)` — reads `cross_collateral_enabled` and
+      `margin_model`; a summary carrying neither field (every pre-Phase-28 test
+      fixture, and any segregated account) reads as segregated and keeps the
+      historical summing, so the change is backwards compatible
+- [x] + `config.CROSS_COLLATERAL_SINGLE_COUNT` (default `True`) to disable it
+- [x] + `_check_available_cash_invariant()` — logs `AVAILABLE CASH INVARIANT
+      BREACH` when available cash exceeds equity beyond
+      `config.AVAILABLE_CASH_INVARIANT_TOLERANCE_PCT`. Available funds are
+      equity minus initial margin and can never exceed equity; the logged
+      `available_cash=$5978.57 equity=$3486.24` pair had been visible for weeks
+      with nothing checking it
+- [x] `tests/test_portfolio.py::TestCrossCollateralAggregation` (11 tests) —
+      margin/maintenance/available single-counted against the real account
+      figures; equity still summed; available never exceeds equity; margin
+      utilization uses the single-counted figure; a segregated account still
+      sums; the flag disables it; `_is_cross_collateral` field handling;
+      invariant fires on the exact logged pair and stays quiet when healthy
+
+### 28b — A collateral-only mismatch is not actionable
+
+- [x] **Root cause:** the residual $496.83 is not an orphan position. The
+      account holds BTC 0.0483 + ETH 0.2364 = $3,485 of crypto collateral, and
+      $496.83 is 14.25% of it with `maintenance / initial = 0.800` exactly —
+      the portfolio-margin haircut Deribit charges against non-USD collateral.
+      `_reconcile()` compares it against `_used_margin` (the sum of open-position
+      net debits, $0 with nothing open), so the divergence is 100% by
+      construction, every cycle, forever
+- [x] **Aug 14 expiry was a red herring:** the mismatch was $992.40 at 17:56
+      *with* `ETH-14AUG26-1700-P qty=12` open and $991.26 at 18:02 after it
+      expired — a long put requires no margin, so the $497 base never moved.
+      Phase 24b's `sync_stuck_positions` had nothing to reconcile (no stuck
+      trades), and `Deribit open: unknown` was accurate, not a bug
+- [x] `_reconcile()` suppresses the warning when the DB has no open positions
+      AND `_describe_deribit_positions()` reports no positions and no resting
+      orders; escalation state is reset in that branch
+- [x] The state transition is logged once at INFO naming the amount and
+      attributing it to collateral margin, subsequent cycles at DEBUG — quiet,
+      not invisible
+- [x] + `config.RECONCILE_REQUIRE_POSITION_EVIDENCE` (default `True`) to disable
+- [x] `tests/test_portfolio.py::TestReconcileCollateralOnly` (6 tests) — no
+      warning and no alert when nothing is open on either side, even past the
+      escalation threshold; the INFO transition logs exactly once; a real
+      untracked Deribit position still warns (Phase 24a regression guard); an
+      open DB position missing from Deribit still warns; the flag disables it
+
+### 28c — The one-shot escalation re-armed on a drifting number
+
+- [x] **Root cause:** the fingerprint was
+      `(round(api_margin), round(db_margin))`, and `api_margin` is
+      mark-to-market — $993.67, $993.82, $993.88, $993.91, $994.11, $994.53.
+      Whenever the rounded dollar changed, the `else` branch reset
+      `_reconcile_repeat_count = 1` AND cleared `_reconcile_escalated`,
+      re-arming the alert; it then fired again as soon as the value held steady
+      for `RECONCILE_ESCALATE_AFTER_CYCLES` consecutive cycles. Hence 13 alerts
+      every 2–3 hours, each honestly reporting "after 12 cycles"
+- [x] **The notifier could not absorb them either:** `Notifier.send` dedups on
+      `event_type:subject`, and `notify_warning` builds the subject from
+      `msg[:80]`, which contained the changing dollar amount — a unique key per
+      alert. `ALERT_COOLDOWN_SEC = 300` is shorter than the gap regardless
+- [x] Fingerprint becomes `(open_desc, round(db_margin, 2))` — the live Deribit
+      instrument set plus the DB margin, both stable while the condition
+      persists; the drifting margin figure is excluded
+- [x] `_reconcile_escalated` clears only when the mismatch genuinely resolves,
+      via the new shared `_reset_reconcile_escalation()` helper
+- [x] Alert text reordered so its first 80 characters are stable (the threshold
+      constant, not the live count or the drifting margin), making the
+      notifier's dedup key stable too
+- [x] `tests/test_portfolio.py::TestReconcileEscalationStability` (5 tests) —
+      120 cycles of the actually-observed drifting margins produce exactly one
+      alert; escalation fires exactly at the threshold; a changed instrument set
+      re-arms; the dedup subject is identical across differing margins; a
+      resolved mismatch clears the state
+
+### 28d — Config parity, docs, and verification
+
+- [x] `config_test.py` gains the three new keys at `config.py` defaults (the
+      test account is precisely the `cross_pm` account they exist for);
+      `tests/test_config_centralization.py::TestConfigTestParity` passes
+- [x] `scratch/scratch_cross_collateral_reconcile.py` — offline demo (20 checks,
+      no network): reproduces the logged $993.91 margin and $5,978.57 available
+      cash against the old path, shows the single-counted values matching the
+      BUIDL ground truth, the per-trade risk budget halving from $119.54 to
+      $59.77, the invariant breach on the exact logged pair, the suppression,
+      and 120 drifting cycles producing one alert. Aborts in live mode
+- [x] README.md Known Issues updated
+- [x] `tests/test_portfolio.py` 74 passing (was 52); full-suite failure set
+      byte-identical to master's, so no regressions were introduced
