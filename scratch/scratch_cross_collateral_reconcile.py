@@ -45,9 +45,7 @@ Run from the repo root:
 Aborts if TRADING_MODE == "live".
 """
 
-import gc
 import logging
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -406,21 +404,17 @@ def main() -> None:
     print("  Phase 28 — cross-collateral accounting and reconcile scope")
     print("=" * 72)
 
-    # mkdtemp + tolerant rmtree rather than TemporaryDirectory: db/state.py's
-    # get_connection() hands out a fresh sqlite3 connection per call and
-    # `with get_connection(...)` is a transaction scope, not a close, so on
-    # Windows the file can still be held when the directory is removed.
-    td = tempfile.mkdtemp(prefix="scratch_phase28_")
-    try:
+    # `with get_connection(...)` now closes the handle at block exit, so a
+    # plain TemporaryDirectory cleans up reliably on Windows too.  (This used
+    # to need mkdtemp + a tolerant rmtree because the connection stayed open
+    # until a cyclic-GC pass ran — see scratch/scratch_db_connection_lifecycle.py.)
+    with tempfile.TemporaryDirectory(prefix="scratch_phase28_") as td:
         db = Path(td) / "scratch_phase28.db"
         init_db(db)
         demo_double_count(db)
         demo_invariant(db)
         demo_collateral_only(db)
         demo_escalation(db)
-    finally:
-        gc.collect()
-        shutil.rmtree(td, ignore_errors=True)
 
     print("\n" + "=" * 72)
     failed = [lbl for lbl, r in results if r == FAIL]
