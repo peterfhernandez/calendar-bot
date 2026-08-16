@@ -404,11 +404,44 @@ SPREAD_VALUE_BASIS = "mark"
 # gap that would otherwise only show up as a surprising realised loss.
 CLOSE_PROCEEDS_WARN_PCT = 0.50
 
-# When the same reconcile-mismatch fingerprint (Deribit vs SQLite margin) recurs
-# this many consecutive refresh cycles, escalate from a warn-only log to a
+# When the same reconcile-mismatch fingerprint (the live Deribit instrument set)
+# recurs this many consecutive refresh cycles, escalate from a warn-only log to a
 # one-shot Telegram alert — a mismatch that never resolves is an alarm, not noise
-# (portfolio/tracker.py).
+# (portfolio/tracker.py).  The fingerprint deliberately excludes the Deribit
+# margin figure: that number is mark-to-market and drifts every cycle, which used
+# to re-arm the "one-shot" alert indefinitely (Phase 28c).
 RECONCILE_ESCALATE_AFTER_CYCLES = 12
+
+# ── Phase 28 — cross-collateral accounting and reconcile scope ────────────────
+# On a Deribit account with cross collateral enabled (margin_model "cross_pm" /
+# "cross_sm"), private/get_account_summary reports initial_margin,
+# maintenance_margin and available_funds as ONE ACCOUNT-WIDE figure denominated
+# in each currency — the BTC row and the ETH row are the same number in
+# different units, not two separate pots.  Only equity/balance are genuinely
+# per-currency.  Summing the account-wide fields across ASSETS therefore
+# multiplies them by the number of currencies scanned (2x for BTC+ETH), which
+# inflated available_cash (and so position sizing) and doubled the margin figure
+# fed to reconcile.  When True, those fields are single-counted on a
+# cross-collateral account; equity is still summed.  Set False to restore the
+# pre-Phase-28 summing behaviour.
+CROSS_COLLATERAL_SINGLE_COUNT = True
+
+# Sanity invariant: available cash can never exceed account equity.  A breach
+# means the per-currency aggregation is wrong (the exact symptom of the
+# double-count above), so it is logged as a WARNING naming both figures.
+# Tolerance absorbs spot-timing jitter between the two conversions.
+AVAILABLE_CASH_INVARIANT_TOLERANCE_PCT = 0.02
+
+# A reconcile mismatch is only actionable when something is actually open on one
+# side or the other.  On a portfolio-margin account the exchange charges margin
+# against the account's own crypto collateral (a ~14% haircut on spot BTC/ETH
+# balances), so Deribit reports non-zero margin with zero positions — which can
+# never match the bot's SQLite figure (the sum of open-position net debits) and
+# produced a permanent 100%-divergence warning every scan cycle.  When True, the
+# mismatch warning is suppressed if the DB has no open positions AND Deribit
+# reports no positions and no resting orders; the state transition is still
+# logged once at INFO so the condition is never silently invisible.
+RECONCILE_REQUIRE_POSITION_EVIDENCE = True
 
 # Position sizing (strategy/sizer.py, execution/executor.py)
 MIN_CONTRACT_SIZE      = 0.1    # config-level sanity floor on contract size (BTC/ETH)

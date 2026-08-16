@@ -8,6 +8,7 @@ to avoid any live network calls.
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import config
 from db.state import init_db, get_connection, create_calendar_trade
 from portfolio.tracker import (
     PortfolioTracker,
@@ -1203,3 +1205,315 @@ class TestKindAnyReconcile:
         db = _make_db()
         with patch("config.TRADING_MODE", "paper"):
             assert self._tracker(db).get_deribit_open_orders("BTC") == []
+
+
+# ── Tests: Phase 28 — cross-collateral accounting and reconcile scope ────────
+
+def _capture_tracker_logs(level=logging.WARNING) -> tuple[list, callable]:
+    """Attach a capturing handler to portfolio.tracker; return (records, detach)."""
+    records: list[logging.LogRecord] = []
+
+    class CapturingHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    log = logging.getLogger("portfolio.tracker")
+    handler = CapturingHandler()
+    handler.setLevel(level)
+    log.addHandler(handler)
+    old_level = log.level
+    log.setLevel(level)
+
+    def detach():
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+
+    return records, detach
+
+
+class TestCrossCollateralAggregation:
+    """Phase 28a: account-wide figures must not be summed across currencies.
+
+    On a cross-collateral account Deribit reports initial_margin,
+    maintenance_margin and available_funds as ONE account-wide number
+    denominated in each currency.  The BTC row and the ETH row are the same
+    figure in different units.  Summing them multiplied margin and available
+    cash by the currency count (2x for BTC+ETH), which inflated position sizing
+    and doubled the number fed to reconcile.
+    """
+
+    # Account-wide truth, mirroring the live test account that surfaced this:
+    # $496.83 initial margin / $2,988.52 available, held as BTC + ETH balances.
+    BTC_SPOT = 62_990.79
+    ETH_SPOT = 1_877.39
+    ACCOUNT_IM_USD    = 496.83
+    ACCOUNT_MM_USD    = 397.46
+    ACCOUNT_AVAIL_USD = 2_988.52
+    BTC_EQUITY = 0.04828025    # $3,041.21
+    ETH_EQUITY = 0.236425      # $443.86
+
+    def _summaries(self, cross: bool) -> dict:
+        """Both currencies carry the same account-wide figures in own units."""
+        def row(currency, equity, spot):
+            s = {
+                "currency":           currency,
+                "equity":             equity,
+                "balance":            equity,
+                "available_funds":    self.ACCOUNT_AVAIL_USD / spot,
+                "initial_margin":     self.ACCOUNT_IM_USD / spot,
+                "maintenance_margin": self.ACCOUNT_MM_USD / spot,
+            }
+            if cross:
+                s["cross_collateral_enabled"] = True
+                s["margin_model"] = "cross_pm"
+            return s
+
+        return {
+            "BTC": row("BTC", self.BTC_EQUITY, self.BTC_SPOT),
+            "ETH": row("ETH", self.ETH_EQUITY, self.ETH_SPOT),
+        }
+
+    def _refresh(self, cross: bool, single_count: bool = True) -> PortfolioTracker:
+        db = _make_db()
+        summaries = self._summaries(cross)
+
+        def fake_rest_get(url, bearer_token=None, timeout=10):
+            if "public/auth" in url:
+                return _fake_auth_response()
+            if "get_account_summary" in url:
+                for currency, summary in summaries.items():
+                    if f"currency={currency}" in url:
+                        return {"result": summary}
+            return {"result": []}
+
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        with patch("portfolio.tracker._rest_post", side_effect=_fake_rest_post), \
+             patch("portfolio.tracker._rest_get", side_effect=fake_rest_get), \
+             patch("config.ASSETS", ["BTC", "ETH"]), \
+             patch("config.CROSS_COLLATERAL_SINGLE_COUNT", single_count):
+            tracker.refresh(spot_prices={"BTC": self.BTC_SPOT, "ETH": self.ETH_SPOT})
+        return tracker
+
+    def test_cross_collateral_margin_is_single_counted(self):
+        tracker = self._refresh(cross=True)
+        # Not 2 x 496.83 = 993.66 (the logged, wrong figure).
+        assert tracker._deribit_margin_usd == pytest.approx(self.ACCOUNT_IM_USD, abs=0.5)
+
+    def test_cross_collateral_maintenance_is_single_counted(self):
+        tracker = self._refresh(cross=True)
+        assert tracker.maintenance_margin_usd == pytest.approx(self.ACCOUNT_MM_USD, abs=0.5)
+
+    def test_cross_collateral_available_cash_is_single_counted(self):
+        tracker = self._refresh(cross=True)
+        # Not 2 x 2988.52 = 5977 — the number that doubled every position size.
+        assert tracker.available_cash == pytest.approx(self.ACCOUNT_AVAIL_USD, abs=0.5)
+
+    def test_equity_is_still_summed_across_currencies(self):
+        """Equity IS genuinely per-currency, so summing it stays correct."""
+        tracker = self._refresh(cross=True)
+        expected = self.BTC_EQUITY * self.BTC_SPOT + self.ETH_EQUITY * self.ETH_SPOT
+        assert tracker.equity_usd == pytest.approx(expected, abs=0.5)
+
+    def test_available_cash_never_exceeds_equity(self):
+        tracker = self._refresh(cross=True)
+        assert tracker.available_cash <= tracker.equity_usd
+
+    def test_margin_utilization_uses_single_counted_margin(self):
+        tracker = self._refresh(cross=True)
+        expected = self.ACCOUNT_MM_USD / tracker.equity_usd
+        assert tracker.margin_utilization_pct == pytest.approx(expected, abs=0.005)
+
+    def test_segregated_account_still_sums(self):
+        """Regression: a non-cross account keeps the historical summing."""
+        tracker = self._refresh(cross=False)
+        assert tracker._deribit_margin_usd == pytest.approx(2 * self.ACCOUNT_IM_USD, abs=1.0)
+
+    def test_single_count_can_be_disabled(self):
+        tracker = self._refresh(cross=True, single_count=False)
+        assert tracker._deribit_margin_usd == pytest.approx(2 * self.ACCOUNT_IM_USD, abs=1.0)
+
+    def test_margin_model_field_alone_detects_cross(self):
+        from portfolio.tracker import _is_cross_collateral
+        assert _is_cross_collateral({"margin_model": "cross_pm"}) is True
+        assert _is_cross_collateral({"margin_model": "segregated_pm"}) is False
+        assert _is_cross_collateral({"cross_collateral_enabled": True}) is True
+        # Pre-Phase-28 fixtures carry neither field and must read as segregated.
+        assert _is_cross_collateral({"equity": 1.0}) is False
+
+    def test_invariant_breach_is_logged(self):
+        """available > equity is impossible — it must not pass silently."""
+        db = _make_db()
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        tracker._equity_usd = 3_486.24
+        tracker._available_cash = 5_978.57   # the doubled figure from the log
+        records, detach = _capture_tracker_logs()
+        try:
+            tracker._check_available_cash_invariant()
+        finally:
+            detach()
+        assert any("AVAILABLE CASH INVARIANT BREACH" in r.getMessage() for r in records)
+
+    def test_invariant_quiet_when_healthy(self):
+        db = _make_db()
+        tracker = PortfolioTracker(
+            db_path=db, client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com",
+        )
+        tracker._equity_usd = 3_486.24
+        tracker._available_cash = 2_988.52
+        records, detach = _capture_tracker_logs()
+        try:
+            tracker._check_available_cash_invariant()
+        finally:
+            detach()
+        assert not any("INVARIANT BREACH" in r.getMessage() for r in records)
+
+
+class TestReconcileCollateralOnly:
+    """Phase 28b: a dollar-only divergence with nothing open is not actionable."""
+
+    def _tracker(self, open_desc: str, db_margin: float, api_margin: float = 496.83):
+        tracker = PortfolioTracker(
+            db_path=_make_db(), client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com", notifier=MagicMock(),
+        )
+        tracker._describe_deribit_positions = MagicMock(return_value=open_desc)
+        tracker._used_margin = db_margin
+        tracker._deribit_margin_usd = api_margin
+        return tracker
+
+    def _run(self, tracker, level=logging.WARNING):
+        records, detach = _capture_tracker_logs(level)
+        try:
+            tracker._reconcile()
+        finally:
+            detach()
+        return [r.getMessage() for r in records]
+
+    def test_no_warning_when_nothing_open_anywhere(self):
+        """The exact live case: $496.83 collateral haircut, zero positions."""
+        tracker = self._tracker(open_desc="", db_margin=0.0)
+        msgs = self._run(tracker)
+        assert not any("RECONCILE MISMATCH" in m for m in msgs)
+
+    def test_state_transition_logged_once_at_info(self):
+        tracker = self._tracker(open_desc="", db_margin=0.0)
+        msgs = self._run(tracker, level=logging.INFO)
+        assert any("collateral margin on the account balance" in m for m in msgs)
+        # Second cycle must not repeat the INFO line.
+        again = self._run(tracker, level=logging.INFO)
+        assert not any("collateral margin on the account balance" in m for m in again)
+
+    def test_no_escalation_alert_for_collateral_only(self):
+        tracker = self._tracker(open_desc="", db_margin=0.0)
+        for _ in range(config.RECONCILE_ESCALATE_AFTER_CYCLES + 5):
+            tracker._reconcile()
+        tracker._notifier.notify_warning.assert_not_called()
+
+    def test_still_warns_when_deribit_has_a_position(self):
+        """Regression guard for Phase 24a: untracked exchange inventory."""
+        tracker = self._tracker(
+            open_desc="BTC-15JUL26-64000-C (option) qty=0.1", db_margin=0.0
+        )
+        msgs = self._run(tracker)
+        assert any("RECONCILE MISMATCH" in m for m in msgs)
+
+    def test_still_warns_when_db_has_open_positions(self):
+        tracker = self._tracker(open_desc="", db_margin=1_500.0, api_margin=10.0)
+        msgs = self._run(tracker)
+        assert any("RECONCILE MISMATCH" in m for m in msgs)
+
+    def test_suppression_can_be_disabled(self):
+        tracker = self._tracker(open_desc="", db_margin=0.0)
+        records, detach = _capture_tracker_logs()
+        try:
+            with patch("config.RECONCILE_REQUIRE_POSITION_EVIDENCE", False):
+                tracker._reconcile()
+        finally:
+            detach()
+        assert any("RECONCILE MISMATCH" in r.getMessage() for r in records)
+
+
+class TestReconcileEscalationStability:
+    """Phase 28c: a drifting margin figure must not re-arm the one-shot alert."""
+
+    def _tracker(self, notifier, open_desc="BTC-15JUL26-64000-C (option) qty=0.1"):
+        tracker = PortfolioTracker(
+            db_path=_make_db(), client_id="id", client_secret="secret",
+            rest_url="https://test.deribit.com", notifier=notifier,
+        )
+        tracker._describe_deribit_positions = MagicMock(return_value=open_desc)
+        tracker._used_margin = 0.0
+        tracker._deribit_margin_usd = 993.91
+        return tracker
+
+    def test_drifting_margin_does_not_re_alert(self):
+        """The reported bug: 13 alerts over two days from one condition.
+
+        Margin marks to market every cycle, so the old
+        (round(api_margin), round(db_margin)) fingerprint changed constantly,
+        resetting the counter and clearing the escalated flag.
+        """
+        notifier = MagicMock()
+        tracker = self._tracker(notifier)
+        drift = [993.67, 993.82, 993.88, 993.91, 994.11, 994.53, 994.36, 995.45,
+                 993.99, 994.82, 993.91, 994.00, 993.69, 993.68, 996.10, 992.40]
+        for i in range(60):
+            tracker._deribit_margin_usd = drift[i % len(drift)]
+            tracker._reconcile()
+        assert notifier.notify_warning.call_count == 1
+
+    def test_escalates_exactly_at_threshold(self):
+        notifier = MagicMock()
+        tracker = self._tracker(notifier)
+        for _ in range(config.RECONCILE_ESCALATE_AFTER_CYCLES - 1):
+            tracker._deribit_margin_usd += 0.13   # drift every cycle
+            tracker._reconcile()
+        notifier.notify_warning.assert_not_called()
+        tracker._deribit_margin_usd += 0.13
+        tracker._reconcile()
+        notifier.notify_warning.assert_called_once()
+
+    def test_changed_instrument_set_re_arms(self):
+        """A genuinely different situation should alert again."""
+        notifier = MagicMock()
+        tracker = self._tracker(notifier)
+        for _ in range(config.RECONCILE_ESCALATE_AFTER_CYCLES):
+            tracker._reconcile()
+        assert notifier.notify_warning.call_count == 1
+        tracker._describe_deribit_positions = MagicMock(
+            return_value="ETH-14AUG26-1700-P (option) qty=12.0"
+        )
+        for _ in range(config.RECONCILE_ESCALATE_AFTER_CYCLES):
+            tracker._reconcile()
+        assert notifier.notify_warning.call_count == 2
+
+    def test_alert_prefix_is_stable_for_notifier_dedup(self):
+        """Notifier.send dedups on subject = first 80 chars of the message."""
+        subjects = []
+        for margin in (993.67, 995.45, 991.26):
+            notifier = MagicMock()
+            tracker = self._tracker(notifier)
+            tracker._deribit_margin_usd = margin
+            for _ in range(config.RECONCILE_ESCALATE_AFTER_CYCLES):
+                tracker._reconcile()
+            msg = notifier.notify_warning.call_args[0][0]
+            subjects.append(msg[:80])
+        assert len(set(subjects)) == 1, f"unstable dedup subjects: {subjects}"
+
+    def test_resolved_mismatch_clears_escalation(self):
+        notifier = MagicMock()
+        tracker = self._tracker(notifier)
+        for _ in range(config.RECONCILE_ESCALATE_AFTER_CYCLES):
+            tracker._reconcile()
+        notifier.notify_warning.assert_called_once()
+        tracker._used_margin = 993.91          # margins now agree
+        tracker._reconcile()
+        assert tracker._reconcile_repeat_count == 0
+        assert tracker._reconcile_escalated is False
