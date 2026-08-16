@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import logging
 import math
-import sqlite3
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -42,7 +41,7 @@ from typing import Iterator
 import config
 from data.chain_cache import ChainCache
 from data.deribit_feed import TickerSnapshot
-from db.state import get_calendar_stats, init_db
+from db.state import get_calendar_stats, get_connection, init_db
 from strategy.decision import DecisionEngine, DryRunExecutor
 from strategy.scanner import CalendarCandidate
 
@@ -263,8 +262,10 @@ class BacktestEngine:
             "Win (Auto TP)", "Loss (Auto Stop)", "Loss (Stop)", "Loss (Early)",
         )
         placeholders = ",".join("?" * len(closed_statuses))
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
+        # get_connection (not a bare sqlite3.connect) so the handle is closed at
+        # block exit — `with` on a plain sqlite3 connection ends the transaction
+        # but leaves the file open, which blocks deleting the temp DB on Windows.
+        with get_connection(db_path) as conn:
             rows = conn.execute(
                 f"SELECT * FROM calendar_trades WHERE result IN ({placeholders}) ORDER BY date_close, id",
                 closed_statuses,

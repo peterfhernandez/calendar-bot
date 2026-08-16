@@ -57,8 +57,45 @@ class CalendarTrade:
     manual_close_spread: Optional[float] = field(default=None)  # User-entered close value
 
 
+class _ScopedConnection(sqlite3.Connection):
+    """
+    A ``sqlite3.Connection`` that also closes itself when used as a context
+    manager.
+
+    Plain ``sqlite3`` treats ``with conn:`` as a *transaction* scope — it
+    commits or rolls back on exit but deliberately leaves the connection open.
+    Every ``with get_connection(...) as conn:`` block in this codebase is a
+    complete unit of work, so leaving the handle open served no purpose and
+    caused a real bug: sqlite3 keeps an internal LRU statement cache whose
+    entries reference the connection back, forming a reference cycle.  That
+    cycle makes the connection unreachable by refcounting, so the file handle
+    survived until the *cyclic* garbage collector happened to run.  On Windows
+    an open handle blocks directory removal, so a test that wrote its DB into a
+    ``TemporaryDirectory`` failed with ``PermissionError: [WinError 32]``
+    depending on nothing more than GC timing.
+
+    Closing on ``__exit__`` makes the release deterministic on every platform.
+    Callers that want a long-lived handle can still use the connection without
+    ``with`` and close it themselves.
+    """
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            # Preserve sqlite3's commit-on-success / rollback-on-error semantics.
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    """
+    Open a connection to the trade database.
+
+    Used as a context manager (``with get_connection(p) as conn:``) the
+    connection commits or rolls back *and closes* on exit — see
+    ``_ScopedConnection`` for why closing matters here.
+    """
+    conn = sqlite3.connect(db_path, factory=_ScopedConnection)
     conn.row_factory = sqlite3.Row
     return conn
 

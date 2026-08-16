@@ -903,275 +903,243 @@ class TestSetMyCommands:
 
 
 @pytest.mark.asyncio
-async def test_handle_info_displays_position_status():
+async def test_handle_info_displays_position_status(tmp_path):
     """Test /info command displays current position status and market prices."""
-    from db.state import create_calendar_trade, get_connection
+    from db.state import create_calendar_trade
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test.db"
-        init_db(db_path)
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
 
-        # Create an open trade
-        trade_id = create_calendar_trade(
-            asset="BTC",
-            date_open=datetime.now(timezone.utc).date(),
-            option_type="Call",
-            strike=95_000.0,
-            expiry_near="2026-07-03",
-            expiry_far="2026-07-31",
-            near_days=3,
-            far_days=31,
-            qty=2.0,
-            spot_open=100_000.0,
-            near_prem=0.015,
-            far_prem=0.025,
-            net_debit=0.010,
-            near_instrument="BTC-3JUL26-95000-C",
-            far_instrument="BTC-31JUL26-95000-C",
-            open_fees=0.002,
-            db_path=db_path,
-        ).id
+    # Create an open trade
+    trade_id = create_calendar_trade(
+        asset="BTC",
+        date_open=datetime.now(timezone.utc).date(),
+        option_type="Call",
+        strike=95_000.0,
+        expiry_near="2026-07-03",
+        expiry_far="2026-07-31",
+        near_days=3,
+        far_days=31,
+        qty=2.0,
+        spot_open=100_000.0,
+        near_prem=0.015,
+        far_prem=0.025,
+        net_debit=0.010,
+        near_instrument="BTC-3JUL26-95000-C",
+        far_instrument="BTC-31JUL26-95000-C",
+        open_fees=0.002,
+        db_path=db_path,
+    ).id
 
-        # Mock Telegram update and context
-        update = AsyncMock()
-        update.message = AsyncMock()
-        context = MagicMock()
-        context.args = [f"trade_id={trade_id}"]
+    # Mock Telegram update and context
+    update = AsyncMock()
+    update.message = AsyncMock()
+    context = MagicMock()
+    context.args = [f"trade_id={trade_id}"]
 
-        # Mock cache with live prices
-        cache = MagicMock()
-        near_snap = MagicMock()
-        near_snap.bid = 0.014
-        near_snap.ask = 0.016
-        far_snap = MagicMock()
-        far_snap.bid = 0.024
-        far_snap.ask = 0.026
-        cache.get.side_effect = lambda inst: near_snap if "3JUL" in inst else far_snap
+    # Mock cache with live prices
+    cache = MagicMock()
+    near_snap = MagicMock()
+    near_snap.bid = 0.014
+    near_snap.ask = 0.016
+    far_snap = MagicMock()
+    far_snap.bid = 0.024
+    far_snap.ask = 0.026
+    cache.get.side_effect = lambda inst: near_snap if "3JUL" in inst else far_snap
 
-        # Call handler
-        await handlers.handle_info(update, context, cache, db_path)
+    # Call handler
+    await handlers.handle_info(update, context, cache, db_path)
 
-        # Verify response was sent
-        update.message.reply_text.assert_called_once()
-        response = update.message.reply_text.call_args[0][0]
+    # Verify response was sent
+    update.message.reply_text.assert_called_once()
+    response = update.message.reply_text.call_args[0][0]
 
-        # Verify response contains expected information
-        assert f"Trade #{trade_id} Status" in response
-        assert "BTC" in response
-        assert "95000" in response
-        assert "Current Market Prices" in response
-        assert "Near leg" in response
-        assert "0.014" in response and "0.016" in response
-        assert "Far leg" in response
-        assert "0.024" in response and "0.026" in response
-        assert "Unrealized P&L" in response
-
-        # Close all database connections before temp directory cleanup
-        try:
-            conn = get_connection(db_path)
-            conn.close()
-        except Exception:
-            pass
+    # Verify response contains expected information
+    assert f"Trade #{trade_id} Status" in response
+    assert "BTC" in response
+    assert "95000" in response
+    assert "Current Market Prices" in response
+    assert "Near leg" in response
+    assert "0.014" in response and "0.016" in response
+    assert "Far leg" in response
+    assert "0.024" in response and "0.026" in response
+    assert "Unrealized P&L" in response
 
 
 @pytest.mark.asyncio
-async def test_handle_info_handles_missing_cache():
+async def test_handle_info_handles_missing_cache(tmp_path):
     """Test /info command handles missing/stale cache data gracefully."""
-    from db.state import create_calendar_trade, get_connection
+    from db.state import create_calendar_trade
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test.db"
-        init_db(db_path)
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
 
-        # Create an open trade
-        trade_id = create_calendar_trade(
-            asset="BTC",
-            date_open=datetime.now(timezone.utc).date(),
-            option_type="Put",
-            strike=90_000.0,
-            expiry_near="2026-07-05",
-            expiry_far="2026-08-02",
-            near_days=5,
-            far_days=33,
-            qty=1.0,
-            spot_open=100_000.0,
-            near_prem=0.02,
-            far_prem=0.03,
-            net_debit=0.01,
-            near_instrument="BTC-5JUL26-90000-P",
-            far_instrument="BTC-2AUG26-90000-P",
-            open_fees=0.001,
-            db_path=db_path,
-        ).id
+    # Create an open trade
+    trade_id = create_calendar_trade(
+        asset="BTC",
+        date_open=datetime.now(timezone.utc).date(),
+        option_type="Put",
+        strike=90_000.0,
+        expiry_near="2026-07-05",
+        expiry_far="2026-08-02",
+        near_days=5,
+        far_days=33,
+        qty=1.0,
+        spot_open=100_000.0,
+        near_prem=0.02,
+        far_prem=0.03,
+        net_debit=0.01,
+        near_instrument="BTC-5JUL26-90000-P",
+        far_instrument="BTC-2AUG26-90000-P",
+        open_fees=0.001,
+        db_path=db_path,
+    ).id
 
-        # Mock Telegram update and context
-        update = AsyncMock()
-        update.message = AsyncMock()
-        context = MagicMock()
-        context.args = [f"trade_id={trade_id}"]
+    # Mock Telegram update and context
+    update = AsyncMock()
+    update.message = AsyncMock()
+    context = MagicMock()
+    context.args = [f"trade_id={trade_id}"]
 
-        # Mock cache with no data (returns None)
-        cache = MagicMock()
-        cache.get.return_value = None
+    # Mock cache with no data (returns None)
+    cache = MagicMock()
+    cache.get.return_value = None
 
-        # Call handler
-        await handlers.handle_info(update, context, cache, db_path)
+    # Call handler
+    await handlers.handle_info(update, context, cache, db_path)
 
-        # Verify response was sent
-        update.message.reply_text.assert_called_once()
-        response = update.message.reply_text.call_args[0][0]
+    # Verify response was sent
+    update.message.reply_text.assert_called_once()
+    response = update.message.reply_text.call_args[0][0]
 
-        # Verify response indicates cache data is missing
-        assert f"Trade #{trade_id} Status" in response
-        assert "NOT IN CACHE" in response
-        assert "Cannot calculate current P&L" in response
-
-        # Close all database connections before temp directory cleanup
-        try:
-            conn = get_connection(db_path)
-            conn.close()
-        except Exception:
-            pass
+    # Verify response indicates cache data is missing
+    assert f"Trade #{trade_id} Status" in response
+    assert "NOT IN CACHE" in response
+    assert "Cannot calculate current P&L" in response
 
 
 @pytest.mark.asyncio
-async def test_handle_close_resets_close_stuck_flag():
+async def test_handle_close_resets_close_stuck_flag(tmp_path):
     """Test /close command resets close_stuck flag in database and clears notification flag."""
-    from db.state import mark_position_close_stuck, get_connection
+    from db.state import mark_position_close_stuck
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test.db"
-        init_db(db_path)
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
 
-        # Create a trade using the test fixture
-        trade = _make_trade(trade_id=42, asset="BTC")
+    # Create a trade using the test fixture
+    trade = _make_trade(trade_id=42, asset="BTC")
 
-        # Insert it into the database
-        from db.state import create_calendar_trade
-        db_trade = create_calendar_trade(
-            asset=trade.asset,
-            date_open=datetime.fromisoformat(trade.date_open).date(),
-            option_type=trade.option_type,
-            strike=trade.strike,
-            expiry_near=trade.expiry_near,
-            expiry_far=trade.expiry_far,
-            near_days=1,
-            far_days=7,
-            qty=trade.qty,
-            spot_open=100000.0,
-            near_prem=0.01,
-            far_prem=0.02,
-            net_debit=trade.net_debit,
-            open_fees=trade.open_fees,
-            near_instrument=trade.near_instrument,
-            far_instrument=trade.far_instrument,
-            ev_score=trade.ev_score,
-            db_path=db_path,
-        )
+    # Insert it into the database
+    from db.state import create_calendar_trade
+    db_trade = create_calendar_trade(
+        asset=trade.asset,
+        date_open=datetime.fromisoformat(trade.date_open).date(),
+        option_type=trade.option_type,
+        strike=trade.strike,
+        expiry_near=trade.expiry_near,
+        expiry_far=trade.expiry_far,
+        near_days=1,
+        far_days=7,
+        qty=trade.qty,
+        spot_open=100000.0,
+        near_prem=0.01,
+        far_prem=0.02,
+        net_debit=trade.net_debit,
+        open_fees=trade.open_fees,
+        near_instrument=trade.near_instrument,
+        far_instrument=trade.far_instrument,
+        ev_score=trade.ev_score,
+        db_path=db_path,
+    )
 
-        # Mark it as stuck
-        mark_position_close_stuck(
-            trade_id=db_trade.id,
-            error_reason="Test close failure",
-            intended_close_reason="stop-loss",
-            db_path=db_path,
-        )
+    # Mark it as stuck
+    mark_position_close_stuck(
+        trade_id=db_trade.id,
+        error_reason="Test close failure",
+        intended_close_reason="stop-loss",
+        db_path=db_path,
+    )
 
-        # Create engine and add to notified_stuck
-        mock_cache = MagicMock()
-        engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
-        engine._notified_stuck.add(db_trade.id)
-        engine._close_roll_failures[db_trade.id] = 3  # stale retry counter
+    # Create engine and add to notified_stuck
+    mock_cache = MagicMock()
+    engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
+    engine._notified_stuck.add(db_trade.id)
+    engine._close_roll_failures[db_trade.id] = 3  # stale retry counter
 
-        # Mock Telegram update and context
-        update = AsyncMock()
-        update.message = AsyncMock()
-        context = MagicMock()
-        context.args = ["trade_id=" + str(db_trade.id)]
+    # Mock Telegram update and context
+    update = AsyncMock()
+    update.message = AsyncMock()
+    context = MagicMock()
+    context.args = ["trade_id=" + str(db_trade.id)]
 
-        # Call handler
-        await handlers.handle_close(update, context, engine, db_path)
+    # Call handler
+    await handlers.handle_close(update, context, engine, db_path)
 
-        # Verify notification flag was cleared
-        assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
+    # Verify notification flag was cleared
+    assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
 
-        # Verify retry counter was dropped so the retried close gets fresh attempts
-        assert db_trade.id not in engine._close_roll_failures, "Retry counter should be cleared"
+    # Verify retry counter was dropped so the retried close gets fresh attempts
+    assert db_trade.id not in engine._close_roll_failures, "Retry counter should be cleared"
 
-        # Verify DB was updated
-        trades = get_open_trades(db_path)
-        assert len(trades) == 1
-        assert trades[0].close_status == "open", "close_status should be reset to 'open'"
-
-        # Close all database connections before temp directory cleanup
-        try:
-            conn = get_connection(db_path)
-            conn.close()
-        except Exception:
-            pass
+    # Verify DB was updated
+    trades = get_open_trades(db_path)
+    assert len(trades) == 1
+    assert trades[0].close_status == "open", "close_status should be reset to 'open'"
 
 
 @pytest.mark.asyncio
-async def test_handle_close_manually_clears_notification_flag():
+async def test_handle_close_manually_clears_notification_flag(tmp_path):
     """Test /close_manually command clears notification flag from engine."""
-    from db.state import create_calendar_trade, get_connection
+    from db.state import create_calendar_trade
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "test.db"
-        init_db(db_path)
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
 
-        # Create a trade using the test fixture
-        trade = _make_trade(trade_id=43, asset="BTC")
+    # Create a trade using the test fixture
+    trade = _make_trade(trade_id=43, asset="BTC")
 
-        # Insert it into the database
-        db_trade = create_calendar_trade(
-            asset=trade.asset,
-            date_open=datetime.fromisoformat(trade.date_open).date(),
-            option_type=trade.option_type,
-            strike=trade.strike,
-            expiry_near=trade.expiry_near,
-            expiry_far=trade.expiry_far,
-            near_days=1,
-            far_days=7,
-            qty=trade.qty,
-            spot_open=100000.0,
-            near_prem=0.01,
-            far_prem=0.02,
-            net_debit=trade.net_debit,
-            open_fees=trade.open_fees,
-            near_instrument=trade.near_instrument,
-            far_instrument=trade.far_instrument,
-            ev_score=trade.ev_score,
-            db_path=db_path,
-        )
+    # Insert it into the database
+    db_trade = create_calendar_trade(
+        asset=trade.asset,
+        date_open=datetime.fromisoformat(trade.date_open).date(),
+        option_type=trade.option_type,
+        strike=trade.strike,
+        expiry_near=trade.expiry_near,
+        expiry_far=trade.expiry_far,
+        near_days=1,
+        far_days=7,
+        qty=trade.qty,
+        spot_open=100000.0,
+        near_prem=0.01,
+        far_prem=0.02,
+        net_debit=trade.net_debit,
+        open_fees=trade.open_fees,
+        near_instrument=trade.near_instrument,
+        far_instrument=trade.far_instrument,
+        ev_score=trade.ev_score,
+        db_path=db_path,
+    )
 
-        # Create engine and add to notified_stuck
-        mock_cache = MagicMock()
-        engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
-        engine._notified_stuck.add(db_trade.id)
+    # Create engine and add to notified_stuck
+    mock_cache = MagicMock()
+    engine = DecisionEngine(cache=mock_cache, portfolio_value=10000.0, db_path=db_path)
+    engine._notified_stuck.add(db_trade.id)
 
-        # Mock Telegram update and context
-        update = AsyncMock()
-        update.message = AsyncMock()
-        context = MagicMock()
-        context.args = ["trade_id=" + str(db_trade.id), "spread=0.0050"]
+    # Mock Telegram update and context
+    update = AsyncMock()
+    update.message = AsyncMock()
+    context = MagicMock()
+    context.args = ["trade_id=" + str(db_trade.id), "spread=0.0050"]
 
-        # Call handler
-        await handlers.handle_close_manually(update, context, engine, db_path)
+    # Call handler
+    await handlers.handle_close_manually(update, context, engine, db_path)
 
-        # Verify notification flag was cleared
-        assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
+    # Verify notification flag was cleared
+    assert db_trade.id not in engine._notified_stuck, "Notification flag should be cleared"
 
-        # Verify position was closed
-        trades = get_open_trades(db_path)
-        assert len(trades) == 0, "Trade should be closed"
-
-        # Close all database connections before temp directory cleanup
-        try:
-            conn = get_connection(db_path)
-            conn.close()
-        except Exception:
-            pass
+    # Verify position was closed
+    trades = get_open_trades(db_path)
+    assert len(trades) == 0, "Trade should be closed"
 
 
 class TestHandlePnl:
@@ -1395,51 +1363,46 @@ class TestStuckPositionVisibility:
 
 class TestHandleInfoHardening:
     @pytest.mark.asyncio
-    async def test_info_zero_cost_basis_replies_not_silent(self):
+    async def test_info_zero_cost_basis_replies_not_silent(self, tmp_path):
         """A trade with cost_basis == 0 must not ZeroDivisionError into silence."""
-        from db.state import create_calendar_trade, get_connection
+        from db.state import create_calendar_trade
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "test.db"
-            init_db(db_path)
-            trade_id = create_calendar_trade(
-                asset="BTC",
-                date_open=datetime.now(timezone.utc).date(),
-                option_type="Call",
-                strike=95_000.0,
-                expiry_near="2026-07-03",
-                expiry_far="2026-07-31",
-                near_days=3,
-                far_days=31,
-                qty=1.0,
-                spot_open=100_000.0,
-                near_prem=0.0,
-                far_prem=0.0,
-                net_debit=0.0,       # cost_basis = net_debit*qty + open_fees = 0
-                near_instrument="BTC-3JUL26-95000-C",
-                far_instrument="BTC-31JUL26-95000-C",
-                open_fees=0.0,
-                db_path=db_path,
-            ).id
+        db_path = tmp_path / "test.db"
+        init_db(db_path)
+        trade_id = create_calendar_trade(
+            asset="BTC",
+            date_open=datetime.now(timezone.utc).date(),
+            option_type="Call",
+            strike=95_000.0,
+            expiry_near="2026-07-03",
+            expiry_far="2026-07-31",
+            near_days=3,
+            far_days=31,
+            qty=1.0,
+            spot_open=100_000.0,
+            near_prem=0.0,
+            far_prem=0.0,
+            net_debit=0.0,       # cost_basis = net_debit*qty + open_fees = 0
+            near_instrument="BTC-3JUL26-95000-C",
+            far_instrument="BTC-31JUL26-95000-C",
+            open_fees=0.0,
+            db_path=db_path,
+        ).id
 
-            update = _make_update()
-            context = _make_context(args=[f"trade_id={trade_id}"])
+        update = _make_update()
+        context = _make_context(args=[f"trade_id={trade_id}"])
 
-            near_snap = MagicMock(bid=0.014, ask=0.016)
-            far_snap = MagicMock(bid=0.024, ask=0.026)
-            cache = MagicMock()
-            cache.get.side_effect = lambda inst: near_snap if "3JUL" in inst else far_snap
+        near_snap = MagicMock(bid=0.014, ask=0.016)
+        far_snap = MagicMock(bid=0.024, ask=0.026)
+        cache = MagicMock()
+        cache.get.side_effect = lambda inst: near_snap if "3JUL" in inst else far_snap
 
-            await handlers.handle_info(update, context, cache, db_path)
+        await handlers.handle_info(update, context, cache, db_path)
 
-            update.message.reply_text.assert_called_once()
-            response = update.message.reply_text.call_args[0][0]
-            # A real reply is sent (no silent ZeroDivisionError).
-            assert "cost basis is $0.00" in response
-            try:
-                get_connection(db_path).close()
-            except Exception:
-                pass
+        update.message.reply_text.assert_called_once()
+        response = update.message.reply_text.call_args[0][0]
+        # A real reply is sent (no silent ZeroDivisionError).
+        assert "cost basis is $0.00" in response
 
 
 class TestGlobalErrorHandler:

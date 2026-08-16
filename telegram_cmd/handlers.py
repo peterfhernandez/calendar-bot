@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import config
 from db.state import (
+    get_connection,
     get_open_trades,
     get_visible_positions,
     get_trades_closed_today_aest,
@@ -460,14 +461,14 @@ async def handle_info(
     # reply at all, leaving the operator staring at silence.  Reply with an
     # error message instead of failing silently.
     try:
-        # Fetch trade from DB
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
-        ).fetchone()
-        conn.close()
+        # Fetch trade from DB.  Go through db.state.get_connection so the handle
+        # is closed on every path — the previous inline sqlite3.connect() leaked
+        # the connection whenever the query raised, since its close() was not in
+        # a finally block.
+        with get_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM calendar_trades WHERE id = ?", (trade_id,)
+            ).fetchone()
 
         if not row:
             await update.message.reply_text(f"Trade #{trade_id} not found in database")

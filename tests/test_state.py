@@ -1,9 +1,13 @@
 """Tests for db/state.py — SQLite calendar trade persistence."""
+import gc
+import sqlite3
+
 import pytest
 from datetime import date
 from pathlib import Path
 
 from db.state import (
+    get_connection,
     init_db,
     create_calendar_trade,
     close_calendar_trade,
@@ -554,3 +558,93 @@ class TestMarkStuckPositionReconciled:
     def test_missing_trade_raises(self, db):
         with pytest.raises(ValueError):
             mark_stuck_position_reconciled(9999, db_path=db)
+
+
+class TestConnectionLifecycle:
+    """
+    `with get_connection(...)` must close the handle at block exit.
+
+    Plain sqlite3 treats `with conn:` as a transaction scope and leaves the
+    connection open; sqlite3's internal LRU statement cache then holds a
+    reference back to the connection, so the handle survived until a *cyclic*
+    GC pass happened to run.  On Windows that open handle blocks directory
+    removal, which made every test writing its DB into a temporary directory
+    fail with PermissionError depending on nothing but GC timing.
+    """
+
+    @staticmethod
+    def _open_connections() -> int:
+        """
+        Count sqlite3 connections still holding an OS handle.
+
+        Counting Connection *objects* would over-count: a closed connection
+        lives on as a Python object while anything references it.  Reading
+        `in_transaction` is side-effect free and raises once closed.
+        """
+        n = 0
+        for obj in gc.get_objects():
+            if isinstance(obj, sqlite3.Connection):
+                try:
+                    obj.in_transaction
+                except sqlite3.ProgrammingError:
+                    continue
+                n += 1
+        return n
+
+    def test_with_block_closes_connection(self, db):
+        with get_connection(db) as conn:
+            conn.execute("SELECT 1").fetchone()
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+    def test_with_block_still_commits(self, db):
+        with get_connection(db) as conn:
+            conn.execute(
+                "INSERT INTO calendar_trades "
+                "(asset, option_type, strike, expiry_near, expiry_far, near_days, "
+                " far_days, qty, date_open, spot_open) "
+                "VALUES ('BTC','Call',1.0,'a','b',1,7,1.0,'2026-01-01',1.0)"
+            )
+        with get_connection(db) as conn2:
+            assert conn2.execute("SELECT COUNT(*) FROM calendar_trades").fetchone()[0] == 1
+
+    def test_with_block_rolls_back_on_error(self, db):
+        with pytest.raises(RuntimeError):
+            with get_connection(db) as conn:
+                conn.execute(
+                    "INSERT INTO calendar_trades "
+                    "(asset, option_type, strike, expiry_near, expiry_far, near_days, "
+                    " far_days, qty, date_open, spot_open) "
+                    "VALUES ('BTC','Call',1.0,'a','b',1,7,1.0,'2026-01-01',1.0)"
+                )
+                raise RuntimeError("boom")
+        with get_connection(db) as conn2:
+            assert conn2.execute("SELECT COUNT(*) FROM calendar_trades").fetchone()[0] == 0
+
+    def test_rows_remain_readable_after_close(self, db):
+        """Handlers build their reply after the with-block, so Row must survive."""
+        _open_trade(db)
+        with get_connection(db) as conn:
+            row = conn.execute("SELECT * FROM calendar_trades").fetchone()
+        assert row["asset"] == "BTC"
+
+    def test_state_helpers_leave_no_open_connections(self, db):
+        """
+        The regression proper: with the cyclic GC disabled, the public helpers
+        must not leave a single connection alive.  Before the fix, init_db alone
+        leaked one and create_calendar_trade two more.
+        """
+        gc.collect()
+        gc.disable()
+        try:
+            baseline = self._open_connections()
+            init_db(db)
+            trade = _open_trade(db)
+            get_open_trades(db_path=db)
+            get_visible_positions(db_path=db)
+            load_calendar_state("BTC", db_path=db)
+            mark_position_close_stuck(trade.id, error_reason="x", db_path=db)
+            get_close_status(trade.id, db_path=db)
+            assert self._open_connections() == baseline
+        finally:
+            gc.enable()

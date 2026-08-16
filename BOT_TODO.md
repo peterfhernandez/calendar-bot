@@ -1862,3 +1862,100 @@ orders everywhere** — and non-zero margin in every currency.
 - [x] README.md Known Issues updated
 - [x] `tests/test_portfolio.py` 74 passing (was 52); full-suite failure set
       byte-identical to master's, so no regressions were introduced
+
+---
+
+## Phase 29 — SQLite Connection Lifecycle (Windows Test Failures)
+
+**Status:** Complete — 5 failing tests fixed at their root cause, plus the
+pytest session-finish crash that aborted the whole run. Full suite 746 passing
+(5 new tests in `tests/test_state.py::TestConnectionLifecycle`). Offline demo:
+`python -m scratch.scratch_db_connection_lifecycle` (11 checks, no network, no
+live orders).
+
+Reported symptom: `python -m pytest -q .\tests\` on Windows reported 5 failures
+— all 5 tests in `tests/test_telegram_cmd.py` that used
+`tempfile.TemporaryDirectory()`, and no others — and then aborted at session
+finish with `PermissionError: [WinError 5] Access is denied:
+'...\pytest-of-Peter\pytest-current'`. The same suite passed on Linux, so the
+failures had been written off as "environmental" across several phases (Phase
+21's note, Phase 27's "4 pre-existing Windows SQLite temp-dir failures", Phase
+28's "20 pre-existing test-ordering / Windows failures").
+
+### 29a — `with get_connection(...)` never closed the connection
+
+- [x] **Root cause:** every DB helper is written as
+      `with get_connection(db_path) as conn:`, but plain `sqlite3` treats
+      `with conn:` as a *transaction* scope — it commits or rolls back and
+      deliberately leaves the connection **open**. Worse, sqlite3 keeps an
+      internal LRU statement cache whose entries reference the connection back,
+      so the connection sits in a **reference cycle** and is unreachable by
+      refcounting; the OS file handle survived until the *cyclic* garbage
+      collector happened to run. Measured with GC disabled: `init_db()` alone
+      left 1 open handle and `create_calendar_trade()` 2 more. On Windows an
+      open handle blocks removal of the containing directory, so
+      `TemporaryDirectory.__exit__` raised `PermissionError` — and whether it
+      did depended on nothing but GC timing, which is exactly why it looked
+      flaky and platform-specific.
+- [x] **Why the existing "fix" did nothing:** four of the five tests already
+      ended with `conn = get_connection(db_path); conn.close()`. `get_connection`
+      hands out a *fresh* connection per call, so this opened a new handle and
+      closed it, leaving the leaked ones untouched — a placebo.
+- [x] **Fix:** `db/state.py` gains `_ScopedConnection`, a `sqlite3.Connection`
+      subclass whose `__exit__` keeps sqlite3's commit-on-success /
+      rollback-on-error semantics via `super().__exit__` and then closes in a
+      `finally`. `get_connection` returns it via `sqlite3.connect(..., factory=)`.
+      One change fixes all 30 `with get_connection(...)` sites (24 in
+      `db/state.py`, 6 in `portfolio/tracker.py`) and removes the footgun for
+      future code. Verified safe: every site keeps `conn` inside its block and
+      returns `fetchone()`/`fetchall()` results, and `sqlite3.Row` remains
+      readable after the connection closes.
+- [x] `telegram_cmd/handlers.py::handle_info` used an inline
+      `sqlite3.connect(db_path)` with a `conn.close()` that was **not** in a
+      `finally`, so it leaked the connection whenever the query raised — now
+      goes through `get_connection` with a `with` block.
+- [x] `backtest/engine.py` had the same `with sqlite3.connect(db_path)` footgun
+      against a `NamedTemporaryFile` DB — switched to `get_connection`.
+- [x] Removed the stale workaround comment and `mkdtemp` + tolerant-`rmtree`
+      dance in `scratch/scratch_cross_collateral_reconcile.py`, which documented
+      this bug as permanent; it uses a plain `TemporaryDirectory` again.
+
+### 29b — The 5 failing tests
+
+- [x] Switched all five from `tempfile.TemporaryDirectory()` to pytest's
+      `tmp_path` fixture (idiomatic, and its cleanup cannot fail a passing test)
+- [x] Deleted the four placebo "close all database connections" blocks and the
+      now-unused `get_connection` imports they needed
+
+### 29c — Session-finish crash on `pytest-current`
+
+- [x] **Root cause (upstream pytest bug, Windows only):**
+      `_pytest.pathlib._force_symlink` refreshes the `pytest-current` symlink by
+      calling `Path.unlink()` on it. On Windows `os.unlink` cannot remove a
+      *directory* symlink or junction — it raises `PermissionError` (WinError 5)
+      — and `_force_symlink` swallows that under `except OSError: pass`, so the
+      link is never updated and keeps pointing at an older run directory. At
+      session finish `cleanup_numbered_dir` deletes those older directories,
+      leaving the link dangling, then calls `cleanup_dead_symlinks`, which calls
+      `Path.unlink()` on it with **no exception handling at all** — aborting the
+      run with a traceback and a non-zero exit status even when every test
+      passed.
+- [x] **Fix:** new `tests/conftest.py` replaces `cleanup_dead_symlinks` with a
+      version that removes such a link using `os.rmdir` (the call Windows
+      accepts for a directory link; it removes the link, never its target) and
+      never lets temp-directory housekeeping take the session down. No-op on
+      POSIX, where `Path.unlink()` already handles both cases.
+
+### 29d — Tests and scratch
+
+- [x] `tests/test_state.py::TestConnectionLifecycle` (5 tests) — the with-block
+      closes the connection; commit and rollback semantics are unchanged; a
+      `sqlite3.Row` fetched inside the block is still readable after it; and,
+      with the cyclic GC disabled, seven public helpers leak zero **open**
+      connections (counted by probing `in_transaction`, since a closed
+      connection lives on as an object but holds no handle)
+- [x] Both the test and the scratch script were verified to fail with the fix
+      reverted, so they genuinely pin the behaviour
+- [x] `scratch/scratch_db_connection_lifecycle.py` — 11 offline checks: the old
+      leak, the new deterministic close, commit/rollback, row survival, and a
+      temp directory removed immediately with no GC pass in between
