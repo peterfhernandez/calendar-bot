@@ -1,9 +1,5 @@
 # Directions for Claude
 
-@README.md
-@BOT_PLAN.md
-@BOT_TODO.md
-
 ## Purpose of project
 
 This repo is a python project for aun automated bot that trades calendar options on crypto curreny with Deribit.
