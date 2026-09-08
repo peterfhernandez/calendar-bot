@@ -1261,6 +1261,7 @@ class DecisionEngine:
         far_instr     = pos.get("far_instrument")
         held_near     = pos.get("near_instrument")
         qty_pos       = pos.get("qty", 1.0)
+        trade_id      = pos.get("trade_id")
 
         roll_for = {
             "asset":          pos["asset"],
@@ -1268,11 +1269,18 @@ class DecisionEngine:
             "option_type":    opt_type,
             "far_instrument": far_instr,
         }
+
+        # Debug: check if far_instrument is in cache
+        chain = self._cache.get_chain(pos["asset"])
+        chain_has_far = any(n for n, s in chain if n == far_instr) if chain else False
+
         candidates = scan(self._cache, roll_for=roll_for)
         if not candidates:
             logger.info(
-                "Roll: no matching candidate for asset=%s strike=%.0f far=%s",
-                pos["asset"], target_strike, far_instr,
+                "Roll: no matching candidate for trade_id=%d asset=%s strike=%.0f far=%s  "
+                "(far in cache: %s, chain_size=%d)",
+                trade_id, pos["asset"], target_strike, far_instr,
+                chain_has_far, len(chain) if chain else 0,
             )
             return False
 
@@ -1281,14 +1289,19 @@ class DecisionEngine:
         # was considered, so if the top match happened to be the currently-held
         # near leg the whole roll was abandoned (trades 14/15).
         new_candidate = None
-        for c in candidates:
+        rejection_reasons = []
+        for i, c in enumerate(candidates):
             # Skip the currently-held near leg — rolling to it is a no-op.
             if c.near_instrument == held_near:
+                rejection_reasons.append(f"[{i}] {c.near_instrument}: held near leg (no-op)")
                 continue
             # Reject a near leg that doesn't precede the far leg by at least
             # MIN_ROLL_NEAR_FAR_GAP_DAYS (guards the zero-width spread of #207).
             gap_days = _expiry_gap_days(c.near_instrument, far_instr)
             if gap_days is not None and gap_days < config.MIN_ROLL_NEAR_FAR_GAP_DAYS:
+                rejection_reasons.append(
+                    f"[{i}] {c.near_instrument}: gap_days={gap_days} < MIN={config.MIN_ROLL_NEAR_FAR_GAP_DAYS}"
+                )
                 logger.debug(
                     "Roll: candidate near %s within %d day(s) of far %s — skipping",
                     c.near_instrument, gap_days, far_instr,
@@ -1297,10 +1310,12 @@ class DecisionEngine:
             c.qty = qty_pos
             reject = self._check_liquidity_gate(c, is_roll=True)
             if reject:
+                rejection_reasons.append(f"[{i}] {c.near_instrument}: liquidity — {reject}")
                 logger.debug("Roll: candidate %s failed liquidity gate — %s", c.near_instrument, reject)
                 continue
             reject = self._check_margin_gate(c)
             if reject:
+                rejection_reasons.append(f"[{i}] {c.near_instrument}: margin — {reject}")
                 logger.debug("Roll: candidate %s failed margin gate — %s", c.near_instrument, reject)
                 continue
             new_candidate = c
@@ -1308,8 +1323,10 @@ class DecisionEngine:
 
         if new_candidate is None:
             logger.info(
-                "Roll: no acceptable roll candidate after gates for trade_id=%d",
-                pos.get("trade_id"),
+                "Roll: no acceptable roll candidate after gates for trade_id=%d  "
+                "(%d candidates evaluated, all rejected: %s)",
+                trade_id, len(candidates),
+                " | ".join(rejection_reasons[:5]),  # Log first 5 rejections
             )
             return False
 
