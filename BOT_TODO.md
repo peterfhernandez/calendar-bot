@@ -613,7 +613,7 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 | Scanner selects profitable setups | ✅ PASS | Scanner filtering working; positions entering and being monitored |
 | Stop-loss triggers correctly | ✅ PASS | Bot_test logs show 16+ stop-loss closes at ~50% of debit (config: STOP_PCT=0.50) |
 | Take-profit triggers correctly | ✅ PASS | Bot_test logs show 5+ take-profit closes (420%, 603%, 168%, 154%, 152%) |
-| Roll logic executes correctly | ❌ FAIL | **CRITICAL:** 0 successful rolls in bot_test logs; 5 positions failed to roll (retry cap), closed instead. Root causes: (a) no matching candidates found for position strike/far-leg; (b) all candidates rejected by liquidity/margin gates. Trade #65: "no matching candidate for BTC 88000 strike"; Trade #59: "no acceptable roll candidate after gates" |
+| Roll logic executes correctly | ❌ FAIL | **CRITICAL:** 0 successful rolls in bot_test logs; 5 positions failed to roll (retry cap), closed instead. Root causes: (a) no matching candidates found for position strike/far-leg; (b) all candidates rejected by liquidity/margin gates. Trade #65: "no matching candidate for BTC 88000 strike"; Trade #59: "no acceptable roll candidate after gates". Added diagnostic tools: enhanced logging in _try_roll() showing cache state, gate rejection reasons; scanner debug output on far_instrument filtering; scratch_roll_diagnostic.py for interactive debugging. Phase 18 fix (open position feed subscription) IS implemented and working. |
 | Daily loss limit halts bot | ⏳ UNTESTED | Not triggered during paper/test runs shown in logs |
 | Config parameters tuned | ⏳ IN PROGRESS | Need to address roll logic before tuning complete |
 
@@ -655,6 +655,8 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 - `scratch/scratch_pnl_chart.py` — renders the `/pnl` equity-curve chart from the paper DB's real (or synthetic, if empty) trade history and saves it to `scratch/pnl_chart_preview.png`. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_pnl_chart` from the repo root.
 - `scratch/scratch_margin_probe.py` — probes the real Deribit margin-simulation endpoint against test.deribit.com and prints the raw response, used to confirm the API schema before `PortfolioTracker.simulate_margin()` is implemented. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_margin_probe` from the repo root.
 - `scratch/scratch_margin_gate.py` — prints current account margin utilization and runs synthetic candidates through `_check_margin_gate()` to demonstrate approve/reject outcomes. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_margin_gate` from the repo root.
+- `scratch/scratch_roll_debug.py` — theoretical analysis of roll logic failure scenarios. Documents 5 possible root causes with detailed explanations, diagnostic checklist, and recommended fixes. Run with `python -m scratch.scratch_roll_debug` from the repo root.
+- `scratch/scratch_roll_diagnostic.py` — interactive roll logic diagnostics. Shows which instruments would be searched for, which gates would be applied, and provides a diagnostic checklist for investigating roll failures. Run with `python -m scratch.scratch_roll_diagnostic` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
 ---
