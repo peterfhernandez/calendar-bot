@@ -476,7 +476,13 @@ def scan(
     # not a roll of this position.
     if is_roll:
         far_instr = roll_for.get("far_instrument")
+        before_filter = len(candidates)
         candidates = [c for c in candidates if c.far_instrument == far_instr]
+        if before_filter > len(candidates):
+            logger.debug(
+                "Roll mode: filtered %d → %d candidates after far_instrument filter (%s)",
+                before_filter, len(candidates), far_instr,
+            )
 
     # Rank by EV score, but treat an ev_score above EV_SCORE_RANKING_CAP as the
     # tell-tale of a near-zero-debit degeneracy (its ev_net/net_debit ratio blows

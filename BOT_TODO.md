@@ -607,18 +607,27 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 
 ### Validation Phase 1 — Paper Trading Validation
 
-- [ ] Run bot in paper mode (`DERIBIT_PAPER = True`) for minimum 4 weeks
-- [ ] Verify scanner selects setups that profit at expiry
-- [ ] Verify stop-loss and take-profit triggers fire correctly
-- [ ] Verify roll logic outcomes vs outright close
-- [ ] Verify daily loss limit halts the bot
-- [ ] Review all logs; tune `config.py` parameters as needed
+| Item | Status | Notes |
+|------|--------|-------|
+| Run bot in paper mode for 4+ weeks | In Progress | Running since early Sept 2026; paper DB shows stable monitoring |
+| Scanner selects profitable setups | ✅ PASS | Scanner filtering working; positions entering and being monitored |
+| Stop-loss triggers correctly | ✅ PASS | Bot_test logs show 16+ stop-loss closes at ~50% of debit (config: STOP_PCT=0.50) |
+| Take-profit triggers correctly | ✅ PASS | Bot_test logs show 5+ take-profit closes (420%, 603%, 168%, 154%, 152%) |
+| Roll logic executes correctly | ❌ FAIL | **CRITICAL:** 0 successful rolls in bot_test logs; 5 positions failed to roll (retry cap), closed instead. Root causes: (a) no matching candidates found for position strike/far-leg; (b) all candidates rejected by liquidity/margin gates. Trade #65: "no matching candidate for BTC 88000 strike"; Trade #59: "no acceptable roll candidate after gates". Added diagnostic tools: enhanced logging in _try_roll() showing cache state, gate rejection reasons; scanner debug output on far_instrument filtering; scratch_roll_diagnostic.py for interactive debugging. Phase 18 fix (open position feed subscription) IS implemented and working. |
+| Daily loss limit halts bot | ⏳ UNTESTED | Not triggered during paper/test runs shown in logs |
+| Config parameters tuned | ⏳ IN PROGRESS | Need to address roll logic before tuning complete |
+
+**Validation Phase 1 Blockers Before Live:**
+1. **[CRITICAL] Roll logic must be fixed** — positions approaching expiry will be force-closed instead of rolled, causing early exits and losses. Investigate: (1) whether roll-eligible positions exist in real market conditions, (2) whether scanner's roll-mode candidate search is too restrictive, (3) whether fee gate is too aggressive (theta gain vs roll cost).
 
 ---
 
 ### Validation Phase 2 — Live Deployment
 
-- [ ] Switch `DERIBIT_PAPER = False` in config
+**Status: BLOCKED pending Phase 1 fixes**
+
+- [ ] Fix roll logic and re-validate with 1+ week of test-mode trading
+- [ ] Switch to live mode with 1/10 of intended capital first
 - [ ] Set up API key in `.env` (never commit)
 - [ ] Deploy to always-on server or VPS
 - [ ] Set up uptime monitoring (e.g. healthcheck ping)
@@ -646,6 +655,8 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 - `scratch/scratch_pnl_chart.py` — renders the `/pnl` equity-curve chart from the paper DB's real (or synthetic, if empty) trade history and saves it to `scratch/pnl_chart_preview.png`. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_pnl_chart` from the repo root.
 - `scratch/scratch_margin_probe.py` — probes the real Deribit margin-simulation endpoint against test.deribit.com and prints the raw response, used to confirm the API schema before `PortfolioTracker.simulate_margin()` is implemented. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_margin_probe` from the repo root.
 - `scratch/scratch_margin_gate.py` — prints current account margin utilization and runs synthetic candidates through `_check_margin_gate()` to demonstrate approve/reject outcomes. Aborts if `TRADING_MODE == "live"`. Run with `python -m scratch.scratch_margin_gate` from the repo root.
+- `scratch/scratch_roll_debug.py` — theoretical analysis of roll logic failure scenarios. Documents 5 possible root causes with detailed explanations, diagnostic checklist, and recommended fixes. Run with `python -m scratch.scratch_roll_debug` from the repo root.
+- `scratch/scratch_roll_diagnostic.py` — interactive roll logic diagnostics. Shows which instruments would be searched for, which gates would be applied, and provides a diagnostic checklist for investigating roll failures. Run with `python -m scratch.scratch_roll_diagnostic` from the repo root.
 - Do not switch to live trading until Phase 9 is fully complete
 
 ---
