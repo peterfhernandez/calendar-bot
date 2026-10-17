@@ -501,7 +501,7 @@ DATE_FORMAT = "%Y-%m-%d"
 _cfg_override = _os.environ.get("BOT_CONFIG_FILE", "")
 if _cfg_override:
     try:
-        with open(_cfg_override) as _f:
+        with open(_cfg_override, encoding='utf-8') as _f:
             exec(compile(_f.read(), _cfg_override, "exec"), globals())
     except FileNotFoundError:
         raise SystemExit(f"Config override file not found: {_cfg_override!r}")

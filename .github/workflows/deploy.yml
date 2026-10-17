@@ -1,24 +1,42 @@
-name: Deploy to laptop
+name: Deploy to VM
+
+# Runs on the self-hosted runner installed on the Linux VM (label calendar-bot-vm),
+# as the same user that owns the bot checkout and the systemd units.
+# See deploy/LINUX_MIGRATION.md.
 
 on:
   push:
     branches: [master]
+  workflow_dispatch:
 
-defaults:
-  run:
-    shell: powershell -ExecutionPolicy Bypass -Command "& '{0}'"
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    runs-on: calendar-bot
+    runs-on: [self-hosted, linux, calendar-bot-vm]
+    env:
+      # Optional repo variable; defaults to ~/calendar-bot of the runner user
+      BOT_DIR: ${{ vars.BOT_DIR }}
     steps:
-      - name: Fix git safe directory
-        run: git config --global --add safe.directory C:/Users/Peter/coderepo/calendar-bot
-
       - name: Pull latest
         run: |
-          git -C C:\Users\Peter\coderepo\calendar-bot fetch origin master
-          git -C C:\Users\Peter\coderepo\calendar-bot reset --hard origin/master
+          set -euo pipefail
+          cd "${BOT_DIR:-$HOME/calendar-bot}"
+          before=$(sha256sum requirements.txt | cut -d' ' -f1)
+          git fetch origin master
+          git reset --hard origin/master
+          after=$(sha256sum requirements.txt | cut -d' ' -f1)
+          if [ "$before" != "$after" ]; then
+            echo "requirements.txt changed - reinstalling"
+            .venv/bin/pip install -q -r requirements.txt
+          fi
 
       - name: Restart Calendar Bot services
-        shell: powershell
-        run: Restart-Service -Name "CalendarBotPaper", "CalendarBotTest" -Force
+        run: sudo -n systemctl restart calendar-bot-paper calendar-bot-test
+
+      - name: Verify services are running
+        run: |
+          sleep 15
+          systemctl is-active calendar-bot-paper calendar-bot-test

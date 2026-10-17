@@ -14,12 +14,12 @@ The important files that define this paper mode are:
 
 - `.env` holds Keys and credentials
 - `config.py` contains configuration variables
-- `db\calendar_bot.db` is the database file
-- `logs\bot.logs` a rotating log file
+- `db/calendar_bot.db` is the database file
+- `logs/bot.log` a rotating log file
 
 #### Command
 
-We launch this bot using a service setup with servy. The launch command is `python -m bot --portfolio=10000`
+The bot runs on the Linux VM as the systemd service `calendar-bot-paper` (`deploy/linux/calendar-bot-paper.service`). The launch command is `python -m bot --portfolio=10000`
 
 #### Telegram
 
@@ -40,12 +40,12 @@ The important files that define this paper mode are:
 
 - `.env.test` holds Keys and credentials
 - `config_test.py` contains configuration variables
-- `db\calendar_bot_test.db` is the database file
-- `logs\bot_test.logs` a rotating log file
+- `db/calendar_bot_test.db` is the database file
+- `logs/bot_test.log` a rotating log file
 
 #### Test mode Command
 
-We launch this bot using a service setup with servy. The launch command is `python -m bot --env .env.test --db db\calendar_bot_test.db --log logs\bot_test.log`
+The bot runs on the Linux VM as the systemd service `calendar-bot-test` (`deploy/linux/calendar-bot-test.service`). The launch command is `python -m bot --env .env.test --db db/calendar_bot_test.db --log logs/bot_test.log`
 
 #### Test Telegram
 
@@ -55,6 +55,10 @@ The paper bot interacts with a telegram chatbot:
 - Chatbot username is `pfh_test_notifications_bot`
 - Chatbot Id: `8719768449`
 - Url is `https://web.telegram.org/a/#8719768449`
+
+## Hosting
+
+Both bots run on a Linux VM in Proxmox under systemd. They start on boot and restart on failure. Pushes to `master` auto-deploy through a self-hosted GitHub runner (label `calendar-bot-vm`). See [deploy/LINUX_MIGRATION.md](deploy/LINUX_MIGRATION.md) for setup and day-to-day commands. The earlier Windows/servy services `CalendarBotPaper` and `CalendarBotTest` are retired.
 
 ## Cash setup
 

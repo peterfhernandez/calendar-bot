@@ -1,0 +1,27 @@
+# Test-mode bot (orders on test.deribit.com): .env.test, db/calendar_bot_test.db,
+# logs/bot_test.log.  config_test.py is applied via BOT_CONFIG_FILE in .env.test.
+# Template — install.sh replaces @BOT_USER@ and @BOT_DIR@ and installs it to
+# /etc/systemd/system/.  Edit the copy in the repo, then re-run install.sh.
+[Unit]
+Description=Calendar Bot (test mode)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@BOT_USER@
+WorkingDirectory=@BOT_DIR@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@BOT_DIR@/.venv/bin/python -m bot --env .env.test --db db/calendar_bot_test.db --log logs/bot_test.log
+# bot.py shuts the feed, loop and Telegram listener down cleanly on SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

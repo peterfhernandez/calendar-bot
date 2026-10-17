@@ -118,6 +118,21 @@ The four flags (`--env`, `--db`, `--log`, `--config`) are pre-parsed before any 
 
 ---
 
+## Running as services on Linux (systemd)
+
+In production both instances run on a Linux VM as two systemd services, `calendar-bot-paper` and `calendar-bot-test`. They start at boot, restart automatically after a crash, and stop cleanly on SIGTERM. A push to `master` deploys through a self-hosted GitHub runner on the VM: [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) pulls the code and restarts both units.
+
+```bash
+sudo bash deploy/linux/install.sh --data ~/calendar-bot-data.tar.gz   # one-time install
+systemctl status calendar-bot-paper calendar-bot-test
+journalctl -u calendar-bot-paper -f
+.venv/bin/python -m scratch.scratch_vm_healthcheck                    # read-only health check
+```
+
+[deploy/LINUX_MIGRATION.md](deploy/LINUX_MIGRATION.md) has the full walkthrough. It covers exporting the DBs and logs from Windows with `deploy/export_data.ps1`, installing on the VM, moving the GitHub runner, and rolling back.
+
+---
+
 ## Known issues
 
 Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 2026-06-28 → 2026-07-07) surfaced four bugs in the close/retry and feed-coverage paths, all now fixed and tracked in [BOT_TODO.md Phase 18](BOT_TODO.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes) with full root-cause detail in [BOT_PLAN.md](BOT_PLAN.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes):
