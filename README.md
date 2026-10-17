@@ -135,6 +135,8 @@ journalctl -u calendar-bot-paper -f
 
 ## Known issues
 
+**No position could roll between 2026-09-08 and 2026-10-17.** A diagnostic line added to `DecisionEngine._try_roll()` (`strategy/decision.py`) iterated `ChainCache.get_chain()` as `(name, snapshot)` pairs, but it returns plain `TickerSnapshot` objects. Every roll attempt therefore raised `TypeError: cannot unpack non-iterable TickerSnapshot object` and logged `Monitor failed for trade_id=N` before it looked for a candidate. Roll-eligible positions were held and later force-closed instead. The test suite caught it (9 failures in `tests/test_decision.py`), but on Windows those failures were masked by a broken numpy/duckdb install; they surfaced on the first run on the Linux VM. Fixed by matching on `s.instrument`, with a regression test that drives `_try_roll` against a real `TickerSnapshot` chain. Roll failures logged in that window reflect this crash, not the strategy.
+
 Analysis of a test-mode run (`db/calendar_bot_test.db`, `logs/bot_test.log*`, 2026-06-28 → 2026-07-07) surfaced four bugs in the close/retry and feed-coverage paths, all now fixed and tracked in [BOT_TODO.md Phase 18](BOT_TODO.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes) with full root-cause detail in [BOT_PLAN.md](BOT_PLAN.md#phase-18--close-order-reliability--stuck-position-retry-bugfixes):
 
 - **Far-leg close orders could be rejected by Deribit** (`-32602 Invalid params`) because the executor didn't account for per-instrument tick size when rounding order prices. Fixed — order prices are now rounded to each instrument's own tick size.

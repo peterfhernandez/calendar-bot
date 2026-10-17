@@ -613,12 +613,12 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 | Scanner selects profitable setups | ✅ PASS | Scanner filtering working; positions entering and being monitored |
 | Stop-loss triggers correctly | ✅ PASS | Bot_test logs show 16+ stop-loss closes at ~50% of debit (config: STOP_PCT=0.50) |
 | Take-profit triggers correctly | ✅ PASS | Bot_test logs show 5+ take-profit closes (420%, 603%, 168%, 154%, 152%) |
-| Roll logic executes correctly | ❌ FAIL | **CRITICAL:** 0 successful rolls in bot_test logs; 5 positions failed to roll (retry cap), closed instead. Root causes: (a) no matching candidates found for position strike/far-leg; (b) all candidates rejected by liquidity/margin gates. Trade #65: "no matching candidate for BTC 88000 strike"; Trade #59: "no acceptable roll candidate after gates". Added diagnostic tools: enhanced logging in _try_roll() showing cache state, gate rejection reasons; scanner debug output on far_instrument filtering; scratch_roll_diagnostic.py for interactive debugging. Phase 18 fix (open position feed subscription) IS implemented and working. |
+| Roll logic executes correctly | ❌ FAIL | **CRITICAL:** 0 successful rolls in bot_test logs; 5 positions failed to roll (retry cap), closed instead. Root causes: (a) no matching candidates found for position strike/far-leg; (b) all candidates rejected by liquidity/margin gates. Trade #65: "no matching candidate for BTC 88000 strike"; Trade #59: "no acceptable roll candidate after gates". Added diagnostic tools: enhanced logging in _try_roll() showing cache state, gate rejection reasons; scanner debug output on far_instrument filtering; scratch_roll_diagnostic.py for interactive debugging. Phase 18 fix (open position feed subscription) IS implemented and working. **Update 2026-10-17:** the diagnostic line added to `_try_roll()` (commit 57435f7) unpacked `get_chain()`'s `TickerSnapshot` list as `(name, snap)` pairs, so every roll attempt since 2026-09-08 raised `TypeError: cannot unpack non-iterable TickerSnapshot object` (~32k occurrences in the paper/test logs) before any candidate was searched. That crash is fixed (`any(s.instrument == far_instr for s in chain)`), with a regression test in `tests/test_decision.py::TestPrematureRollGuard`. Roll failures logged after 2026-09-08 came from this crash, not from the strategy, so roll logic needs re-validating in test mode. |
 | Daily loss limit halts bot | ⏳ UNTESTED | Not triggered during paper/test runs shown in logs |
 | Config parameters tuned | ⏳ IN PROGRESS | Need to address roll logic before tuning complete |
 
 **Validation Phase 1 Blockers Before Live:**
-1. **[CRITICAL] Roll logic must be fixed** — positions approaching expiry will be force-closed instead of rolled, causing early exits and losses. Investigate: (1) whether roll-eligible positions exist in real market conditions, (2) whether scanner's roll-mode candidate search is too restrictive, (3) whether fee gate is too aggressive (theta gain vs roll cost).
+1. **[CRITICAL] Roll logic must be fixed** — (2026-10-17: the `_try_roll` TypeError crash that blocked every roll since 2026-09-08 is fixed; re-validate rolls in test mode before treating the original root causes as confirmed) — positions approaching expiry will be force-closed instead of rolled, causing early exits and losses. Investigate: (1) whether roll-eligible positions exist in real market conditions, (2) whether scanner's roll-mode candidate search is too restrictive, (3) whether fee gate is too aggressive (theta gain vs roll cost).
 
 ---
 
@@ -629,7 +629,7 @@ Completed. New entry gate that rejects a candidate if adding it to the current p
 - [ ] Fix roll logic and re-validate with 1+ week of test-mode trading
 - [ ] Switch to live mode with 1/10 of intended capital first
 - [ ] Set up API key in `.env` (never commit)
-- [ ] Deploy to always-on server or VPS
+- [x] Deploy to always-on server or VPS — Linux VM in Proxmox, systemd units `calendar-bot-paper` / `calendar-bot-test`, auto-deploy through a self-hosted runner (see `deploy/LINUX_MIGRATION.md`)
 - [ ] Set up uptime monitoring (e.g. healthcheck ping)
 - [ ] Run with small capital first (reduce `MAX_LOSS_PCT` to 0.5% for first month)
 - [ ] Review live performance weekly for first 3 months

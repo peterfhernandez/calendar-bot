@@ -3061,6 +3061,24 @@ class TestPrematureRollGuard:
             rolled = engine._try_roll(pos, 90_000.0)
         assert rolled is False
 
+    def test_try_roll_far_in_cache_diagnostic_handles_snapshots(self, caplog):
+        """get_chain() returns TickerSnapshot objects; the 'far in cache'
+        diagnostic once unpacked them as (name, snap) pairs, raising TypeError
+        on every roll attempt so no position could ever roll."""
+        engine, _ = _make_engine(cache=_make_cache(near_days=2, far_days=30))
+        pos = {
+            "trade_id": 208, "asset": "BTC", "option_type": "Call",
+            "strike": 90_000.0, "qty": 1.0, "net_debit": 0.02, "spot_open": 90_000.0,
+            "near_instrument": f"BTC-{_future_label(2)}-90000-C",
+            "far_instrument": f"BTC-{_future_label(30)}-90000-C",
+        }
+        assert all(isinstance(s, TickerSnapshot) for s in engine._cache.get_chain("BTC"))
+        with patch("strategy.decision.scan", return_value=[]), \
+             caplog.at_level("INFO", logger="strategy.decision"):
+            rolled = engine._try_roll(pos, 90_000.0)
+        assert rolled is False
+        assert "far in cache: True, chain_size=2" in caplog.text
+
     def test_expiry_gap_days_helper(self):
         assert _expiry_gap_days(
             f"BTC-{_future_label(2)}-90000-C", f"BTC-{_future_label(30)}-90000-C"

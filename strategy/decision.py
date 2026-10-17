@@ -1270,9 +1270,10 @@ class DecisionEngine:
             "far_instrument": far_instr,
         }
 
-        # Debug: check if far_instrument is in cache
+        # Debug: check if far_instrument is in cache.  get_chain() returns a
+        # list of TickerSnapshot objects, not (name, snapshot) pairs.
         chain = self._cache.get_chain(pos["asset"])
-        chain_has_far = any(n for n, s in chain if n == far_instr) if chain else False
+        chain_has_far = any(s.instrument == far_instr for s in chain) if chain else False
 
         candidates = scan(self._cache, roll_for=roll_for)
         if not candidates:
